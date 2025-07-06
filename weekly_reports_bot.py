@@ -67,9 +67,13 @@ except Exception as e:
     users = None  # or handle the error appropriately
 
 # Check if API tokens and users are loaded
-if not api_tokens or not users:
-    print("Error: API tokens or user data could not be loaded. Exiting.")
+if not api_tokens:
+    print("Error: API tokens could not be loaded. Exiting.")
     exit(1)
+elif  not users:
+    print("Error: user data could not be loaded. Exiting.")
+    exit(1)
+    
 # Set the headers for API requests using the first API token
 if api_tokens:
     API_TOKEN = next(iter(api_tokens.values()))  # Get the first token from the dictionary
@@ -375,30 +379,97 @@ def send_to_discord(reports):
         else:
             print(f"Failed to send report for {report['username']}: {response.text}")
 
+"""
+Example JSON structure for toggl_api_tokens.json:
+[
+    {
+        "name": "Flomad Students",
+        "api_token": "210bc42419994fc26f4e97d03d5e208f"
+    },
+    {
+        "name": "Flomad Participants 1",
+        "api_token": "0e6df8bf00f9cb20d5d5418b1121ca55"
+    },
+    {
+        "name": "Toggl 2 Flomad",
+        "api_token": "2d8b16d7923728381944f76b258e8a1a"
+    },
+    {
+        "name": "Flomad Labs R&D 4",
+        "api_token": "ea044057fca51c7afd0a670df5958ea5"
+    },
+    {
+        "name": "Participants 5",
+        "api_token": "01b41265c55ca83f488f279b54268921"
+    },
+    {
+        "name": "Flomad Labs R&D 6",
+        "api_token": "c7e6eff82cbf6ebb73dc1416d42b6665"
+    },
+    {
+        "name": "Flomad Labs EMP",
+        "api_token": "07e59620a2f68413d4f4adc87a4c0fc0"
+    },
+    {
+        "name": "Mc Toggl1",
+        "api_token": "a927c5d2dbe6cbd852517dda1627928d"
+    },
+    {
+        "name": "Flomad Labs Reg 3",
+        "api_token": "d0a234fe27176f93da850e74948c11c3"
+    },
+    {
+        "name": "toggl8.participants@flomad.com",
+        "api_token": "4c125d5fd0fd9ba93a4e5bd5b17fc59d"
+    }
+]
+"""
+def get_all_weekly_reports():
+    """
+    This function returns the lists of weekly reports for each api token in the toggl_api_tokens.json file.
+    It uses the get_detailed_report function to fetch data and then formats it for Discord.
+    
+    Returns:
+        List of dictionaries containing user_id, username, and message for each report.
+    """
+    if not api_tokens:
+        print("Error: No API tokens available. Exiting.")
+        return []
+    
+    all_reports = []
+    
+    for token in api_tokens:
+        headers = get_header(token['api_token'])
+        
+        workspaces = get_workspaces()
+        if not workspaces:
+            print(f"No workspaces found for token: {token['name']}")
+            continue
+        
+        for workspace in workspaces:
+            WORKSPACE_ID = workspace['id']
+            print(f"Workspace ID: {WORKSPACE_ID}, Name: {workspace['name']}")
+            print(f"Fetching data for token: {token['name']} of the workspace: {workspace['name']}")
+            # Fetch detailed report for the last 7 days
+            toggl_data = get_detailed_report(WORKSPACE_ID, datetime.now() - timedelta(days=7), datetime.now())
+            
+            if toggl_data:
+                reports = generate_discord_reports(toggl_data)
+                all_reports.extend(reports)
+            else:
+                print(f"Failed to fetch data for token: {token['name']}")
+    
+    return all_reports
+
 #******************************************
 # Main execution flow
 #******************************************
-
 # Example usage:
 if __name__ == "__main__":
-    # Define the week range
-    today = datetime.now()
-    start_of_week = today - timedelta(days=today.weekday())  # Monday
-    end_of_week = start_of_week + timedelta(days=6)  # Sunday
-        
-    # Get detailed report for the week
-    weekly_reports = get_detailed_report(WORKSPACE_ID, start_of_week, end_of_week)
-
-    # Generate reports
-    reports = get_all_weekly_reports(weekly_reports)
     
-    # Print reports
-    for report in reports:
-        print(f"\n{'='*50}")
-        print(f"Report for {report['username']} (ID: {report['user_id']})")
-        print(f"{'='*50}")
-        print(report['message'])
-        print(f"Message length: {len(report['message'])} characters")
+    reports = get_all_weekly_reports()
+    if not reports:
+        print("No reports generated. Exiting.")
+        exit(1)
     
     send_to_discord(reports)
-    
