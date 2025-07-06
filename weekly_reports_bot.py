@@ -4,30 +4,48 @@ from datetime import datetime, timedelta
 import json
 from collections import defaultdict
 
-# Your Toggl API token
-API_TOKEN = "210bc42419994fc26f4e97d03d5e208f"
+# === api token ===
+API_TOKEN = "2d8b16d7923728381944f76b258e8a1a"  # Replace with an actual API token
 
+# === workspace id ===
+WORKSPACE_ID = "200169844"  # Replace with an actual workspace ID
+
+# === headers for API requests ===
+headers = {
+        "Authorization": "Basic xxxxxxxx",  # Replace with a base64 encoded API token
+        "Content-Type": "application/json"
+    }
+
+#TODO: Write the proper error handling and logging for the file operations
+# === api tokens ===
+with open('toggl_api_tokens.json') as f:
+    api_tokens = json.load(f)
+    
 # === Load user data ===
 with open('toggl_users.json') as f:
     users = json.load(f)
     
-# Create authentication header
-auth_header = base64.b64encode(f"{API_TOKEN}:api_token".encode()).decode()
-headers = {
-    "Authorization": f"Basic {auth_header}",
-    "Content-Type": "application/json"
-}
+def get_header(api_token):
+    """
+    Create the authorization header for Toggl API requests.
+    
+    Args:
+        api_token (str): Your Toggl API token.
+    
+    Returns:
+        dict: Headers with the authorization token.
+    """
+    auth_header = base64.b64encode(f"{api_token}:api_token".encode()).decode()
+    return {
+        "Authorization": f"Basic {auth_header}",
+        "Content-Type": "application/json"
+    }
 
 def get_workspaces():
+    """Fetch all workspaces for the authenticated user."""
     url = "https://api.track.toggl.com/api/v9/workspaces"
     response = requests.get(url, headers=headers)
     return response.json()
-
-workspaces = get_workspaces()
-for workspace in workspaces:
-        WORKSPACE_ID = workspace['id']
-        # This works because each owner has only one workspace
-        print(f"Workspace ID: {WORKSPACE_ID}, Name: {workspace['name']}")
 
 def get_detailed_report(workspace_id, start_date, end_date):
     """Get detailed report using Reports API"""
@@ -301,6 +319,10 @@ def get_all_weekly_reports(toggl_data):
     
     return report_list
 
+#******************************************
+# Discord integration
+#******************************************
+
 def send_to_discord(reports):
     """
     Send the generated reports to Discord using webhooks
@@ -321,7 +343,11 @@ def send_to_discord(reports):
             print(f"Sent report for {report['username']}")
         else:
             print(f"Failed to send report for {report['username']}: {response.text}")
-            
+
+#******************************************
+# Main execution flow
+#******************************************
+
 # Example usage:
 if __name__ == "__main__":
     # Define the week range
@@ -345,5 +371,3 @@ if __name__ == "__main__":
     
     send_to_discord(reports)
     
-    
-
