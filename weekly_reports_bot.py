@@ -16,15 +16,9 @@ headers = {
         "Content-Type": "application/json"
     }
 
-#TODO: Write the proper error handling and logging for the file operations
-# === api tokens ===
-with open('toggl_api_tokens.json') as f:
-    api_tokens = json.load(f)
-    
-# === Load user data ===
-with open('toggl_users.json') as f:
-    users = json.load(f)
-    
+#******************************************
+# Helper functions for API requests
+#******************************************
 def get_header(api_token):
     """
     Create the authorization header for Toggl API requests.
@@ -47,6 +41,43 @@ def get_workspaces():
     response = requests.get(url, headers=headers)
     return response.json()
 
+#******************************************
+# Load API tokens and user data
+#******************************************
+# === api tokens ===
+try:
+    with open('toggl_api_tokens.json') as f:
+        api_tokens = json.load(f)
+except FileNotFoundError:
+    print("Error: 'toggl_api_tokens.json' not found.")
+    api_tokens = None  # or handle the error appropriately
+except Exception as e:
+    print(f"An error occurred while reading 'toggl_api_tokens.json': {e}")
+    api_tokens = None  # or handle the error appropriately
+
+# === Load user data ===
+try:
+    with open('toggl_users.json') as f:
+        users = json.load(f)
+except FileNotFoundError:
+    print("Error: 'toggl_users.json' not found.")
+    users = None  # or handle the error appropriately
+except Exception as e:
+    print(f"An error occurred while reading 'toggl_users.json': {e}")
+    users = None  # or handle the error appropriately
+
+# Check if API tokens and users are loaded
+if not api_tokens or not users:
+    print("Error: API tokens or user data could not be loaded. Exiting.")
+    exit(1)
+# Set the headers for API requests using the first API token
+if api_tokens:
+    API_TOKEN = next(iter(api_tokens.values()))  # Get the first token from the dictionary
+    headers = get_header(API_TOKEN)
+
+#******************************************
+# Function to get detailed report from Toggl Reports API
+#******************************************
 def get_detailed_report(workspace_id, start_date, end_date):
     """Get detailed report using Reports API"""
     url = f"https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries"
