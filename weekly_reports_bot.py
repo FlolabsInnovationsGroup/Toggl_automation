@@ -1,3 +1,4 @@
+import pytz
 import requests
 import base64
 from datetime import datetime, timedelta
@@ -93,8 +94,6 @@ def cache_workspace_projects(workspace_id):
     projects = get_workspace_projects(workspace_id)
     for project in projects:
         PROJECT_CACHE[project['id']] = project['name']
-    
-    print(f"Cached {len(projects)} projects for workspace {workspace_id}")
 
 #******************************************
 # Load API tokens and user data
@@ -351,7 +350,10 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
         
         # Footer
         message_parts.append("---")
-        message_parts.append(f"🤖 *Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+        now_utc = datetime.now(pytz.UTC)
+        est = now_utc.astimezone(pytz.timezone('US/Eastern'))
+        cet = now_utc.astimezone(pytz.timezone('Europe/Paris'))
+        message_parts.append(f"🤖 *Generated: {now_utc.strftime('%H:%M')} UTC | {est.strftime('%H:%M')} EST | {cet.strftime('%H:%M')} CET*")
         
         # Join all parts
         full_message = "\n".join(message_parts)
@@ -377,7 +379,8 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
             
             short_message_parts.append("")
             short_message_parts.append(f"📈 {productivity_emoji} {productivity_text}")
-            short_message_parts.append(f"🤖 *Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+            now_utc = datetime.now(pytz.UTC)
+            short_message_parts.append(f"🤖 *Generated on {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC*")
             
             full_message = "\n".join(short_message_parts)
         
