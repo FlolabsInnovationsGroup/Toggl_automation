@@ -11,35 +11,90 @@ API_TOKEN = "2d8b16d7923728381944f76b258e8a1a"  # Replace with an actual API tok
 WORKSPACE_ID = "200169844"  # Replace with an actual workspace ID
 
 # === headers for API requests ===
-headers = {
-        "Authorization": "Basic xxxxxxxx",  # Replace with a base64 encoded API token
-        "Content-Type": "application/json"
-    }
+HEADERS = {}
+
+# === Global project cache ===
+PROJECT_CACHE = {}
 
 #******************************************
 # Helper functions for API requests
 #******************************************
-def get_header(api_token):
+def get_headers(api_token):
     """
     Create the authorization header for Toggl API requests.
     
     Args:
         api_token (str): Your Toggl API token.
     
-    Returns:
+    updates the global headers variable with the authorization token.:
         dict: Headers with the authorization token.
     """
     auth_header = base64.b64encode(f"{api_token}:api_token".encode()).decode()
-    return {
+    """    Update the global HEADERS variable with the authorization token.
+    This function sets the headers for API requests to Toggl.
+    Args:
+        auth_header (str): Base64 encoded authorization header.
+    """
+    # Check if the API token is valid
+    if not api_token:
+        raise ValueError("API token is required for authentication.")
+    if not isinstance(api_token, str):
+        raise TypeError("API token must be a string.")
+    
+    # Encode the API token for basic authentication
+    auth_header = base64.b64encode(f"{api_token}:api_token".encode()).decode()
+    
+    # Update the global HEADERS variable with the authorization token
+    global HEADERS
+    # Set the headers for API requests
+    HEADERS = {
         "Authorization": f"Basic {auth_header}",
         "Content-Type": "application/json"
     }
 
 def get_workspaces():
-    """Fetch all workspaces for the authenticated user."""
+    """
+    Fetch all workspaces for the authenticated user.
+    Returns:
+        list: List of workspaces in JSON format.
+    """
     url = "https://api.track.toggl.com/api/v9/workspaces"
-    response = requests.get(url, headers=headers)
+    response = requests.get(url, headers=HEADERS)
     return response.json()
+
+def get_workspace_projects(workspace_id):
+    """
+    Fetch all projects for a specific workspace.
+    
+    Args:
+        workspace_id (str): The workspace ID
+    
+    Returns:
+        list: List of projects in JSON format
+    """
+    url = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/projects"
+    response = requests.get(url, headers=HEADERS)
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Error fetching projects for workspace {workspace_id}: {response.status_code}")
+        return []
+
+def cache_workspace_projects(workspace_id):
+    """
+    Cache all projects for a workspace in the global PROJECT_CACHE.
+    
+    Args:
+        workspace_id (str): The workspace ID
+    """
+    global PROJECT_CACHE
+    
+    projects = get_workspace_projects(workspace_id)
+    for project in projects:
+        PROJECT_CACHE[project['id']] = project['name']
+    
+    print(f"Cached {len(projects)} projects for workspace {workspace_id}")
 
 #******************************************
 # Load API tokens and user data
@@ -76,8 +131,8 @@ elif  not users:
     
 # Set the headers for API requests using the first API token
 if api_tokens:
-    API_TOKEN = next(iter(api_tokens.values()))  # Get the first token from the dictionary
-    headers = get_header(API_TOKEN)
+    API_TOKEN = api_tokens[0]["api_token"]  # Get the first token from the dictionary
+    get_headers(API_TOKEN)
 
 #******************************************
 # Function to get detailed report from Toggl Reports API
@@ -94,7 +149,7 @@ def get_detailed_report(workspace_id, start_date, end_date):
         "grouping": "projects"
     }
     
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=HEADERS, json=payload)
     
     if response.status_code == 200:
         return response.json()
@@ -122,16 +177,17 @@ def format_seconds_to_hours_minutes(seconds):
 
 def get_project_name_from_id(project_id):
     """
-    Helper function to get project name from project_id
-    You should implement this based on your project mapping
-    For now, returning a placeholder
+    Helper function to get project name from project_id using the cached projects
     """
-    project_mapping = {
-        200169844: "Program Tasks",
-        200169894: "Team Meetings",
-        None: "Personal/No Project"
-    }
-    return project_mapping.get(project_id, f"Project {project_id}")
+    if project_id is None:
+        return "Personal/No Project"
+    
+    # Check if project name is in cache
+    if project_id in PROJECT_CACHE:
+        return PROJECT_CACHE[project_id]
+    
+    # If not in cache, return a fallback name
+    return f"Project {project_id}"
 
 def parse_toggl_date(date_string):
     """Parse Toggl date string and return a datetime object"""
@@ -379,52 +435,8 @@ def send_to_discord(reports):
         else:
             print(f"Failed to send report for {report['username']}: {response.text}")
 
-"""
-Example JSON structure for toggl_api_tokens.json:
-[
-    {
-        "name": "Flomad Students",
-        "api_token": "210bc42419994fc26f4e97d03d5e208f"
-    },
-    {
-        "name": "Flomad Participants 1",
-        "api_token": "0e6df8bf00f9cb20d5d5418b1121ca55"
-    },
-    {
-        "name": "Toggl 2 Flomad",
-        "api_token": "2d8b16d7923728381944f76b258e8a1a"
-    },
-    {
-        "name": "Flomad Labs R&D 4",
-        "api_token": "ea044057fca51c7afd0a670df5958ea5"
-    },
-    {
-        "name": "Participants 5",
-        "api_token": "01b41265c55ca83f488f279b54268921"
-    },
-    {
-        "name": "Flomad Labs R&D 6",
-        "api_token": "c7e6eff82cbf6ebb73dc1416d42b6665"
-    },
-    {
-        "name": "Flomad Labs EMP",
-        "api_token": "07e59620a2f68413d4f4adc87a4c0fc0"
-    },
-    {
-        "name": "Mc Toggl1",
-        "api_token": "a927c5d2dbe6cbd852517dda1627928d"
-    },
-    {
-        "name": "Flomad Labs Reg 3",
-        "api_token": "d0a234fe27176f93da850e74948c11c3"
-    },
-    {
-        "name": "toggl8.participants@flomad.com",
-        "api_token": "4c125d5fd0fd9ba93a4e5bd5b17fc59d"
-    }
-]
-"""
-def get_all_weekly_reports():
+
+def get_all_weekly_reports_from_all_owners():
     """
     This function returns the lists of weekly reports for each api token in the toggl_api_tokens.json file.
     It uses the get_detailed_report function to fetch data and then formats it for Discord.
@@ -437,9 +449,10 @@ def get_all_weekly_reports():
         return []
     
     all_reports = []
+    global WORKSPACE_ID
     
     for token in api_tokens:
-        headers = get_header(token['api_token'])
+        get_headers(token['api_token'])
         
         workspaces = get_workspaces()
         if not workspaces:
@@ -448,13 +461,15 @@ def get_all_weekly_reports():
         
         for workspace in workspaces:
             WORKSPACE_ID = workspace['id']
-            print(f"Workspace ID: {WORKSPACE_ID}, Name: {workspace['name']}")
-            print(f"Fetching data for token: {token['name']} of the workspace: {workspace['name']}")
+            
+            # Cache projects for this workspace
+            cache_workspace_projects(WORKSPACE_ID)
+            
             # Fetch detailed report for the last 7 days
             toggl_data = get_detailed_report(WORKSPACE_ID, datetime.now() - timedelta(days=7), datetime.now())
             
             if toggl_data:
-                reports = generate_discord_reports(toggl_data)
+                reports = get_all_weekly_reports(toggl_data)
                 all_reports.extend(reports)
             else:
                 print(f"Failed to fetch data for token: {token['name']}")
@@ -466,10 +481,11 @@ def get_all_weekly_reports():
 #******************************************
 # Example usage:
 if __name__ == "__main__":
-    
-    reports = get_all_weekly_reports()
+    # Generate all weekly reports
+    reports = get_all_weekly_reports_from_all_owners()
     if not reports:
         print("No reports generated. Exiting.")
         exit(1)
     
+    # Send reports to Discord
     send_to_discord(reports)
