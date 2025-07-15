@@ -273,18 +273,7 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
         message_parts.append(f"📅 **Week:** {week_start_date.strftime('%B %d')} - {week_end_date.strftime('%B %d, %Y')}")
         message_parts.append(f"⏰ **Total Time:** {format_seconds_to_hours_minutes(report['total_seconds'])} ({total_hours:.1f} hours)")
         message_parts.append(f"📝 **Total Entries:** {report['total_entries']}")
-        
-        # Productivity insights
-        avg_hours_per_day = total_hours / 7
-        working_days = len([d for d in report['daily_breakdown'].values() if d > 0])
-        
         message_parts.append("")
-        message_parts.append("📈 **INSIGHTS:**")
-        message_parts.append(f"• Average hours per day: {avg_hours_per_day:.1f}h")
-        message_parts.append(f"• Active working days: {working_days}")
-        if working_days > 0:
-            avg_hours_per_working_day = total_hours / working_days
-            message_parts.append(f"• Average hours per working day: {avg_hours_per_working_day:.1f}h")
         
         # Productivity level emoji
         if total_hours >= 40:
@@ -300,7 +289,7 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
             productivity_emoji = "📈"
             productivity_text = "Room for improvement"
         
-        message_parts.append(f"• {productivity_emoji} {productivity_text}")
+        message_parts.append(f"{productivity_emoji} {productivity_text}")
         message_parts.append("")
         message_parts.append(f"🤖 *Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC*")
         
