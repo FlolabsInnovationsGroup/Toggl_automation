@@ -1,4 +1,3 @@
-import pytz
 import requests
 import base64
 from datetime import datetime, timedelta
@@ -216,23 +215,21 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
         Dictionary with user_id as key and Discord message as value
     """
     
-    # Group data by user
+    # Set default week dates if not provided
+    today = datetime.now()
+    week_start_date = today - timedelta(days=today.weekday())
+    week_end_date = week_start_date + timedelta(days=6)
+    
+    # Process each entry
     user_reports = defaultdict(lambda: {
         'username': '',
         'total_seconds': 0,
         'total_entries': 0,
-        'projects': defaultdict(lambda: {'seconds': 0, 'entries': 0, 'descriptions': set()}),
+        'projects': defaultdict(int),
         'daily_breakdown': defaultdict(int),
         'all_entries': []
     })
     
-    # Set default week dates if not provided
-    if not week_start_date or not week_end_date:
-        today = datetime.now()
-        week_start_date = today - timedelta(days=today.weekday())
-        week_end_date = week_start_date + timedelta(days=6)
-    
-    # Process each entry
     for entry in toggl_data:
         user_id = entry['user_id']
         username = entry['username']
@@ -245,29 +242,18 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
         # Process each time entry
         for time_entry in entry.get('time_entries', []):
             seconds = time_entry.get('seconds', 0)
-            start_time = parse_toggl_date(time_entry.get('start', ''))
             
             # Add to totals
             user_reports[user_id]['total_seconds'] += seconds
             user_reports[user_id]['total_entries'] += 1
             
-            # Group by project
-            project_name = get_project_name_from_id(project_id)
-            user_reports[user_id]['projects'][project_name]['seconds'] += seconds
-            user_reports[user_id]['projects'][project_name]['entries'] += 1
-            user_reports[user_id]['projects'][project_name]['descriptions'].add(description)
-            
-            # Daily breakdown
-            day_key = start_time.strftime('%A, %B %d')
-            user_reports[user_id]['daily_breakdown'][day_key] += seconds
-            
             # Store entry for detailed view
             user_reports[user_id]['all_entries'].append({
-                'project': project_name,
+                'project': get_project_name_from_id(project_id),
                 'description': description,
                 'duration': seconds,
-                'start': start_time,
-                'date': start_time.strftime('%Y-%m-%d')
+                'start': parse_toggl_date(time_entry.get('start', '')),
+                'date': time_entry['start'][:10]
             })
     
     # Generate Discord messages
@@ -287,43 +273,12 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
         message_parts.append(f"📅 **Week:** {week_start_date.strftime('%B %d')} - {week_end_date.strftime('%B %d, %Y')}")
         message_parts.append(f"⏰ **Total Time:** {format_seconds_to_hours_minutes(report['total_seconds'])} ({total_hours:.1f} hours)")
         message_parts.append(f"📝 **Total Entries:** {report['total_entries']}")
-        message_parts.append("")
         
-        # Project breakdown
-        message_parts.append("🎯 **PROJECT BREAKDOWN:**")
-        message_parts.append("```")
-        for project_name, project_data in sorted(report['projects'].items(), 
-                                                key=lambda x: x[1]['seconds'], reverse=True):
-            project_hours = project_data['seconds'] / 3600
-            percentage = (project_data['seconds'] / report['total_seconds'] * 100) if report['total_seconds'] > 0 else 0
-            message_parts.append(f"• {project_name}")
-            message_parts.append(f"  Time: {format_seconds_to_hours_minutes(project_data['seconds'])} ({percentage:.1f}%)")
-            message_parts.append(f"  Entries: {project_data['entries']}")
-            message_parts.append("")
-        message_parts.append("```")
-        
-        # Daily breakdown
-        message_parts.append("📅 **DAILY BREAKDOWN:**")
-        message_parts.append("```")
-        for day, seconds in sorted(report['daily_breakdown'].items()):
-            if seconds > 0:
-                message_parts.append(f"• {day}: {format_seconds_to_hours_minutes(seconds)}")
-        message_parts.append("```")
-        
-        # Task descriptions by project
-        message_parts.append("📋 **TASK DESCRIPTIONS:**")
-        for project_name, project_data in report['projects'].items():
-            if project_data['descriptions']:
-                message_parts.append(f"**{project_name}:**")
-                for desc in sorted(project_data['descriptions']):
-                    if desc.strip():  # Only show non-empty descriptions
-                        message_parts.append(f"• {desc}")
-                message_parts.append("")
-        
-        # Performance insights
+        # Productivity insights
         avg_hours_per_day = total_hours / 7
         working_days = len([d for d in report['daily_breakdown'].values() if d > 0])
         
+        message_parts.append("")
         message_parts.append("📈 **INSIGHTS:**")
         message_parts.append(f"• Average hours per day: {avg_hours_per_day:.1f}h")
         message_parts.append(f"• Active working days: {working_days}")
@@ -347,42 +302,10 @@ def generate_discord_reports(toggl_data, week_start_date=None, week_end_date=Non
         
         message_parts.append(f"• {productivity_emoji} {productivity_text}")
         message_parts.append("")
-        
-        # Footer
-        message_parts.append("---")
-        now_utc = datetime.now(pytz.UTC)
-        est = now_utc.astimezone(pytz.timezone('US/Eastern'))
-        cet = now_utc.astimezone(pytz.timezone('Europe/Paris'))
-        message_parts.append(f"🤖 *Generated: {now_utc.strftime('%H:%M')} UTC | {est.strftime('%H:%M')} EST | {cet.strftime('%H:%M')} CET*")
+        message_parts.append(f"🤖 *Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC*")
         
         # Join all parts
         full_message = "\n".join(message_parts)
-        
-        # Discord has a 2000 character limit, so we might need to split
-        if len(full_message) > 2000:
-            # Create a shorter version
-            short_message_parts = []
-            short_message_parts.append("📊 **WEEKLY TIME TRACKING REPORT**")
-            short_message_parts.append(f"👤 **Employee:** {username}")
-            short_message_parts.append(f"📅 **Week:** {week_start_date.strftime('%B %d')} - {week_end_date.strftime('%B %d, %Y')}")
-            short_message_parts.append(f"⏰ **Total Time:** {format_seconds_to_hours_minutes(report['total_seconds'])} ({total_hours:.1f} hours)")
-            short_message_parts.append(f"📝 **Total Entries:** {report['total_entries']}")
-            short_message_parts.append("")
-            
-            # Top 3 projects only
-            short_message_parts.append("🎯 **TOP PROJECTS:**")
-            for project_name, project_data in sorted(report['projects'].items(), 
-                                                    key=lambda x: x[1]['seconds'], reverse=True)[:3]:
-                project_hours = project_data['seconds'] / 3600
-                percentage = (project_data['seconds'] / report['total_seconds'] * 100) if report['total_seconds'] > 0 else 0
-                short_message_parts.append(f"• {project_name}: {format_seconds_to_hours_minutes(project_data['seconds'])} ({percentage:.1f}%)")
-            
-            short_message_parts.append("")
-            short_message_parts.append(f"📈 {productivity_emoji} {productivity_text}")
-            now_utc = datetime.now(pytz.UTC)
-            short_message_parts.append(f"🤖 *Generated on {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC*")
-            
-            full_message = "\n".join(short_message_parts)
         
         discord_messages[user_id] = {
             'username': username,
