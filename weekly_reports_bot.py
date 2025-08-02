@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 import json
 from collections import defaultdict
 
-# === api token ===
-API_TOKEN = "2d8b16d7923728381944f76b258e8a1a"  # Replace with an actual API token
+# === Discord webhook for system alerts ===
+SYSTEM_ALERT_WEBHOOK = "https://discord.com/api/webhooks/1401155910126272553/xF3EHp8wQlA0mx4tvcUXvvzUmXBoJgfNae21TN6N-a7mZR699QdGLkqPGQjgtKkxj2_I"
 
 # === workspace id ===
 WORKSPACE_ID = "200169844"  # Replace with an actual workspace ID
@@ -95,6 +95,38 @@ def cache_workspace_projects(workspace_id):
     for project in projects:
         PROJECT_CACHE[project['id']] = project['name']
 
+def get_workspace_users(workspace_id):
+    url = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/users"
+    response = requests.get(url, headers=HEADERS)
+    if response.status_code == 200:
+        return response.json()
+    return []
+
+def check_time_entries():
+    url = "https://api.track.toggl.com/api/v9/me/time_entries"
+    response = requests.get(url, headers=HEADERS)
+    print(response.json())
+    
+def get_fallback_time_entries(start_date, end_date):
+    url = f"https://api.track.toggl.com/api/v9/me/time_entries?start_date={start_date.isoformat()}Z&end_date={end_date.isoformat()}Z"
+    response = requests.get(url, headers=HEADERS)
+    if response.status_code == 200:
+        entries = response.json()
+        grouped = defaultdict(lambda: defaultdict(list))
+        for entry in entries:
+            print(entry)
+            grouped[entry['user_id']][entry.get('project_id')].append(entry)
+            
+        return [
+            {
+                'user_id': user_id,
+                'username': username,
+                'project_id': project_id,
+                'time_entries': entries
+            } for user_id, projects in grouped.items() for project_id, entries in projects.items()
+        ]
+    return None
+
 #******************************************
 # Load API tokens and user data
 #******************************************
@@ -147,25 +179,19 @@ def get_detailed_report(workspace_id, start_date, end_date):
         "sub_grouping": "users",
         "grouping": "projects"
     }
-    ''' New payload format'''
-    payload = {
-        "start_date": start_date.strftime('%Y-%m-%d'),
-        "end_date": end_date.strftime('%Y-%m-%d')
-    }
-
     
     response = requests.post(url, headers=HEADERS, json=payload)
     
     if response.status_code == 200:
-        return response.json()
+        data = response.json()
+        if len(data) == 0:
+            users = get_workspace_users(workspace_id)
+            if len(users) == 1:
+                return get_fallback_time_entries(start_date, end_date)
+        return data
     else:
         print(f"Error fetching detailed report: {response.status_code}")
         return None
-    
-def check_time_entries():
-    url = "https://api.track.toggl.com/api/v9/me/time_entries"
-    response = requests.get(url, headers=HEADERS)
-    print(response.json())
 
 #******************************************
 # Helper functions for report generation
@@ -360,7 +386,7 @@ def send_to_discord(reports):
     for report in reports:
         webhook_url = next((user['discord_webhook_url'] for user in users if user['name'] == report['username']), None)
         if not webhook_url:
-            print(f"No Discord webhook URL found for {report['username']}")
+            send_alert_to_discord(f"🚨 Missing webhook for user: {report['username']}")
             continue
         
         discord_data = {
@@ -376,6 +402,34 @@ def send_to_discord(reports):
             print(f"Failed to send report for {report['username']}: {response.text}")
         '''
 
+def send_alert_to_discord(message):
+    payload = {"content": message}
+    try:
+        requests.post(SYSTEM_ALERT_WEBHOOK, json=payload)
+    except Exception as e:
+        print(f"Error sending alert to Discord: {e}")
+
+def check_and_alert_issues(users, reports, workspace_name, workspace_id):
+    if len(users) > 1 and len(reports) == 0:
+        users = get_workspace_users(workspace_id)
+        active_users = [user for user in users if user.get('inactive') == False]
+        inactive_users = [user for user in users if user.get('inactive') == True]
+        print(f"Active users in workspace {workspace_id}: {active_users}")
+        
+        '''        If there are no reports for the workspace, check for inactive users'''
+        if inactive_users:
+            alert_msg = "⚠️ Users with no entries this week in workspace '{}':\n{}".format(
+                workspace_name,
+                "\n".join(f"- {name}" for name in inactive_users)
+            )
+            send_alert_to_discord(alert_msg)
+        
+        if len(active_users) == 1:
+            user = active_users[0]
+            send_alert_to_discord(f"🚨 Empty report for workspace '{workspace_name}' with single member: {user['name']} (ID: {workspace_id})")
+        else:
+            send_alert_to_discord(f"🚨 Empty report for workspace '{workspace_name}' with multiple active members (ID: {workspace_id})")
+        
 #******************************************
 # Main function to get all weekly reports from all owners
 #******************************************
@@ -398,13 +452,12 @@ def get_all_weekly_reports_from_all_owners():
         get_headers(token['api_token'])
         
         workspaces = get_workspaces()
-        print(f"Token: {token['name']}, Workspaces: {workspaces}")
+        #print(f"Token: {token['name']}, Workspaces: {workspaces}")
 
         if not workspaces:
-            print(f"No workspaces found for token: {token['name']}")
+            send_alert_to_discord(f"🚨No workspaces found for token: {token['name']}")
             continue
         
-        check_time_entries()
         for workspace in workspaces:
             WORKSPACE_ID = workspace['id']
             
@@ -413,13 +466,16 @@ def get_all_weekly_reports_from_all_owners():
             
             # Fetch detailed report for the last 7 days
             toggl_data = get_detailed_report(WORKSPACE_ID, datetime.now() - timedelta(days=7), datetime.now())
-            print(f"Workspace {WORKSPACE_ID} report length: {len(toggl_data) if toggl_data else 0}")
+            #print(f"Workspace {WORKSPACE_ID} report length: {len(toggl_data) if toggl_data else 0}")
 
+            reports = get_all_weekly_reports(toggl_data)
+            
             if toggl_data:
-                reports = get_all_weekly_reports(toggl_data)
                 all_reports.extend(reports)
             else:
                 print(f"Failed to fetch data for token: {token['name']}")
+                
+            check_and_alert_issues(users, reports, workspace['name'], WORKSPACE_ID)
     
     return all_reports
 
