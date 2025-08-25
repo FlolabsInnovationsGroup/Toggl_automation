@@ -12,7 +12,7 @@ Toggl Report Automation (single Google Sheet, two tabs)
 
 Google Sheet structure (two tabs only):
 - TEAM tab columns (case-insensitive):
-  name, discord_webhook_url, user_api_token, Weekly_Time_Commitment, Check_up, [email optional]
+  name, discord_webhook_url, user_api_token, Weekly_Time_Commitment, Check_up
 - WORKSPACES tab columns (case-insensitive):
   name, api_token
 
@@ -219,6 +219,101 @@ def get_detailed_report(workspace_id, start_date, end_date):
     resp = requests.post(url, headers=HEADERS, json=payload, timeout=30)
     return resp.json() if resp.status_code == 200 else None
 
+def _with_headers_for(token: str):
+    """Context-like helper that temporarily switches HEADERS to use a given token."""
+    class _Ctx:
+        def __enter__(self_inner):
+            self_inner.prev = HEADERS.copy()
+            get_headers(token)
+            return self_inner
+        def __exit__(self_inner, exc_type, exc, tb):
+            # restore previous headers
+            prev = getattr(self_inner, "prev", {})
+            if prev:
+                # mutate global HEADERS back
+                global HEADERS
+                HEADERS = prev
+    return _Ctx()
+
+def get_detailed_report_for_user_with_token(workspace_id, start_date, end_date, user_api_token, user_id=None):
+    """
+    Same endpoint as get_detailed_report, but using the *user's* API token.
+    Optionally filter by a specific user_id for safety.
+    """
+    url = f"https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries"
+    payload = {
+        "start_date": start_date.strftime('%Y-%m-%d'),
+        "end_date": end_date.strftime('%Y-%m-%d'),
+        "grouped": True,
+        "sub_grouping": "users",
+        "grouping": "projects"
+    }
+    if user_id is not None:
+        payload["user_ids"] = [user_id]
+
+    with _with_headers_for(user_api_token):
+        resp = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+
+def get_v9_me_time_entries_for_user_token(workspace_id, start_date, end_date, user_api_token, username_hint=None, user_id_hint=None):
+    """
+    Fallback for members who cannot access Reports API v3.
+    Uses GET /api/v9/me/time_entries with the user's token, filters by workspace_id,
+    and returns a list in the same shape your report generator expects:
+      [
+        {
+          'user_id': <int>,
+          'username': <str>,
+          'project_id': <int or None>,
+          'time_entries': [ { 'seconds': <int>, 'start': <iso> }, ... ]
+        },
+        ...
+      ]
+    Grouped by project_id.
+    """
+    # Build the request
+    url = f"https://api.track.toggl.com/api/v9/me/time_entries"
+    params = {
+        "start_date": start_date.strftime('%Y-%m-%dT00:00:00Z'),
+        "end_date":   end_date.strftime('%Y-%m-%dT23:59:59Z')
+    }
+
+    # Temporarily switch auth to the user's token
+    with _with_headers_for(user_api_token):
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
+        if not resp.ok:
+            return []
+
+        rows = resp.json() or []
+        # Filter to entries in the desired workspace and group by project
+        grouped = defaultdict(list)
+        for te in rows:
+            if te.get("wid") != workspace_id:
+                continue
+            proj_id = te.get("project_id") or te.get("pid")  # pid in some responses
+            # compute seconds; toggl duration can be negative if running
+            dur = te.get("duration", 0) or 0
+            seconds = max(0, int(dur))
+            start_iso = te.get("start") or te.get("at") or ""
+            grouped[proj_id].append({
+                "seconds": seconds,
+                "start": start_iso
+            })
+
+        # Shape into your report entries list
+        out = []
+        for proj_id, time_entries in grouped.items():
+            out.append({
+                "user_id": user_id_hint if user_id_hint is not None else 0,
+                "username": username_hint or "Unknown",
+                "project_id": proj_id,
+                "time_entries": time_entries
+            })
+        return out
+
+
 # -----------------------------
 # Formatting helpers
 # -----------------------------
@@ -253,7 +348,8 @@ def gamified_badge(total_hours: float) -> str:
     """
     # thresholds are inclusive lower-bounds
     steps = [
-        (55, "👹 Oni mode! Inhuman productivity!"),
+        (60, "👹 Oni mode! Inhuman productivity!"),
+        (55, "🦄 Mythical productivity!"),
         (50, "🐉 Legendary productivity week!"),
         (45, "🥇 Elite productivity week!"),
         (40, "🏆 Great productivity week!"),
@@ -341,6 +437,9 @@ def lambda_handler(event, context):
     # Quick lookup for user webhooks & weekly commitments
     name_to_webhook = { _norm(u['name']): u.get('discord_webhook_url') for u in team_cfg if 'discord_webhook_url' in u }
     name_to_commit  = { _norm(u['name']): u.get('weekly_commitment_hours') for u in team_cfg if 'weekly_commitment_hours' in u }
+    
+    # Map names to user-level Toggl tokens for fallback
+    name_to_user_token  = { _norm(u['name']): u.get('user_api_token') for u in team_cfg if u.get('user_api_token') }
 
     all_reports = []
     PROJECT_CACHE.clear()
@@ -368,7 +467,70 @@ def lambda_handler(event, context):
             data = get_detailed_report(wid, week_start, week_end)
             if data is None:
                 _alert(f"🚨 Reports API returned no data for workspace '{wname}' (ID {wid}).")
-                continue
+                data = []  # continue, we’ll try to backfill per-user
+
+            # Pull workspace users (active) and see who’s missing from the report
+            ws_users = get_workspace_users(wid)
+            active_users = [u for u in ws_users if u.get("is_active") and not u.get("inactive")]
+
+            # user_ids present in current dataset
+            present_user_ids = set()
+            for entry in (data or []):
+                try:
+                    present_user_ids.add(entry.get("user_id"))
+                except Exception:
+                    pass
+
+            # Backfill: for each active user with no data, try their own API token
+            for u in active_users:
+                uid = u.get("id")
+                if uid in present_user_ids:
+                    continue
+
+                uname = u.get("fullname") or u.get("name") or ""
+                uname_norm = _norm(uname)
+
+                u_token = name_to_user_token.get(uname_norm)
+                if not u_token and not uname_norm in name_to_user_token:
+                    # No user token available; specific alert
+                    _alert(
+                        "🔎 Missing user API token for active Toggl user with no weekly entries:\n"
+                        f"• Workspace: '{wname}' (ID {wid})\n"
+                        f"• User: {uname}\n"
+                        "→ Add their `user_api_token` in the TEAM (Toggl_users) sheet to backfill their report."
+                    )
+                    continue
+
+                # 1) Try Reports API v3 with the user's token (may be empty due to permissions)
+                per_user = get_detailed_report_for_user_with_token(
+                    wid, week_start, week_end, u_token, user_id=uid
+                )
+                if per_user and isinstance(per_user, list) and len(per_user) > 0:
+                    data.extend(per_user)
+                    continue
+
+                # 2) Fallback: use v9/me/time_entries with the user's token and map to your shape
+                fallback = get_v9_me_time_entries_for_user_token(
+                    workspace_id=wid,
+                    start_date=week_start,
+                    end_date=week_end,
+                    user_api_token=u_token,
+                    username_hint=uname,
+                    user_id_hint=uid
+                )
+                if fallback:
+                    data.extend(fallback)
+                else:
+                    _alert(
+                        "🧪 User-level backfill returned no entries either (Reports v3 empty and /me/time_entries empty):\n"
+                        f"• Workspace: '{wname}' (ID {wid})\n"
+                        f"• User: {uname}"
+                    )
+
+
+            # Now build reports with the enriched data
+            reports = generate_discord_reports(data, week_start, week_end)
+
 
             # Build reports (per-user) from Toggl data
             reports = generate_discord_reports(data, week_start, week_end)
@@ -377,7 +539,7 @@ def lambda_handler(event, context):
             ws_users = get_workspace_users(wid)
             active_users = [u for u in ws_users if u.get("is_active") and not u.get("inactive")]
             id_to_name = {u.get("id"): _norm(u.get("fullname") or u.get("name") or "") for u in ws_users}
-
+            
             # If there are active users but no reports at all, alert
             if not reports and active_users:
                 _alert(
@@ -385,7 +547,26 @@ def lambda_handler(event, context):
                     f"for workspace '{wname}' (ID {wid}) with active members:\n"
                     f"{_format_json_list(active_users)}"
                 )
+                
+                # Alert when an active user has no entries AND no user_api_token in TEAM
+                present_user_ids = set(reports.keys())  # user_ids present in the built report
+                for u in active_users:
+                    uid = u.get("id")
+                    if uid in present_user_ids:
+                        continue  # they already have data this week
 
+                    uname = u.get("fullname") or u.get("name") or ""
+                    uname_norm = _norm(uname)
+
+                    has_token = bool(name_to_user_token.get(uname_norm))
+                    if not has_token:
+                        _alert(
+                            "🔎 Missing user API token for active Toggl user with no weekly entries:\n"
+                            f"• Workspace: '{wname}' (ID {wid})\n"
+                            f"• User: {uname}\n"
+                            "→ Add their `user_api_token` in the TEAM (Toggl_users) sheet to backfill their report."
+                        )
+            
             # Enrich message with weekly commitment + collect for sending
             for uid, r in reports.items():
                 uname_norm = id_to_name.get(uid, _norm(r['username']))
@@ -400,7 +581,7 @@ def lambda_handler(event, context):
                     
                     # 🔔 Alert if below 50% of commitment (and commitment is > 0)
                     if weekly > 0 and pct < 50.0:
-                        _alert(
+                        r['message'] += (
                             f"⚠️ {r['username']} at {pct}% of weekly commitment "
                             f"({r['total_hours']:.1f}h / {weekly:.1f}h)"
                         )
