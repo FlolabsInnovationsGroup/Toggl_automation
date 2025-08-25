@@ -403,9 +403,9 @@ def generate_discord_reports(toggl_data, week_start_date, week_end_date):
         username = report['username']
         total_hours = report['total_seconds'] / 3600
         parts = [
-            "📊 **WEEKLY TIME TRACKING REPORT**",
+            "# 📊 WEEKLY TIME TRACKING REPORT",
             "=" * 40,
-            f"👤 **Employee:** {username}",
+            f"## 👤 Team member: {username}",
             f"📅 **Week:** {week_start_date.strftime('%B %d')} - {week_end_date.strftime('%B %d, %Y')}",
             f"⏰ **Total Time:** {format_seconds_to_hm(report['total_seconds'])} ({total_hours:.1f} hours)",
             f"📝 **Total Entries:** {report['total_entries']}",
@@ -582,7 +582,7 @@ def lambda_handler(event, context):
                     # 🔔 Alert if below 50% of commitment (and commitment is > 0)
                     if weekly > 0 and pct < 50.0:
                         r['message'] += (
-                            f"⚠️ {r['username']} at {pct}% of weekly commitment "
+                            f"\n> ⚠️ {r['username']} at {pct}% of weekly commitment "
                             f"({r['total_hours']:.1f}h / {weekly:.1f}h)"
                         )
                     
