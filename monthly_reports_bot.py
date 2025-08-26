@@ -1,11 +1,33 @@
-import os
-import csv
-import json
-import base64
-import requests
+import os, csv, json, base64, requests
 from io import StringIO
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+
+"""
+Monthly Toggl Reports (Lambda)
+
+Sends one Discord message per person with:
+- Hours this month
+- Total hours in the last 12 months (across all selected workspaces)
+
+It aggregates by NORMALIZED NAME (not Toggl user_id) so a person is not split across workspaces.
+It prefers Reports API v3 totals; if empty, falls back to Reports API v2 summary.
+
+ENV VARS
+--------
+GOOGLE_SHEET_URL          -> Google Sheets URL (Anyone with link: view)
+TEAM_GID                  -> gid for TEAM tab
+WORKSPACES_GID            -> gid for WORKSPACES tab
+SYSTEM_ALERT_WEBHOOK      -> Discord webhook for admin alerts (optional but recommended)
+DISCORD_FALLBACK_WEBHOOK  -> Fallback webhook if a user-specific one is missing (optional)
+HTTP_TIMEOUT_SECONDS      -> HTTP timeout for API calls (default: 20)
+FILTER_WORKSPACE_IDS      -> optional comma-separated wid list to include (e.g. "123,456")
+
+TEAM tab columns (case-insensitive):
+- name, discord_webhook_url
+WORKSPACES tab columns (case-insensitive):
+- name, api_token
+"""
 
 # ==========================
 # ENV / CONFIG
@@ -14,16 +36,18 @@ GOOGLE_SHEET_URL         = os.getenv("GOOGLE_SHEET_URL", "")
 TEAM_GID                 = os.getenv("TEAM_GID", "")
 WORKSPACES_GID           = os.getenv("WORKSPACES_GID", "")
 SYSTEM_ALERT_WEBHOOK     = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
-HISTORY_START_DATE_STR   = os.getenv("HISTORY_START_DATE", "2015-01-01")
-FILTER_WORKSPACE_IDS_RAW = os.getenv("FILTER_WORKSPACE_IDS", "").strip()
 DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "").strip()
 HTTP_TIMEOUT             = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+FILTER_WORKSPACE_IDS_RAW = os.getenv("FILTER_WORKSPACE_IDS", "").strip()
 
-# Optional wid filter
+# Optional wid filter (comma-separated list of workspace IDs)
 FILTER_WIDS = set()
 if FILTER_WORKSPACE_IDS_RAW:
     FILTER_WIDS = {int(x.strip()) for x in FILTER_WORKSPACE_IDS_RAW.split(",") if x.strip().isdigit()}
 
+# ==========================
+# Alert helper
+# ==========================
 def _alert(msg: str):
     print(f"[ALERT] {msg}")
     if SYSTEM_ALERT_WEBHOOK:
@@ -32,9 +56,9 @@ def _alert(msg: str):
         except Exception:
             pass
 
-def _norm(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
-
+# ==========================
+# Sheets helpers
+# ==========================
 def _sheet_export_csv_url(sheet_url: str, gid: str) -> str:
     if not sheet_url or not gid:
         return ""
@@ -44,6 +68,7 @@ def _sheet_export_csv_url(sheet_url: str, gid: str) -> str:
     except Exception:
         return ""
 
+
 def _fetch_csv_rows(sheet_url: str, gid: str) -> list[list[str]]:
     url = _sheet_export_csv_url(sheet_url, gid)
     if not url:
@@ -52,6 +77,7 @@ def _fetch_csv_rows(sheet_url: str, gid: str) -> list[list[str]]:
     resp.raise_for_status()
     return list(csv.reader(StringIO(resp.text)))
 
+
 def _find_header(headers: list[str], *cands) -> int | None:
     h = [x.strip().lower() for x in headers]
     for c in cands:
@@ -59,16 +85,19 @@ def _find_header(headers: list[str], *cands) -> int | None:
             return h.index(c)
     return None
 
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
 def load_team_sheet() -> list[dict]:
     rows = _fetch_csv_rows(GOOGLE_SHEET_URL, TEAM_GID)
     if not rows:
         _alert("TEAM tab not reachable or empty")
         return []
     headers = rows[0]
-    i_name   = _find_header(headers, "name", "full name", "fullname")
-    i_web    = _find_header(headers, "discord_webhook_url", "webhook", "discord webhook")
-    i_u_tok  = _find_header(headers, "user_api_token", "user token", "user api token")
-    i_email  = _find_header(headers, "email")
+    i_name = _find_header(headers, "name", "full name", "fullname")
+    i_web  = _find_header(headers, "discord_webhook_url", "webhook", "discord webhook")
 
     team = []
     for r in rows[1:]:
@@ -79,53 +108,43 @@ def load_team_sheet() -> list[dict]:
             item = {"name": name}
             if i_web is not None and i_web < len(r) and r[i_web].strip():
                 item["discord_webhook_url"] = r[i_web].strip()
-            if i_u_tok is not None and i_u_tok < len(r) and r[i_u_tok].strip():
-                item["user_api_token"] = r[i_u_tok].strip()
-            if i_email is not None and i_email < len(r) and r[i_email].strip():
-                item["email"] = r[i_email].strip()
             team.append(item)
         except Exception:
             continue
     return team
 
-# -----------------------------
-# Toggl Core API v9 helpers (user token)
-# -----------------------------
 
-def _headers_for_user_token(user_api_token: str) -> dict:
-    auth_header = base64.b64encode(f"{user_api_token}:api_token".encode()).decode()
+def load_workspace_tokens() -> list[dict]:
+    rows = _fetch_csv_rows(GOOGLE_SHEET_URL, WORKSPACES_GID)
+    if not rows:
+        _alert("WORKSPACES tab not reachable or empty")
+        return []
+    headers = rows[0]
+    i_name = _find_header(headers, "name")
+    i_tok  = _find_header(headers, "api_token", "token", "api token")
+    out = []
+    for r in rows[1:]:
+        try:
+            name = r[i_name].strip() if i_name is not None and i_name < len(r) else ""
+            tok  = r[i_tok].strip()  if i_tok  is not None and i_tok  < len(r) else ""
+            if name and tok:
+                out.append({"name": name, "api_token": tok})
+        except Exception:
+            continue
+    return out
+
+# ==========================
+# Toggl helpers (Reports v3 totals + v2 summary fallback)
+# ==========================
+def _headers_for_token(api_token: str) -> dict:
     return {
-        "Authorization": f"Basic {auth_header}",
+        "Authorization": "Basic " + base64.b64encode(f"{api_token}:api_token".encode()).decode(),
         "Content-Type": "application/json"
     }
 
-def fetch_me_time_entries(user_api_token: str, start_iso: str, end_iso: str) -> list[dict]:
-    """
-    GET /api/v9/me/time_entries?start_date=...&end_date=...
-    Returns list of TE dicts. We do not page here; Toggl v9 returns entries within the range.
-    """
-    url = "https://api.track.toggl.com/api/v9/me/time_entries"
-    params = {"start_date": start_iso, "end_date": end_iso}
-    hdrs = _headers_for_user_token(user_api_token)
-    resp = requests.get(url, headers=hdrs, params=params, timeout=HTTP_TIMEOUT)
-    if not resp.ok:
-        return []
-    return resp.json() or []
-
-def _sum_hours(entries: list[dict]) -> float:
-    total_seconds = 0
-    for te in entries:
-        wid = te.get("wid")
-        if FILTER_WIDS and wid not in FILTER_WIDS:
-            continue
-        dur = te.get("duration", 0) or 0
-        # Negative duration means running entry; ignore or clamp to 0
-        total_seconds += max(0, int(dur))
-    return round(total_seconds / 3600.0, 2)
 
 def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
     first = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=timezone.utc)
-    # next month’s first day - 1sec
     if dt.month == 12:
         next_first = datetime(dt.year + 1, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
     else:
@@ -133,119 +152,232 @@ def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
     last = next_first - timedelta(seconds=1)
     return first, last
 
-def _year_bounds_utc(y: int) -> tuple[datetime, datetime]:
-    start = datetime(y, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    end   = datetime(y, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
-    return start, end
 
-# -----------------------------
-# Monthly report builder
-# -----------------------------
+def _twelve_months_ago(dt: datetime) -> datetime:
+    # approx 365 days back is fine for the "last 12 months" window
+    return dt - timedelta(days=365)
 
-def build_user_monthly(user_name: str, user_token: str) -> dict:
-    """Return {'name', 'hours_month', 'hours_total'} using the user's token."""
-    now = datetime.now(timezone.utc)
-    m_start, m_end = _month_bounds_utc(now)
 
-    # Month range (single call)
-    month_entries = fetch_me_time_entries(
-        user_token, m_start.strftime("%Y-%m-%dT%H:%M:%SZ"), m_end.strftime("%Y-%m-%dT%H:%M:%SZ")
-    )
-    hours_month = _sum_hours(month_entries)
+def _sum_seconds_to_hours(seconds: int) -> float:
+    return round(max(0, int(seconds)) / 3600.0, 2)
 
-    # Total history range (chunk by year for safety)
-    try:
-        hist_start = datetime.strptime(HISTORY_START_DATE_STR, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except Exception:
-        hist_start = datetime(2015, 1, 1, tzinfo=timezone.utc)
 
-    hours_total = 0.0
-    y = hist_start.year
-    last_year = now.year
-    while y <= last_year:
-        y_start, y_end = _year_bounds_utc(y)
-        # clamp to hist_start / now
-        start = max(y_start, hist_start)
-        end   = min(y_end, now)
-        if start > end:
-            y += 1
-            continue
-        y_entries = fetch_me_time_entries(
-            user_token, start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
-        hours_total += _sum_hours(y_entries)
-        y += 1
+def fetch_totals_by_user_v3(api_token: str, workspace_id: int, start_dt: datetime, end_dt: datetime) -> dict:
+    """
+    POST /reports/api/v3/workspace/{wid}/search/time_entries/totals
+    Body: { start_date, end_date, grouping: "users", grouped: true }
+    Returns: {"seconds": {uid:int}, "names": {uid:str}}
+    """
+    if FILTER_WIDS and workspace_id not in FILTER_WIDS:
+        return {"seconds": {}, "names": {}}
 
-    return {
-        "name": user_name,
-        "hours_month": round(hours_month, 2),
-        "hours_total": round(hours_total, 2),
+    url = f"https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries/totals"
+    payload = {
+        "start_date": start_dt.strftime("%Y-%m-%d"),
+        "end_date":   end_dt.strftime("%Y-%m-%d"),
+        "grouping":   "users",
+        "grouped":    True
     }
+    try:
+        r = requests.post(url, headers=_headers_for_token(api_token)),
+        # (typo guard) ensure variable is the Response
+        r = r[0]
+        if r.status_code != 200:
+            _alert(f"ℹ️ v3 totals failed wid={workspace_id}: {r.status_code} {r.text}")
+            return {"seconds": {}, "names": {}}
+        data = r.json() or {}
+    except Exception as e:
+        _alert(f"⚠️ v3 totals exception wid={workspace_id}: {e}")
+        return {"seconds": {}, "names": {}}
 
-def format_discord_message(name: str, hours_month: float, hours_total: float) -> str:
-    now = datetime.now(timezone.utc)
-    m_start, m_end = _month_bounds_utc(now)
+    seconds_by_user, names_by_user = {}, {}
+    groups = data.get("groups") or data.get("data") or []
+    for g in groups:
+        uid   = g.get("id") or g.get("user_id") or (g.get("group") or {}).get("id")
+        secs  = g.get("seconds") or g.get("total_seconds") or 0
+        title = g.get("title") or g.get("name") or (g.get("group") or {}).get("name") or ""
+        if uid is None:
+            continue
+        try:
+            uid = int(uid)
+        except Exception:
+            continue
+        seconds_by_user[uid] = int(secs or 0)
+        names_by_user[uid]   = str(title).strip()
+
+    _alert(
+        f"{'✅' if seconds_by_user else 'ℹ️'} v3 totals returned {len(seconds_by_user)} users for wid={workspace_id} "
+        f"{start_dt.date()}→{end_dt.date()}"
+    )
+    return {"seconds": seconds_by_user, "names": names_by_user}
+
+
+def fetch_totals_by_user(api_token: str, workspace_id: int, start_dt: datetime, end_dt: datetime) -> dict:
+    """Try v3 totals, then v2 summary fallback."""
+    res_v3 = fetch_totals_by_user_v3(api_token, workspace_id, start_dt, end_dt)
+    if res_v3["seconds"]:
+        return res_v3
+
+    # v2 fallback
+    _alert(f"↩️ Falling back to v2 summary wid={workspace_id} {start_dt.date()}→{end_dt.date()}")
+    url = "https://api.track.toggl.com/reports/api/v2/summary"
+    params = {
+        "workspace_id": workspace_id,
+        "since": start_dt.strftime("%Y-%m-%d"),
+        "until": end_dt.strftime("%Y-%m-%d"),
+        "user_agent": "toggl-discord-bot",
+        "grouping": "users"
+    }
+    try:
+        r = requests.get(url, headers=_headers_for_token(api_token), params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            _alert(f"⚠️ v2 summary failed wid={workspace_id}: {r.status_code} {r.text}")
+            return {"seconds": {}, "names": {}}
+        data = r.json() or {}
+    except Exception as e:
+        _alert(f"⚠️ v2 summary exception wid={workspace_id}: {e}")
+        return {"seconds": {}, "names": {}}
+
+    seconds_by_user, names_by_user = {}, {}
+    rows = data.get("data") or []
+    for row in rows:
+        title = row.get("title") or {}
+        name  = (title.get("user") or title.get("name") or "").strip()
+        ms    = int(row.get("time") or 0)
+        if not name:
+            continue
+        uid = abs(hash(name)) % (10**9)  # pseudo id for internal mapping
+        seconds_by_user[uid] = ms // 1000
+        names_by_user[uid]   = name
+
+    _alert(
+        f"{'✅' if seconds_by_user else 'ℹ️'} v2 summary wid={workspace_id} users={len(seconds_by_user)} "
+        f"for {start_dt.date()}→{end_dt.date()}"
+    )
+    return {"seconds": seconds_by_user, "names": names_by_user}
+
+# ==========================
+# v9 workspaces list
+# ==========================
+def list_workspaces(api_token: str) -> list[dict]:
+    try:
+        r = requests.get("https://api.track.toggl.com/api/v9/workspaces",
+                         headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            _alert(f"⚠️ v9/workspaces failed for token …{api_token[-4:]}: {r.status_code} {r.text}")
+            return []
+        return r.json() or []
+    except Exception as e:
+        _alert(f"⚠️ v9/workspaces exception for token …{api_token[-4:]}: {e}")
+        return []
+
+# ==========================
+# Discord message
+# ==========================
+def format_discord_message(name: str, hours_month: float, hours_total: float, m_start: datetime, m_end: datetime) -> str:
     period = f"{m_start.strftime('%b %d')}–{m_end.strftime('%b %d, %Y')}"
-
+    now    = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     return "\n".join([
-        "📆 **MONTHLY TIME REPORT**",
+        "# 📆 MONTHLY TIME REPORT",
         "—" * 30,
-        f"👤 **Employee:** {name}",
+        f"## 👤 **Employee:** {name}",
         f"🗓️ **Period:** {period}",
         f"⏰ **Hours this month:** {hours_month:.2f} h",
-        f"📈 **Total historical hours:** {hours_total:.2f} h",
+        f"📈 **Total hours in past 12 months:** {hours_total:.2f} h",
         "",
-        f"🤖 *Generated on {now.strftime('%Y-%m-%d %H:%M:%S')} UTC*"
+        f"🤖 *Generated on {now} UTC*"
     ])
 
-# -----------------------------
+# ==========================
 # Lambda entrypoint
-# -----------------------------
-
+# ==========================
 def lambda_handler(event, context):
     team = load_team_sheet()
     if not team:
         _alert("TEAM sheet empty or unreachable.")
         return {"status": "no_team"}
 
+    workspaces = load_workspace_tokens()
+    if not workspaces:
+        _alert("WORKSPACES sheet empty or unreachable.")
+        return {"status": "no_workspaces"}
+
+    # Build webhook lookup by normalized name
+    name_to_webhook = { _norm(t["name"]): (t.get("discord_webhook_url", "").strip()) for t in team if t.get("name") }
+
+    # Date windows
+    now = datetime.now(timezone.utc)
+    m_start, m_end = _month_bounds_utc(now)
+    hist_start     = _twelve_months_ago(now)
+
+    # Accumulators by normalized name
+    month_sec_by_name = defaultdict(int)
+    total_sec_by_name = defaultdict(int)
+    display_name_for  = {}
+
+    # Collect from each workspace under each token
+    for token_entry in workspaces:
+        api_token = token_entry.get("api_token")
+        if not api_token:
+            _alert(f"⚠️ Missing api_token in workspace row: {token_entry}")
+            continue
+
+        wid_list = list_workspaces(api_token)
+        for ws in wid_list:
+            wid = ws.get("id")
+            if not wid:
+                continue
+            if FILTER_WIDS and wid not in FILTER_WIDS:
+                continue
+
+            # Monthly totals
+            month_res = fetch_totals_by_user(api_token, wid, m_start, m_end)
+            for uid, secs in month_res["seconds"].items():
+                name = month_res["names"].get(uid, f"User {uid}").strip()
+                key  = _norm(name)
+                month_sec_by_name[key] += int(secs or 0)
+                if len(name) > len(display_name_for.get(key, "")):
+                    display_name_for[key] = name
+
+            # Last 12 months totals
+            hist_res = fetch_totals_by_user(api_token, wid, hist_start, now)
+            for uid, secs in hist_res["seconds"].items():
+                name = hist_res["names"].get(uid, f"User {uid}").strip()
+                key  = _norm(name)
+                total_sec_by_name[key] += int(secs or 0)
+                if len(name) > len(display_name_for.get(key, "")):
+                    display_name_for[key] = name
+
+    # Compose and send
     sent = 0
-    results = []
+    processed = 0
 
-    for row in team:
-        name = row.get("name", "").strip()
-        user_token = row.get("user_api_token", "").strip()
-        webhook = row.get("discord_webhook_url", "").strip()
+    # Use union of keys so users with month but no total (or vice versa) still send
+    all_keys = set(month_sec_by_name.keys()) | set(total_sec_by_name.keys())
 
-        if not name:
+    for key in sorted(all_keys):
+        processed += 1
+        name = display_name_for.get(key, key.title())
+        month_hours = _sum_seconds_to_hours(month_sec_by_name.get(key, 0))
+        total_hours = _sum_seconds_to_hours(total_sec_by_name.get(key, 0))
+
+        # Skip completely empty users (0 & 0) to reduce noise; comment this block out if you want everyone
+        if month_hours == 0 and total_hours == 0:
             continue
 
-        if not user_token:
-            _alert(f"🔎 Missing `user_api_token` for '{name}' in TEAM sheet.")
-            # Skip this user (per your requirement: only alert for missing token)
-            continue
-
-        try:
-            summary = build_user_monthly(name, user_token)
-        except Exception as e:
-            _alert(f"⚠️ Error building monthly report for {name}: {e}")
-            continue
-
-        msg = format_discord_message(summary["name"], summary["hours_month"], summary["hours_total"])
-        results.append(summary)
-
-        # Send to user’s webhook or fallback (if provided)
-        target_webhook = webhook or DISCORD_FALLBACK_WEBHOOK
-        if not target_webhook:
-            # If no webhook configured anywhere, do nothing (no alert requested).
+        msg = format_discord_message(name, month_hours, total_hours, m_start, m_end)
+        webhook = name_to_webhook.get(key) or DISCORD_FALLBACK_WEBHOOK
+        if not webhook:
+            _alert(f"ℹ️ No webhook for '{name}' and no DISCORD_FALLBACK_WEBHOOK; skipping send.")
             continue
 
         try:
-            r = requests.post(target_webhook, json={"content": msg}, timeout=HTTP_TIMEOUT)
-            if r.status_code == 204:
+            resp = requests.post(webhook, json={"content": msg}, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 204:
                 sent += 1
             else:
-                _alert(f"⚠️ Discord send failed for {name}: {r.status_code} {r.text}")
+                _alert(f"⚠️ Discord send failed for {name}: {resp.status_code} {resp.text}")
         except Exception as e:
             _alert(f"⚠️ Discord send exception for {name}: {e}")
 
-    return {"status": "ok", "sent": sent, "users_processed": len(results)}
+    return {"status": "ok", "users_processed": processed, "sent": sent}

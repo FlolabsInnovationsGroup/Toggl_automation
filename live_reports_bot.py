@@ -126,7 +126,7 @@ def _get_user_state(user_name: str) -> dict:
         seen_updates = {str(k): str(v) for k, v in seen_updates.items()}
         return {"seen_entries": seen_entries, "seen_updates": seen_updates}
     except Exception as e:
-        print(f"[ERROR] DynamoDB get error for {user_name}: {e}")
+        _alert(f"[ERROR] DynamoDB get error for {user_name}: {e}")
         return {"seen_entries": [], "seen_updates": {}}
 
 def _save_user_state(user_name: str, seen_entries: list, seen_updates: dict):
@@ -139,7 +139,7 @@ def _save_user_state(user_name: str, seen_entries: list, seen_updates: dict):
             "seen_updates": seen_updates
         })
     except Exception as e:
-        print(f"[ERROR] DynamoDB put error for {user_name}: {e}")
+        _alert(f"[ERROR] DynamoDB put error for {user_name}: {e}")
 
 # ==========================
 # Toggl API helpers
@@ -155,9 +155,9 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
         r = requests.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
             return r.json() or []
-        print(f"[ERROR] get_workspaces_for_token: {r.status_code} {r.text}")
+        _alert(f"[ERROR] get_workspaces_for_token: {r.status_code} {r.text}")
     except Exception as e:
-        print(f"[ERROR] get_workspaces_for_token exception: {e}")
+        _alert(f"[ERROR] get_workspaces_for_token exception: {e}")
     return []
 
 def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime) -> list[dict]:
@@ -177,7 +177,7 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
     while True:
         resp = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
-            print(f"[ERROR] details fetch failed: {resp.status_code} - {resp.text}")
+            _alert(f"[ERROR] details fetch failed: {resp.status_code} - {resp.text}")
             break
         data = resp.json()
         entries = data.get("data", []) or []
@@ -250,7 +250,7 @@ def lambda_handler(event, context):
 
                 webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
                 if not webhook_url:
-                    print(f"[INFO] No webhook configured for '{user_name}', skipping {entry_id}")
+                    _alert(f"[INFO] No webhook configured for '{user_name}', skipping {entry_id}")
                     continue
 
                 # parse timestamps
@@ -321,10 +321,10 @@ def lambda_handler(event, context):
                 try:
                     r = requests.post(webhook_url, json={"content": msg}, timeout=HTTP_TIMEOUT)
                     if r.status_code != 204:
-                        print(f"[ERROR] Discord send failed for {user_name}: {r.status_code} - {r.text}")
+                        _alert(f"[ERROR] Discord send failed for {user_name}: {r.status_code} - {r.text}")
                     else:
                         notified += 1
                 except Exception as e:
-                    print(f"[ERROR] Discord send exception for {user_name}: {e}")
+                    _alert(f"[ERROR] Discord send exception for {user_name}: {e}")
 
     return {"status": "complete", "notified": notified}
