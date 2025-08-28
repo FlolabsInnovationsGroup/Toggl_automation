@@ -17,10 +17,12 @@ TEAM_GID             = os.getenv("TEAM_GID", "")
 WORKSPACES_GID       = os.getenv("WORKSPACES_GID", "")
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 
-DYNAMODB_TABLE       = os.getenv("DYNAMODB_TABLE", "")
+DYNAMODB_TABLE      = os.getenv("DYNAMODB_TABLE", "")
 TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
-MAX_SEEN_IDS         = int(os.getenv("MAX_SEEN_IDS", "50"))
-HTTP_TIMEOUT         = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+MAX_SEEN_IDS        = int(os.getenv("MAX_SEEN_IDS", "50"))
+HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON: don't notify on first-seen items started before window
+
 
 # Discord rate limiting knobs
 DISCORD_MIN_INTERVAL_MS       = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))   # per-webhook gap
@@ -354,45 +356,59 @@ def lambda_handler(event, context):
                 start_dt   = _parse(start_str) if start_str else now
                 updated_dt = _parse(updated_str) if updated_str else now
 
-                # load and check state
-                state         = _get_user_state(user_name)
-                seen_ids      = set(state["seen_entries"])
-                seen_updates  = state["seen_updates"]
-                prev_updated  = seen_updates.get(entry_id)
+                                # --- stable state key for DynamoDB (prefer uid, fallback to normalized name) ---
+                uid = entry.get("uid")
+                state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
 
-                window_start = since
+                # --- load state ---
+                state        = _get_user_state(state_key)
+                seen_ids     = set(state["seen_entries"])
+                seen_updates = state["seen_updates"]
 
+                prev_updated_str = seen_updates.get(entry_id)
+                def _parse(ts: str) -> datetime:
+                    try:
+                        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
+                        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+                    except Exception:
+                        return now
+
+                prev_updated = _parse(prev_updated_str) if prev_updated_str else None
+                first_seen   = prev_updated is None  # source of truth is the updates map
+
+                # Always persist latest 'updated' we observed
+                seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+                if entry_id not in seen_ids:
+                    state["seen_entries"].append(entry_id)  # keep for quick membership; capped on save
+
+                # Decide notification:
                 should_notify = False
                 label         = "🆕 New Time Entry Added"
 
-                if entry_id not in seen_ids:
-                    # First time we see this entry
-                    if updated_dt >= window_start:
+                if first_seen:
+                    # First time we ever see this entry in DB.
+                    # Flood guard: if the entry STARTED before the window, just ingest; don't notify.
+                    # (We still detect future edits because prev_updated now exists.)
+                    if HARD_START_FILTER and start_dt < since:
+                        _save_user_state(state_key, state["seen_entries"], seen_updates)
+                        continue
+                    # Otherwise (started within window), treat as new-in-window
+                    if updated_dt >= since:
                         should_notify = True
                         label = "🆕 New Time Entry Added"
-                    # Regardless of notification, ingest it to prevent future floods
-                    state["seen_entries"].append(entry_id)
-                    seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                 else:
-                    # We’ve seen this ID: notify only if it got edited in the window
-                    if prev_updated:
-                        prev_dt = _parse(prev_updated)
-                        if updated_dt > prev_dt and updated_dt >= window_start:
-                            should_notify = True
-                            label = "✍️ Time Entry Edited"
-                    else:
-                        # legacy rows that had no seen_updates recorded
-                        if updated_dt >= window_start:
-                            should_notify = True
-                            label = "✍️ Time Entry Edited"
-                    # always refresh stored updated
-                    seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-                
-                _save_user_state(user_name, state["seen_entries"], seen_updates)
+                    # Seen before: notify only if it was edited after we last saw it, AND inside window
+                    if (updated_dt > prev_updated) and (updated_dt >= since):
+                        should_notify = True
+                        label = "✍️ Time Entry Edited"
+
+                # Persist latest state before any network call
+                _save_user_state(state_key, state["seen_entries"], seen_updates)
+
                 if not should_notify:
                     continue
 
-                # send once we decided to notify (rate-limited)
+                # send (rate-limited)
                 duration_fmt = convert_ms_to_hms(duration_ms)
                 msg = (
                     f"## {label}\n"
