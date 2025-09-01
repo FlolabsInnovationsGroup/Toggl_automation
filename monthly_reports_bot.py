@@ -1,14 +1,14 @@
-import os, csv, json, base64, requests
+import os, csv, json, base64, requests, time, random
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 """
-Monthly Toggl Reports (Lambda)
+Monthly Toggl Reports (Lambda) with Discord Rate Limiter
 
 Sends one Discord message per person with:
 - Hours this month
-- Total hours in the last 12 months (across all selected workspaces)
+- Total hours in the entire history (across all selected workspaces)
 
 It aggregates by NORMALIZED NAME (not Toggl user_id) so a person is not split across workspaces.
 It prefers Reports API v3 totals; if empty, falls back to Reports API v2 summary.
@@ -23,10 +23,15 @@ DISCORD_FALLBACK_WEBHOOK  -> Fallback webhook if a user-specific one is missing 
 HTTP_TIMEOUT_SECONDS      -> HTTP timeout for API calls (default: 20)
 FILTER_WORKSPACE_IDS      -> optional comma-separated wid list to include (e.g. "123,456")
 
-TEAM tab columns (case-insensitive):
-- name, discord_webhook_url
-WORKSPACES tab columns (case-insensitive):
-- name, api_token
+# History scan controls (optional)
+HISTORY_STEP_MONTHS       -> months per window when scanning history (default: 12)
+HISTORY_MAX_EMPTY_WINDOWS -> stop after N consecutive empty windows (default: 2)
+HISTORY_MAX_YEARS         -> hard cap on how far back to go (default: 15)
+
+# Discord rate limiting (optional)
+DISCORD_MIN_INTERVAL_MS        -> per-webhook minimum gap (default: 500)
+DISCORD_GLOBAL_MIN_INTERVAL_MS -> global minimum gap between ANY sends (default: 0)
+DISCORD_MAX_RETRIES            -> max retries on 429/5xx (default: 5)
 """
 
 # ==========================
@@ -39,6 +44,16 @@ SYSTEM_ALERT_WEBHOOK     = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 DISCORD_FALLBACK_WEBHOOK = os.getenv("DISCORD_FALLBACK_WEBHOOK", "").strip()
 HTTP_TIMEOUT             = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 FILTER_WORKSPACE_IDS_RAW = os.getenv("FILTER_WORKSPACE_IDS", "").strip()
+
+# History scanning controls
+HISTORY_STEP_MONTHS        = int(os.getenv("HISTORY_STEP_MONTHS", "12"))
+HISTORY_MAX_EMPTY_WINDOWS  = int(os.getenv("HISTORY_MAX_EMPTY_WINDOWS", "2"))
+HISTORY_MAX_YEARS          = int(os.getenv("HISTORY_MAX_YEARS", "15"))
+
+# Discord rate limiting knobs
+DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
+DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))
+DISCORD_MAX_RETRIES            = int(os.getenv("DISCORD_MAX_RETRIES", "5"))
 
 # Optional wid filter (comma-separated list of workspace IDs)
 FILTER_WIDS = set()
@@ -153,9 +168,14 @@ def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
     return first, last
 
 
-def _twelve_months_ago(dt: datetime) -> datetime:
-    # approx 365 days back is fine for the "last 12 months" window
-    return dt - timedelta(days=365)
+def _shift_months(dt: datetime, months: int) -> datetime:
+    """
+    Shift a UTC datetime to the first day of the target month (00:00 UTC).
+    E.g., shift -12 moves 1 year back to the first of that month.
+    """
+    y = dt.year + (dt.month - 1 + months) // 12
+    m = ((dt.month - 1 + months) % 12) + 1
+    return datetime(y, m, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 
 def _sum_seconds_to_hours(seconds: int) -> float:
@@ -179,9 +199,7 @@ def fetch_totals_by_user_v3(api_token: str, workspace_id: int, start_dt: datetim
         "grouped":    True
     }
     try:
-        r = requests.post(url, headers=_headers_for_token(api_token)),
-        # (typo guard) ensure variable is the Response
-        r = r[0]
+        r = requests.post(url, headers=_headers_for_token(api_token), json=payload, timeout=HTTP_TIMEOUT)
         if r.status_code != 200:
             _alert(f"ℹ️ v3 totals failed wid={workspace_id}: {r.status_code} {r.text}")
             return {"seconds": {}, "names": {}}
@@ -205,10 +223,6 @@ def fetch_totals_by_user_v3(api_token: str, workspace_id: int, start_dt: datetim
         seconds_by_user[uid] = int(secs or 0)
         names_by_user[uid]   = str(title).strip()
 
-    _alert(
-        f"{'✅' if seconds_by_user else 'ℹ️'} v3 totals returned {len(seconds_by_user)} users for wid={workspace_id} "
-        f"{start_dt.date()}→{end_dt.date()}"
-    )
     return {"seconds": seconds_by_user, "names": names_by_user}
 
 
@@ -219,7 +233,6 @@ def fetch_totals_by_user(api_token: str, workspace_id: int, start_dt: datetime, 
         return res_v3
 
     # v2 fallback
-    _alert(f"↩️ Falling back to v2 summary wid={workspace_id} {start_dt.date()}→{end_dt.date()}")
     url = "https://api.track.toggl.com/reports/api/v2/summary"
     params = {
         "workspace_id": workspace_id,
@@ -250,10 +263,6 @@ def fetch_totals_by_user(api_token: str, workspace_id: int, start_dt: datetime, 
         seconds_by_user[uid] = ms // 1000
         names_by_user[uid]   = name
 
-    _alert(
-        f"{'✅' if seconds_by_user else 'ℹ️'} v2 summary wid={workspace_id} users={len(seconds_by_user)} "
-        f"for {start_dt.date()}→{end_dt.date()}"
-    )
     return {"seconds": seconds_by_user, "names": names_by_user}
 
 # ==========================
@@ -272,6 +281,134 @@ def list_workspaces(api_token: str) -> list[dict]:
         return []
 
 # ==========================
+# History aggregation (12-month windows)
+# ==========================
+def aggregate_history_for_workspace(api_token: str, wid: int, end_dt: datetime) -> dict[str, int]:
+    """
+    Walk history backwards in HISTORY_STEP_MONTHS windows and aggregate total seconds per normalized name.
+    Stops after HISTORY_MAX_EMPTY_WINDOWS consecutive empty windows or HISTORY_MAX_YEARS cap.
+    Returns dict[name_norm] = seconds
+    """
+    totals_by_name = defaultdict(int)
+
+    # Start at the end of the current month
+    _, current_end = _month_bounds_utc(end_dt)
+    empty_streak = 0
+    max_steps = max(1, (HISTORY_MAX_YEARS * 12) // max(1, HISTORY_STEP_MONTHS))
+
+    for _ in range(max_steps):
+        # window: [window_start, current_end]
+        start_month = _shift_months(current_end, -(HISTORY_STEP_MONTHS - 1))
+        window_start = start_month
+        window_end   = current_end
+
+        res = fetch_totals_by_user(api_token, wid, window_start, window_end)
+        if not res["seconds"]:
+            empty_streak += 1
+            if empty_streak >= HISTORY_MAX_EMPTY_WINDOWS:
+                break
+        else:
+            empty_streak = 0
+            for uid, secs in res["seconds"].items():
+                name = res["names"].get(uid, f"User {uid}").strip()
+                key  = _norm(name)
+                totals_by_name[key] += int(secs or 0)
+
+        # move the cursor to the end of the month prior to window_start
+        prev_day = window_start - timedelta(days=1)
+        _, current_end = _month_bounds_utc(prev_day)
+
+    return totals_by_name
+
+# ==========================
+# Discord rate limiting helpers
+# ==========================
+_last_send_ts_per_webhook = {}  # webhook_url -> monotonic timestamp
+_last_send_ts_global = 0.0      # monotonic timestamp
+
+
+def _sleep_ms(ms: int):
+    if ms > 0:
+        time.sleep(ms / 1000.0)
+
+
+def _respect_min_interval(webhook_url: str):
+    """Ensure per-webhook spacing."""
+    now = time.monotonic()
+    last = _last_send_ts_per_webhook.get(webhook_url)
+    if last is not None:
+        elapsed_ms = int((now - last) * 1000)
+        if elapsed_ms < DISCORD_MIN_INTERVAL_MS:
+            _sleep_ms(DISCORD_MIN_INTERVAL_MS - elapsed_ms)
+    _last_send_ts_per_webhook[webhook_url] = time.monotonic()
+
+
+def _respect_global_interval():
+    """Ensure global spacing across ANY sends."""
+    global _last_send_ts_global
+    if DISCORD_GLOBAL_MIN_INTERVAL_MS <= 0:
+        return
+    now = time.monotonic()
+    if _last_send_ts_global > 0:
+        elapsed_ms = int((now - _last_send_ts_global) * 1000)
+        if elapsed_ms < DISCORD_GLOBAL_MIN_INTERVAL_MS:
+            _sleep_ms(DISCORD_GLOBAL_MIN_INTERVAL_MS - elapsed_ms)
+    _last_send_ts_global = time.monotonic()
+
+
+def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20) -> bool:
+    """Send a Discord message honoring pacing and 429/5xx backoffs."""
+    # Global + per-webhook spacing
+    _respect_global_interval()
+    _respect_min_interval(webhook_url)
+
+    payload = {"content": content}
+    attempt = 0
+    base_backoff = 1.0  # seconds
+    while attempt < DISCORD_MAX_RETRIES:
+        try:
+            resp = requests.post(webhook_url, json=payload, timeout=timeout)
+            if resp.status_code == 204:
+                return True
+            if resp.status_code == 429:
+                # Rate limited: honor Retry-After or X-RateLimit-Reset-After or body.retry_after
+                retry_after = None
+                try:
+                    retry_after = (resp.headers.get("Retry-After") or
+                                   resp.headers.get("X-RateLimit-Reset-After"))
+                    if retry_after is None:
+                        data = resp.json()
+                        retry_after = data.get("retry_after") or data.get("Retry-After")
+                except Exception:
+                    pass
+                try:
+                    wait_s = float(retry_after) if retry_after is not None else 2.0
+                except Exception:
+                    wait_s = 2.0
+                wait_s += random.uniform(0.05, 0.25)  # jitter
+                time.sleep(wait_s)
+                attempt += 1
+                continue
+            if 500 <= resp.status_code < 600:
+                # transient server error: exponential backoff
+                wait_s = base_backoff * (2 ** attempt) + random.uniform(0.05, 0.25)
+                time.sleep(wait_s)
+                attempt += 1
+                continue
+            # Other non-success codes
+            _alert(f"⚠️ Discord send failed: {resp.status_code} {resp.text}")
+            return False
+        except Exception as e:
+            # network issue: backoff and retry
+            wait_s = base_backoff * (2 ** attempt) + random.uniform(0.05, 0.25)
+            time.sleep(wait_s)
+            attempt += 1
+            if attempt >= DISCORD_MAX_RETRIES:
+                _alert(f"⚠️ Discord send exception: {e}")
+                return False
+    return False
+
+# ==========================
 # Discord message
 # ==========================
 def format_discord_message(name: str, hours_month: float, hours_total: float, m_start: datetime, m_end: datetime) -> str:
@@ -283,7 +420,7 @@ def format_discord_message(name: str, hours_month: float, hours_total: float, m_
         f"## 👤 **Employee:** {name}",
         f"🗓️ **Period:** {period}",
         f"⏰ **Hours this month:** {hours_month:.2f} h",
-        f"📈 **Total hours in past 12 months:** {hours_total:.2f} h",
+        f"📈 **Total hours (company history):** {hours_total:.2f} h",
         "",
         f"🤖 *Generated on {now} UTC*"
     ])
@@ -307,12 +444,12 @@ def lambda_handler(event, context):
 
     # Date windows
     now = datetime.now(timezone.utc)
-    m_start, m_end = _month_bounds_utc(now)
-    hist_start     = _twelve_months_ago(now)
+    m_start, m_end = _month_bounds_utc(datetime(now.year, now.month-1, now.day, 0, 0, 0, tzinfo=timezone.utc))
+    m_end = datetime(m_end.year, m_end.month+1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     # Accumulators by normalized name
     month_sec_by_name = defaultdict(int)
-    total_sec_by_name = defaultdict(int)
+    history_sec_by_name = defaultdict(int)   # lifetime totals
     display_name_for  = {}
 
     # Collect from each workspace under each token
@@ -330,7 +467,7 @@ def lambda_handler(event, context):
             if FILTER_WIDS and wid not in FILTER_WIDS:
                 continue
 
-            # Monthly totals
+            # Monthly totals for current month
             month_res = fetch_totals_by_user(api_token, wid, m_start, m_end)
             for uid, secs in month_res["seconds"].items():
                 name = month_res["names"].get(uid, f"User {uid}").strip()
@@ -339,29 +476,27 @@ def lambda_handler(event, context):
                 if len(name) > len(display_name_for.get(key, "")):
                     display_name_for[key] = name
 
-            # Last 12 months totals
-            hist_res = fetch_totals_by_user(api_token, wid, hist_start, now)
-            for uid, secs in hist_res["seconds"].items():
-                name = hist_res["names"].get(uid, f"User {uid}").strip()
-                key  = _norm(name)
-                total_sec_by_name[key] += int(secs or 0)
-                if len(name) > len(display_name_for.get(key, "")):
-                    display_name_for[key] = name
+            # Lifetime totals via HISTORY_STEP_MONTHS windows
+            hist_totals = aggregate_history_for_workspace(api_token, wid, now)
+            for key, secs in hist_totals.items():
+                history_sec_by_name[key] += int(secs or 0)
+                # prefer the prettier name if we already captured it from month_res; otherwise default Title case
+                display_name_for.setdefault(key, key.title())
 
     # Compose and send
     sent = 0
     processed = 0
 
-    # Use union of keys so users with month but no total (or vice versa) still send
-    all_keys = set(month_sec_by_name.keys()) | set(total_sec_by_name.keys())
+    # Use union of keys so users with month but no history (or vice versa) still send
+    all_keys = set(month_sec_by_name.keys()) | set(history_sec_by_name.keys())
 
     for key in sorted(all_keys):
         processed += 1
         name = display_name_for.get(key, key.title())
-        month_hours = _sum_seconds_to_hours(month_sec_by_name.get(key, 0))
-        total_hours = _sum_seconds_to_hours(total_sec_by_name.get(key, 0))
+        month_hours  = _sum_seconds_to_hours(month_sec_by_name.get(key, 0))
+        total_hours  = _sum_seconds_to_hours(history_sec_by_name.get(key, 0))
 
-        # Skip completely empty users (0 & 0) to reduce noise; comment this block out if you want everyone
+        # Skip completely empty users to reduce noise; comment out if you want everyone
         if month_hours == 0 and total_hours == 0:
             continue
 
@@ -371,13 +506,10 @@ def lambda_handler(event, context):
             _alert(f"ℹ️ No webhook for '{name}' and no DISCORD_FALLBACK_WEBHOOK; skipping send.")
             continue
 
-        try:
-            resp = requests.post(webhook, json={"content": msg}, timeout=HTTP_TIMEOUT)
-            if resp.status_code == 204:
-                sent += 1
-            else:
-                _alert(f"⚠️ Discord send failed for {name}: {resp.status_code} {resp.text}")
-        except Exception as e:
-            _alert(f"⚠️ Discord send exception for {name}: {e}")
+        ok = send_discord_with_backoff(webhook, msg, timeout=HTTP_TIMEOUT)
+        if ok:
+            sent += 1
+        else:
+            _alert(f"⚠️ Discord send failed for {name} (after retries)")
 
     return {"status": "ok", "users_processed": processed, "sent": sent}
