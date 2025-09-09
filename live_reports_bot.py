@@ -336,13 +336,14 @@ def lambda_handler(event, context):
                 duration_ms = int(entry.get("dur") or 0)
                 start_str   = entry.get("start") or ""
                 updated_str = entry.get("updated") or entry.get("at") or ""  # 'updated' preferred; 'at' fallback
-
+                uid = entry.get("uid")
+                
                 if not entry_id or not user_name:
                     continue
 
                 webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
                 if not webhook_url:
-                    _alert(f"[INFO] No webhook configured for '{user_name}', skipping {entry_id}")
+                    _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}), skipping {entry_id}")
                     continue
 
                 # parse timestamps
@@ -357,7 +358,6 @@ def lambda_handler(event, context):
                 updated_dt = _parse(updated_str) if updated_str else now
 
                                 # --- stable state key for DynamoDB (prefer uid, fallback to normalized name) ---
-                uid = entry.get("uid")
                 state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
 
                 # --- load state ---
