@@ -512,12 +512,12 @@ def lambda_handler(event, context):
 
                 # Start
                 if label.startswith("✍️") and changed_start:
-                    lines.append(f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M')}~~ {start_dt.strftime('%Y-%m-%d %H:%M')}")
+                    lines.append(f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 else:
-                    lines.append(f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M')}")
+                    lines.append(f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
 
                 # Updated (always current)
-                lines.append(f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M')}")
+                lines.append(f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}")
 
                 if label.startswith("✍️") and diff_lines:
                     lines.append("")
