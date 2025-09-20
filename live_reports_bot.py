@@ -39,8 +39,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     s = (val or "").strip().lower()
     return s in ("1", "true", "yes", "y", "on")
 
-# When true, DO NOT send any Discord messages; only update DynamoDB state
-DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
+# Feature flags
+DRY_RUN_NO_SEND     = _env_bool("DRY_RUN_NO_SEND", False)       # keep DB updated, but don't notify
+SEND_NOTIFICATIONS  = _env_bool("SEND_NOTIFICATIONS", True)     # master switch for notifications
+
+# Effective "should we send anything to Discord at all?"
+NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
 
 # AWS clients
 dynamodb = boto3.resource("dynamodb")
@@ -326,8 +330,8 @@ def _respect_global_interval():
 
 def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20) -> bool:
     """Send a Discord message honoring pacing and 429/5xx backoffs."""
-    # Short-circuit in dry-run mode
-    if DRY_RUN_NO_SEND:
+    # If notifications are disabled, never make a network call.
+    if not NOTIFY_ENABLED:
         return True
 
     # Global + per-webhook spacing
@@ -446,9 +450,13 @@ def lambda_handler(event, context):
         _alert("WORKSPACES sheet empty or unreachable.")
         return {"status": "no_workspaces"}
 
-    # Map user name -> webhook
-    user_map = { t["name"]: t.get("discord_webhook_url", "").strip() for t in team if t.get("discord_webhook_url") }
-    user_map_norm = { _norm(k): v for k, v in user_map.items() }
+    # Map user name -> webhook (only if we plan to send)
+    if NOTIFY_ENABLED:
+        user_map = { t["name"]: t.get("discord_webhook_url", "").strip() for t in team if t.get("discord_webhook_url") }
+        user_map_norm = { _norm(k): v for k, v in user_map.items() }
+    else:
+        user_map = {}
+        user_map_norm = {}
 
     now   = datetime.now(timezone.utc)
     since = now - timedelta(days=TIME_WINDOW_DAYS)
@@ -458,7 +466,7 @@ def lambda_handler(event, context):
     skipped_deletions = 0
 
     # runtime aggregation per user for deletion detection + batched saves
-    # state_key -> {"current_ids": set(), "user_name": str, "webhook": str, "state": dict, "dirty": bool}
+    # state_key -> {"current_ids": set(), "user_name": str, "webhook": str|None, "state": dict, "dirty": bool}
     user_runtime = {}
 
     # per-webhook outbox for batched sending
@@ -494,10 +502,14 @@ def lambda_handler(event, context):
                 if not entry_id or not user_name:
                     continue
 
-                webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
-                if not webhook_url:
-                    _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}), skipping {entry_id}")
-                    continue
+                # Only look up webhook if we're going to send
+                webhook_url = None
+                if NOTIFY_ENABLED:
+                    webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
+                    if not webhook_url:
+                        _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}), skipping {entry_id}")
+                        # We still continue processing state (no messages will be sent).
+                        # Fall through with webhook_url=None.
 
                 # parse timestamps (shared parsers)
                 start_dt   = parse_iso(start_str, now) if start_str else now
@@ -512,7 +524,7 @@ def lambda_handler(event, context):
                     user_runtime[state_key] = {
                         "current_ids": set(),
                         "user_name": user_name,
-                        "webhook": webhook_url,
+                        "webhook": webhook_url,  # may be None when NOTIFY_ENABLED=False
                         "state": state,
                         "dirty": False,
                     }
@@ -608,8 +620,8 @@ def lambda_handler(event, context):
                 if not should_notify:
                     continue
 
-                # DRY RUN: skip queuing entirely
-                if DRY_RUN_NO_SEND:
+                # If notifications are disabled, skip building/queuing messages entirely.
+                if not NOTIFY_ENABLED:
                     skipped_notifies += 1
                     continue
 
@@ -662,8 +674,9 @@ def lambda_handler(event, context):
                 msg = "\n".join(lines)
 
                 # Queue for batched send
-                outbox.setdefault(webhook_url, []).append(msg)
-                notified += 1
+                if webhook_url:
+                    outbox.setdefault(webhook_url, []).append(msg)
+                    notified += 1
 
     # ==========================
     # Deletion detection (after all fetches)
@@ -694,13 +707,13 @@ def lambda_handler(event, context):
             if not in_window:
                 continue
 
-            # DRY RUN: skip queuing entirely
-            if DRY_RUN_NO_SEND:
+            if not NOTIFY_ENABLED:
                 skipped_deletions += 1
             else:
                 msg = _format_deleted_message(user_name, snap)
-                outbox.setdefault(webhook_url, []).append(msg)
-                notified += 1
+                if webhook_url:
+                    outbox.setdefault(webhook_url, []).append(msg)
+                    notified += 1
 
             # Remove the tombstoned entry from state to avoid repeat notifications
             try:
@@ -734,7 +747,7 @@ def lambda_handler(event, context):
     # ==========================
     # Send all queued Discord messages in parallel across webhooks
     # ==========================
-    if not DRY_RUN_NO_SEND and outbox:
+    if NOTIFY_ENABLED and outbox:
         max_workers = min(8, len(outbox))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [ex.submit(_send_all_for_webhook, wh, msgs) for wh, msgs in outbox.items()]
@@ -749,5 +762,7 @@ def lambda_handler(event, context):
         "notified": notified,
         "skipped_notifies": skipped_notifies,
         "skipped_deletions": skipped_deletions,
-        "dry_run_no_send": DRY_RUN_NO_SEND
+        "dry_run_no_send": DRY_RUN_NO_SEND,
+        "send_notifications": SEND_NOTIFICATIONS,
+        "notify_enabled": NOTIFY_ENABLED,
     }
