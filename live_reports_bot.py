@@ -9,6 +9,9 @@ from io import StringIO
 import boto3
 from datetime import datetime, timedelta, timezone
 
+# Reuse a single HTTP session for all outbound requests (TLS/connection reuse)
+SESSION = requests.Session()
+
 # ==========================
 # ENVIRONMENT
 # ==========================
@@ -49,7 +52,7 @@ def _alert(msg: str):
     print(f"[ALERT] {msg}")
     if SYSTEM_ALERT_WEBHOOK:
         try:
-            requests.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
+            SESSION.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
         except Exception:
             pass
 
@@ -69,7 +72,7 @@ def _fetch_csv_rows(sheet_url: str, gid: str) -> list[list[str]]:
     url = _sheet_export_csv_url(sheet_url, gid)
     if not url:
         return []
-    resp = requests.get(url, timeout=HTTP_TIMEOUT)
+    resp = SESSION.get(url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return list(csv.reader(StringIO(resp.text)))
 
@@ -171,6 +174,23 @@ def _save_user_state(user_name: str, seen_entries: list, seen_updates: dict, see
         _alert(f"[ERROR] DynamoDB put error for {user_name}: {e}")
 
 # ==========================
+# Timestamp parsers (shared, no re-def per entry)
+# ==========================
+def parse_iso(ts: str, default_now: datetime) -> datetime:
+    try:
+        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return default_now
+
+def parse_iso_opt(ts: str):
+    try:
+        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return None
+
+# ==========================
 # Toggl API helpers
 # ==========================
 def _headers_for_token(api_token: str) -> dict:
@@ -181,7 +201,7 @@ def _headers_for_token(api_token: str) -> dict:
 def get_workspaces_for_token(api_token: str) -> list[dict]:
     url = "https://api.track.toggl.com/api/v9/workspaces"
     try:
-        r = requests.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
+        r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
             return r.json() or []
         _alert(f"[ERROR] get_workspaces_for_token: {r.status_code} {r.text}")
@@ -204,7 +224,7 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
     }
     all_entries = []
     while True:
-        resp = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+        resp = SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             _alert(f"[ERROR] details fetch failed: {resp.status_code} - {resp.text}")
             break
@@ -294,7 +314,7 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
     base_backoff = 1.0  # seconds
     while attempt < DISCORD_MAX_RETRIES:
         try:
-            resp = requests.post(webhook_url, json=payload, timeout=timeout)
+            resp = SESSION.post(webhook_url, json=payload, timeout=timeout)
             if resp.status_code == 204:
                 return True
             if resp.status_code == 429:
@@ -389,8 +409,8 @@ def lambda_handler(event, context):
     skipped_notifies = 0
     skipped_deletions = 0
 
-    # runtime aggregation per user for deletion detection
-    # state_key -> {"current_ids": set(), "user_name": str, "webhook": str, "state": dict}
+    # runtime aggregation per user for deletion detection + batched saves
+    # state_key -> {"current_ids": set(), "user_name": str, "webhook": str, "state": dict, "dirty": bool}
     user_runtime = {}
 
     # Iterate over each workspace token
@@ -428,28 +448,22 @@ def lambda_handler(event, context):
                     _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}), skipping {entry_id}")
                     continue
 
-                # parse timestamps
-                def _parse(ts: str) -> datetime:
-                    try:
-                        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
-                        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
-                    except Exception:
-                        return now
-
-                start_dt   = _parse(start_str) if start_str else now
-                updated_dt = _parse(updated_str) if updated_str else now
+                # parse timestamps (shared parsers)
+                start_dt   = parse_iso(start_str, now) if start_str else now
+                updated_dt = parse_iso(updated_str, now) if updated_str else now
 
                 # --- stable state key for DynamoDB (prefer uid, fallback to normalized name) ---
                 state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
 
-                # --- load state ---
+                # --- load/init runtime bucket ---
                 if state_key not in user_runtime:
                     state = _get_user_state(state_key)
                     user_runtime[state_key] = {
                         "current_ids": set(),
                         "user_name": user_name,
                         "webhook": webhook_url,
-                        "state": state
+                        "state": state,
+                        "dirty": False,
                     }
                 else:
                     state = user_runtime[state_key]["state"]
@@ -461,10 +475,7 @@ def lambda_handler(event, context):
                 prev_updated_str = seen_updates.get(entry_id)
                 prev_updated = None
                 if prev_updated_str and not prev_updated_str.startswith("deleted:"):
-                    try:
-                        prev_updated = _parse(prev_updated_str)
-                    except Exception:
-                        prev_updated = None
+                    prev_updated = parse_iso_opt(prev_updated_str)
                 first_seen   = prev_updated is None  # source of truth is the updates map (ignoring tombstones)
 
                 prev_snap = seen_snapshots.get(entry_id, {})
@@ -473,15 +484,16 @@ def lambda_handler(event, context):
                 prev_proj = prev_snap.get("project", project)
                 prev_tags = prev_snap.get("tags", list(tags))
                 prev_start_str = prev_snap.get("start", start_str)
-                prev_start_dt = _parse(prev_start_str) if prev_start_str else start_dt
+                prev_start_dt = parse_iso(prev_start_str, now) if prev_start_str else start_dt
 
                 # Track that we saw this ID this run
                 user_runtime[state_key]["current_ids"].add(entry_id)
 
-                # Always persist latest 'updated' we observed
+                # Always persist latest 'updated' we observed (in-memory; save later)
                 seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                 if entry_id not in seen_ids:
                     state["seen_entries"].append(entry_id)  # keep for quick membership; capped on save
+                user_runtime[state_key]["dirty"] = True  # mark for batched save
 
                 # Build current snapshot (for future comparisons)
                 curr_snap = {
@@ -513,7 +525,7 @@ def lambda_handler(event, context):
 
                 if first_seen:
                     if HARD_START_FILTER and start_dt < since:
-                        _save_user_state(state_key, state["seen_entries"], seen_updates, seen_snapshots)
+                        # no notify; just keep state
                         continue
                     if updated_dt >= since:
                         should_notify = True
@@ -542,10 +554,12 @@ def lambda_handler(event, context):
                         if changed_start:
                             diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
 
-                # Persist latest state before any network call
-                _save_user_state(state_key, state["seen_entries"], seen_updates, seen_snapshots)
-
                 if not should_notify:
+                    continue
+
+                # In DRY-RUN: skip building messages entirely for speed
+                if DRY_RUN_NO_SEND:
+                    skipped_notifies += 1
                     continue
 
                 # Build message (edited version mirrors "New" layout; changed fields show strikethrough → new)
@@ -562,9 +576,9 @@ def lambda_handler(event, context):
 
                 # Tags
                 if label.startswith("✍️") and changed_tags:
-                    old_tags = ", ".join(sorted(old_set)) or "No tags"
-                    new_tags = ", ".join(sorted(new_set)) or "No tags"
-                    lines.append(f"🏷️ **Tags:** ~~{old_tags}~~ {new_tags}")
+                    old_tags_s = ", ".join(sorted(old_set)) or "No tags"
+                    new_tags_s = ", ".join(sorted(new_set)) or "No tags"
+                    lines.append(f"🏷️ **Tags:** ~~{old_tags_s}~~ {new_tags_s}")
                 else:
                     lines.append(f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}")
 
@@ -596,15 +610,12 @@ def lambda_handler(event, context):
                 lines.append("—")
                 msg = "\n".join(lines)
 
-                # send (rate-limited) — or skip in DRY_RUN_NO_SEND
-                if DRY_RUN_NO_SEND:
-                    skipped_notifies += 1
+                # send (rate-limited)
+                ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
+                if ok:
+                    notified += 1
                 else:
-                    ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
-                    if ok:
-                        notified += 1
-                    else:
-                        _alert(f"[ERROR] Discord send failed for {user_name} (entry {entry_id})")
+                    _alert(f"[ERROR] Discord send failed for {user_name} (entry {entry_id})")
 
     # ==========================
     # Deletion detection (after all fetches)
@@ -629,31 +640,10 @@ def lambda_handler(event, context):
                 # no snapshot -> cannot build message; drop quietly
                 continue
 
-            # Respect window to avoid noise from historical items
-            snap_updated_s = snap.get("updated") or ""
-            snap_start_s   = snap.get("start") or ""
-            def _parse_opt(ts: str):
-                try:
-                    return datetime.strptime(ts.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-                except Exception:
-                    return None
-            snap_updated = _parse_opt(snap_updated_s)
-            snap_start   = _parse_opt(snap_start_s)
-
-            # Respect window to avoid noise from historical items
-            snap_start_s = snap.get("start") or ""
-
-            def _parse_opt(ts: str):
-                try:
-                    return datetime.strptime(ts.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-                except Exception:
-                    return None
-
-            snap_start = _parse_opt(snap_start_s)
-
             # Consider deletion ONLY if the entry's START is inside the same window we fetched
+            snap_start_s = snap.get("start") or ""
+            snap_start   = parse_iso_opt(snap_start_s)
             in_window = bool(snap_start and snap_start >= since)
-
             if not in_window:
                 continue  # don't treat it as deleted; we didn't even fetch that start range
 
@@ -676,8 +666,26 @@ def lambda_handler(event, context):
             seen_updates.pop(eid, None)
             seen_snapshots.pop(eid, None)
 
-        # Save pruned state for the user
-        _save_user_state(state_key, seen_entries, seen_updates, seen_snapshots)
+            # mark dirty to save pruned state later
+            bucket["dirty"] = True
+
+        # write back the mutated local state into the bucket
+        bucket["state"]["seen_entries"]   = seen_entries
+        bucket["state"]["seen_updates"]   = seen_updates
+        bucket["state"]["seen_snapshots"] = seen_snapshots
+
+    # ==========================
+    # Batched state save: exactly once per user
+    # ==========================
+    for state_key, bucket in user_runtime.items():
+        if bucket.get("dirty"):
+            st = bucket["state"]
+            _save_user_state(
+                state_key,
+                st.get("seen_entries", []),
+                st.get("seen_updates", {}),
+                st.get("seen_snapshots", {})
+            )
 
     return {
         "status": "complete",
