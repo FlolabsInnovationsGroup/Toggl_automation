@@ -21,7 +21,7 @@ DYNAMODB_TABLE      = os.getenv("DYNAMODB_TABLE", "")
 TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
 MAX_SEEN_IDS        = int(os.getenv("MAX_SEEN_IDS", "50"))
 HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
-HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON: don't notify on first-seen items started before window
+HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON
 
 # Discord rate limiting knobs
 DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))   # per-webhook gap
@@ -222,6 +222,16 @@ def _format_delta_ms(delta_ms: int) -> str:
     mins    = minutes % 60
     return f"{sign}{hours}h {mins}m {seconds}s"
 
+def _format_delta_datetimes(new_dt: datetime, old_dt: datetime) -> str:
+    # new - old (positive means moved later)
+    delta = int((new_dt - old_dt).total_seconds())
+    sign = "+" if delta >= 0 else "-"
+    s = abs(delta)
+    mins = s // 60
+    hours = mins // 60
+    rem_m = mins % 60
+    return f"{sign}{hours}h {rem_m}m"
+
 def _truncate(s: str, limit: int = 140) -> str:
     if not isinstance(s, str):
         return ""
@@ -275,7 +285,6 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
             if resp.status_code == 204:
                 return True
             if resp.status_code == 429:
-                # Rate limited: honor Retry-After or X-RateLimit-Reset-After
                 retry_after = None
                 try:
                     retry_after = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-After")
@@ -288,21 +297,18 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
                     wait_s = float(retry_after) if retry_after is not None else 2.0
                 except Exception:
                     wait_s = 2.0
-                wait_s += random.uniform(0.05, 0.25)  # jitter
+                wait_s += random.uniform(0.05, 0.25)
                 time.sleep(wait_s)
                 attempt += 1
                 continue
             if 500 <= resp.status_code < 600:
-                # transient server error: exponential backoff
                 wait_s = base_backoff * (2 ** attempt) + random.uniform(0.05, 0.25)
                 time.sleep(wait_s)
                 attempt += 1
                 continue
-            # Other non-success codes
             print(f"[FAIL] Discord send {resp.status_code}: {resp.text}")
             return False
         except Exception as e:
-            # network issue: backoff and retry
             wait_s = base_backoff * (2 ** attempt) + random.uniform(0.05, 0.25)
             time.sleep(wait_s)
             attempt += 1
@@ -328,7 +334,6 @@ def lambda_handler(event, context):
 
     # Map user name -> webhook
     user_map = { t["name"]: t.get("discord_webhook_url", "").strip() for t in team if t.get("discord_webhook_url") }
-    # Also build a normalized lookup (some APIs return 'user' as Full Name)
     user_map_norm = { _norm(k): v for k, v in user_map.items() }
 
     now   = datetime.now(timezone.utc)
@@ -396,11 +401,12 @@ def lambda_handler(event, context):
                 first_seen   = prev_updated is None  # source of truth is the updates map
 
                 prev_snap = seen_snapshots.get(entry_id, {})
-                prev_dur  = int(prev_snap.get("dur", duration_ms))  # if absent, assume same to avoid noisy diffs
+                prev_dur  = int(prev_snap.get("dur", duration_ms))
                 prev_desc = prev_snap.get("desc", description)
                 prev_proj = prev_snap.get("project", project)
                 prev_tags = prev_snap.get("tags", list(tags))
                 prev_start_str = prev_snap.get("start", start_str)
+                prev_start_dt = _parse(prev_start_str) if prev_start_str else start_dt
 
                 # Always persist latest 'updated' we observed
                 seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -422,63 +428,49 @@ def lambda_handler(event, context):
                 should_notify = False
                 label         = "🆕 New Time Entry Added"
                 diff_lines    = []  # for "changes: ..." summary
-                display_overlines = []  # for struck-through vs new in the body
+
+                # Detect changes (for rendering)
+                changed_time  = duration_ms != prev_dur
+                changed_proj  = project != prev_proj
+                changed_desc  = description != prev_desc
+                try:
+                    old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
+                    new_set = set(tags) if isinstance(tags, list) else set()
+                except Exception:
+                    old_set, new_set = set(), set()
+                changed_tags  = old_set != new_set
+                changed_start = (start_dt != prev_start_dt)
 
                 if first_seen:
-                    # Flood guard: if the entry STARTED before the window, just ingest; don't notify.
                     if HARD_START_FILTER and start_dt < since:
                         _save_user_state(state_key, state["seen_entries"], seen_updates, seen_snapshots)
                         continue
-                    # Otherwise (started within window), treat as new-in-window
                     if updated_dt >= since:
                         should_notify = True
                         label = "🆕 New Time Entry Added"
                 else:
-                    # Seen before: notify only if it was edited after we last saw it, AND inside window
                     if (updated_dt > prev_updated) and (updated_dt >= since):
                         should_notify = True
                         label = "✍️ Time Entry Edited"
 
-                        # --- Build intuitive struck-through diffs ---
-                        # Time
-                        if duration_ms != prev_dur:
-                            delta_ms = duration_ms - prev_dur
-                            display_overlines.append(
-                                f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(duration_ms)}"
-                            )
-                            diff_lines.append(f"Δ Time {_format_delta_ms(delta_ms)}")
-                        # Project
-                        if project != prev_proj:
-                            display_overlines.append(
-                                f"📁 **Project:** ~~{prev_proj}~~ {project}"
-                            )
+                        # Build summary deltas
+                        if changed_time:
+                            diff_lines.append(f"Δ Time {_format_delta_ms(duration_ms - prev_dur)}")
+                        if changed_proj:
                             diff_lines.append("Project changed")
-                        # Description
-                        if description != prev_desc:
-                            display_overlines.append(
-                                f"📝 **Task:** ~~{_truncate(prev_desc)}~~ {_truncate(description)}"
-                            )
+                        if changed_desc:
                             diff_lines.append("Description changed")
-                        # Tags (added/removed)
-                        try:
-                            old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
-                            new_set = set(tags) if isinstance(tags, list) else set()
+                        if changed_tags:
                             added   = sorted(list(new_set - old_set))
                             removed = sorted(list(old_set - new_set))
-                            if added or removed:
-                                old_tags = ", ".join(sorted(old_set)) or "No tags"
-                                new_tags = ", ".join(sorted(new_set)) or "No tags"
-                                display_overlines.append(
-                                    f"🏷️ **Tags:** ~~{old_tags}~~ {new_tags}"
-                                )
-                                bits = []
-                                if added:
-                                    bits.append("+" + ", ".join(added))
-                                if removed:
-                                    bits.append("-" + ", ".join(removed))
-                                diff_lines.append("Tags " + " ".join(bits))
-                        except Exception:
-                            pass
+                            bits = []
+                            if added:
+                                bits.append("+" + ", ".join(added))
+                            if removed:
+                                bits.append("-" + ", ".join(removed))
+                            diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
+                        if changed_start:
+                            diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
 
                 # Persist latest state before any network call
                 _save_user_state(state_key, state["seen_entries"], seen_updates, seen_snapshots)
@@ -486,35 +478,53 @@ def lambda_handler(event, context):
                 if not should_notify:
                     continue
 
-                # Build message
-                base_lines = [
+                # Build message (edited version mirrors "New" layout; changed fields show strikethrough → new)
+                lines = [
                     f"## {label}",
                     f"👤 **User**: {user_name}",
                 ]
 
-                if label.startswith("✍️") and display_overlines:
-                    # When edited, show the struck-through lines first (they already contain labels/emojis)
-                    base_lines.extend(display_overlines)
+                # Project
+                if label.startswith("✍️") and changed_proj:
+                    lines.append(f"📁 **Project:** ~~{prev_proj}~~ {project}")
                 else:
-                    # New entry (no diffs): show the standard fields
-                    base_lines.extend([
-                        f"📁 **Project:** {project}",
-                        f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}",
-                        f"📝 **Task:** {description}",
-                        f"⏱️ **Time Tracked:** {convert_ms_to_hms(duration_ms)}",
-                    ])
+                    lines.append(f"📁 **Project:** {project}")
 
-                base_lines.extend([
-                    f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M')}",
-                    f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M')}",
-                ])
+                # Tags
+                if label.startswith("✍️") and changed_tags:
+                    old_tags = ", ".join(sorted(old_set)) or "No tags"
+                    new_tags = ", ".join(sorted(new_set)) or "No tags"
+                    lines.append(f"🏷️ **Tags:** ~~{old_tags}~~ {new_tags}")
+                else:
+                    lines.append(f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}")
+
+                # Description
+                if label.startswith("✍️") and changed_desc:
+                    lines.append(f"📝 **Task:** ~~{_truncate(prev_desc)}~~ {_truncate(description)}")
+                else:
+                    lines.append(f"📝 **Task:** {description}")
+
+                # Time
+                if label.startswith("✍️") and changed_time:
+                    lines.append(f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(duration_ms)}")
+                else:
+                    lines.append(f"⏱️ **Time Tracked:** {convert_ms_to_hms(duration_ms)}")
+
+                # Start
+                if label.startswith("✍️") and changed_start:
+                    lines.append(f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M')}~~ {start_dt.strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    lines.append(f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M')}")
+
+                # Updated (always current)
+                lines.append(f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M')}")
 
                 if label.startswith("✍️") and diff_lines:
-                    base_lines.append("")
-                    base_lines.append("**changes:** " + "; ".join(diff_lines))
+                    lines.append("")
+                    lines.append("**changes:** " + "; ".join(diff_lines))
 
-                base_lines.append("—")
-                msg = "\n".join(base_lines)
+                lines.append("—")
+                msg = "\n".join(lines)
 
                 # send (rate-limited)
                 ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
