@@ -8,6 +8,7 @@ import random
 from io import StringIO
 import boto3
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Reuse a single HTTP session for all outbound requests (TLS/connection reuse)
 SESSION = requests.Session()
@@ -212,6 +213,10 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
 def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime) -> list[dict]:
     """
     Uses Reports API v2 /details for a short time window.
+    Adds robust pagination:
+      - per_page to reduce round trips
+      - break on empty page / no progress
+      - safety cap on pages
     """
     url = "https://api.track.toggl.com/reports/api/v2/details"
     headers = _headers_for_token(api_token)
@@ -220,20 +225,40 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
         "since": since_dt.strftime("%Y-%m-%d"),
         "until": until_dt.strftime("%Y-%m-%d"),
         "user_agent": "toggl-discord-bot",
-        "page": 1
+        "page": 1,
+        "per_page": 200,
     }
+
     all_entries = []
-    while True:
+    last_total = 0
+    MAX_PAGES = 200
+
+    for _ in range(MAX_PAGES):
         resp = SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             _alert(f"[ERROR] details fetch failed: {resp.status_code} - {resp.text}")
             break
-        data = resp.json()
-        entries = data.get("data", []) or []
-        all_entries.extend(entries)
-        if len(all_entries) >= data.get("total_count", 0):
+
+        data = resp.json() or {}
+        entries = data.get("data") or []
+        total_count = int(data.get("total_count") or 0)
+
+        if not entries:
             break
+
+        all_entries.extend(entries)
+
+        if total_count and len(all_entries) >= total_count:
+            break
+
+        if len(all_entries) == last_total:
+            break
+        last_total = len(all_entries)
+
         params["page"] += 1
+    else:
+        _alert(f"[WARN] Hit MAX_PAGES={MAX_PAGES} for workspace {workspace_id}; stopping pagination early.")
+
     return all_entries
 
 def convert_ms_to_hms(milliseconds: int) -> str:
@@ -384,6 +409,29 @@ def _format_deleted_message(user_name: str, snap: dict) -> str:
     return "\n".join(lines)
 
 # ==========================
+# Batch helpers for Discord
+# ==========================
+def _chunk_messages(msgs, limit=1900, sep="\n\n"):
+    chunk, size = [], 0
+    for m in msgs:
+        mlen = len(m)
+        if chunk and size + len(sep) + mlen > limit:
+            yield sep.join(chunk)
+            chunk, size = [m], mlen
+        else:
+            chunk.append(m)
+            size = len(sep.join(chunk))
+    if chunk:
+        yield sep.join(chunk)
+
+def _send_all_for_webhook(wh_url, msgs):
+    sent = 0
+    for payload in _chunk_messages(msgs):
+        if send_discord_with_backoff(wh_url, payload, timeout=HTTP_TIMEOUT):
+            sent += 1
+    return wh_url, sent
+
+# ==========================
 # Lambda entrypoint
 # ==========================
 def lambda_handler(event, context):
@@ -412,6 +460,9 @@ def lambda_handler(event, context):
     # runtime aggregation per user for deletion detection + batched saves
     # state_key -> {"current_ids": set(), "user_name": str, "webhook": str, "state": dict, "dirty": bool}
     user_runtime = {}
+
+    # per-webhook outbox for batched sending
+    outbox = {}  # webhook_url -> list[str]
 
     # Iterate over each workspace token
     for token_entry in workspace_set:
@@ -557,7 +608,7 @@ def lambda_handler(event, context):
                 if not should_notify:
                     continue
 
-                # In DRY-RUN: skip building messages entirely for speed
+                # DRY RUN: skip queuing entirely
                 if DRY_RUN_NO_SEND:
                     skipped_notifies += 1
                     continue
@@ -610,12 +661,9 @@ def lambda_handler(event, context):
                 lines.append("—")
                 msg = "\n".join(lines)
 
-                # send (rate-limited)
-                ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
-                if ok:
-                    notified += 1
-                else:
-                    _alert(f"[ERROR] Discord send failed for {user_name} (entry {entry_id})")
+                # Queue for batched send
+                outbox.setdefault(webhook_url, []).append(msg)
+                notified += 1
 
     # ==========================
     # Deletion detection (after all fetches)
@@ -637,7 +685,6 @@ def lambda_handler(event, context):
                 continue
             snap = seen_snapshots.get(eid)
             if not snap:
-                # no snapshot -> cannot build message; drop quietly
                 continue
 
             # Consider deletion ONLY if the entry's START is inside the same window we fetched
@@ -645,18 +692,15 @@ def lambda_handler(event, context):
             snap_start   = parse_iso_opt(snap_start_s)
             in_window = bool(snap_start and snap_start >= since)
             if not in_window:
-                continue  # don't treat it as deleted; we didn't even fetch that start range
+                continue
 
-            # Send deleted-entry message (or skip in dry-run)
-            msg = _format_deleted_message(user_name, snap)
+            # DRY RUN: skip queuing entirely
             if DRY_RUN_NO_SEND:
                 skipped_deletions += 1
             else:
-                ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
-                if ok:
-                    notified += 1
-                else:
-                    _alert(f"[ERROR] Discord send failed for deleted entry (user={user_name}, id={eid})")
+                msg = _format_deleted_message(user_name, snap)
+                outbox.setdefault(webhook_url, []).append(msg)
+                notified += 1
 
             # Remove the tombstoned entry from state to avoid repeat notifications
             try:
@@ -686,6 +730,19 @@ def lambda_handler(event, context):
                 st.get("seen_updates", {}),
                 st.get("seen_snapshots", {})
             )
+
+    # ==========================
+    # Send all queued Discord messages in parallel across webhooks
+    # ==========================
+    if not DRY_RUN_NO_SEND and outbox:
+        max_workers = min(8, len(outbox))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_send_all_for_webhook, wh, msgs) for wh, msgs in outbox.items()]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    _alert(f"[ERROR] send pool: {e}")
 
     return {
         "status": "complete",
