@@ -472,6 +472,9 @@ def lambda_handler(event, context):
     # per-webhook outbox for batched sending
     outbox = {}  # webhook_url -> list[str]
 
+    # Track which users we already warned about missing webhooks (avoid per-entry spam)
+    missing_webhook_warned = set()
+
     # Iterate over each workspace token
     for token_entry in workspace_set:
         api_token = token_entry["api_token"]
@@ -502,14 +505,11 @@ def lambda_handler(event, context):
                 if not entry_id or not user_name:
                     continue
 
-                # Only look up webhook if we're going to send
+                # Lookup webhook only if we're going to send
                 webhook_url = None
                 if NOTIFY_ENABLED:
                     webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
-                    if not webhook_url:
-                        _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}), skipping {entry_id}")
-                        # We still continue processing state (no messages will be sent).
-                        # Fall through with webhook_url=None.
+                    # NOTE: do NOT early-continue on missing webhook; we still want to persist state.
 
                 # parse timestamps (shared parsers)
                 start_dt   = parse_iso(start_str, now) if start_str else now
@@ -524,7 +524,7 @@ def lambda_handler(event, context):
                     user_runtime[state_key] = {
                         "current_ids": set(),
                         "user_name": user_name,
-                        "webhook": webhook_url,  # may be None when NOTIFY_ENABLED=False
+                        "webhook": webhook_url,  # may be None
                         "state": state,
                         "dirty": False,
                     }
@@ -568,6 +568,16 @@ def lambda_handler(event, context):
                     "updated": updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 }
                 seen_snapshots[entry_id] = curr_snap
+
+                # If we plan to notify but webhook is missing:
+                #   - Only warn once per user per run
+                #   - Never warn for entries we've already seen (e.g., from a previous dry run)
+                if NOTIFY_ENABLED and not webhook_url:
+                    if first_seen and user_name not in missing_webhook_warned:
+                        _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}); persisting state and skipping notifications.")
+                        missing_webhook_warned.add(user_name)
+                    # Do not try to notify; continue to next entry
+                    continue
 
                 # Decide notification:
                 should_notify = False
@@ -707,13 +717,12 @@ def lambda_handler(event, context):
             if not in_window:
                 continue
 
-            if not NOTIFY_ENABLED:
+            if not NOTIFY_ENABLED or not webhook_url:
                 skipped_deletions += 1
             else:
                 msg = _format_deleted_message(user_name, snap)
-                if webhook_url:
-                    outbox.setdefault(webhook_url, []).append(msg)
-                    notified += 1
+                outbox.setdefault(webhook_url, []).append(msg)
+                notified += 1
 
             # Remove the tombstoned entry from state to avoid repeat notifications
             try:
