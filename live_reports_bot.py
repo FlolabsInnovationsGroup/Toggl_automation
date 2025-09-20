@@ -640,14 +640,22 @@ def lambda_handler(event, context):
             snap_updated = _parse_opt(snap_updated_s)
             snap_start   = _parse_opt(snap_start_s)
 
-            in_window = False
-            if snap_updated and snap_updated >= since:
-                in_window = True
-            elif snap_start and snap_start >= since:
-                in_window = True
+            # Respect window to avoid noise from historical items
+            snap_start_s = snap.get("start") or ""
+
+            def _parse_opt(ts: str):
+                try:
+                    return datetime.strptime(ts.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+                except Exception:
+                    return None
+
+            snap_start = _parse_opt(snap_start_s)
+
+            # Consider deletion ONLY if the entry's START is inside the same window we fetched
+            in_window = bool(snap_start and snap_start >= since)
 
             if not in_window:
-                continue  # don't spam deletions for old items falling out of window
+                continue  # don't treat it as deleted; we didn't even fetch that start range
 
             # Send deleted-entry message (or skip in dry-run)
             msg = _format_deleted_message(user_name, snap)
