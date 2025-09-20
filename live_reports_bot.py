@@ -223,8 +223,7 @@ def _format_delta_ms(delta_ms: int) -> str:
     return f"{sign}{hours}h {mins}m {seconds}s"
 
 def _format_delta_datetimes(new_dt: datetime, old_dt: datetime) -> str:
-    # new - old (positive means moved later)
-    delta = int((new_dt - old_dt).total_seconds())
+    delta = int((new_dt - old_dt).total_seconds())  # positive = moved later
     sign = "+" if delta >= 0 else "-"
     s = abs(delta)
     mins = s // 60
@@ -272,7 +271,6 @@ def _respect_global_interval():
 
 def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20) -> bool:
     """Send a Discord message honoring pacing and 429/5xx backoffs."""
-    # Global + per-webhook spacing
     _respect_global_interval()
     _respect_min_interval(webhook_url)
 
@@ -318,6 +316,39 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
     return False
 
 # ==========================
+# Helpers for deleted-entry messages
+# ==========================
+def _strike(s: str) -> str:
+    return f"~~{s}~~"
+
+def _format_deleted_message(user_name: str, snap: dict) -> str:
+    project = snap.get("project", "No project")
+    tags    = snap.get("tags") or []
+    desc    = snap.get("desc", "No description")
+    dur_ms  = int(snap.get("dur", 0))
+    start_s = snap.get("start") or ""
+    try:
+        start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        start_str = start_s or "unknown"
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    old_tags = ", ".join(sorted(tags)) if isinstance(tags, list) and tags else "No tags"
+    lines = [
+        "## 🗑️ Time Entry Deleted",
+        f"👤 **User**: {_strike(user_name)}",
+        f"📁 **Project:** {_strike(project)}",
+        f"🏷️ **Tags:** {_strike(old_tags)}",
+        f"📝 **Task:** {_strike(_truncate(desc))}",
+        f"⏱️ **Time Tracked:** {_strike(convert_ms_to_hms(dur_ms))}",
+        f"🗓️ **Start:** {_strike(start_str)}",
+        f"🕑 **Deleted detected:** {now_str}",
+        "—"
+    ]
+    return "\n".join(lines)
+
+# ==========================
 # Lambda entrypoint
 # ==========================
 def lambda_handler(event, context):
@@ -340,6 +371,10 @@ def lambda_handler(event, context):
     since = now - timedelta(days=TIME_WINDOW_DAYS)
 
     notified = 0
+
+    # runtime aggregation per user for deletion detection
+    # state_key -> {"current_ids": set(), "user_name": str, "webhook": str, "state": dict}
+    user_runtime = {}
 
     # Iterate over each workspace token
     for token_entry in workspace_set:
@@ -391,14 +426,29 @@ def lambda_handler(event, context):
                 state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
 
                 # --- load state ---
-                state          = _get_user_state(state_key)
+                if state_key not in user_runtime:
+                    state = _get_user_state(state_key)
+                    user_runtime[state_key] = {
+                        "current_ids": set(),
+                        "user_name": user_name,
+                        "webhook": webhook_url,
+                        "state": state
+                    }
+                else:
+                    state = user_runtime[state_key]["state"]
+
                 seen_ids       = set(state["seen_entries"])
                 seen_updates   = state["seen_updates"]
                 seen_snapshots = state.get("seen_snapshots", {})
 
                 prev_updated_str = seen_updates.get(entry_id)
-                prev_updated = _parse(prev_updated_str) if prev_updated_str else None
-                first_seen   = prev_updated is None  # source of truth is the updates map
+                prev_updated = None
+                if prev_updated_str and not prev_updated_str.startswith("deleted:"):
+                    try:
+                        prev_updated = _parse(prev_updated_str)
+                    except Exception:
+                        prev_updated = None
+                first_seen   = prev_updated is None  # source of truth is the updates map (ignoring tombstones)
 
                 prev_snap = seen_snapshots.get(entry_id, {})
                 prev_dur  = int(prev_snap.get("dur", duration_ms))
@@ -407,6 +457,9 @@ def lambda_handler(event, context):
                 prev_tags = prev_snap.get("tags", list(tags))
                 prev_start_str = prev_snap.get("start", start_str)
                 prev_start_dt = _parse(prev_start_str) if prev_start_str else start_dt
+
+                # Track that we saw this ID this run
+                user_runtime[state_key]["current_ids"].add(entry_id)
 
                 # Always persist latest 'updated' we observed
                 seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -449,7 +502,7 @@ def lambda_handler(event, context):
                         should_notify = True
                         label = "🆕 New Time Entry Added"
                 else:
-                    if (updated_dt > prev_updated) and (updated_dt >= since):
+                    if (updated_dt and prev_updated and updated_dt > prev_updated) and (updated_dt >= since):
                         should_notify = True
                         label = "✍️ Time Entry Edited"
 
@@ -532,5 +585,67 @@ def lambda_handler(event, context):
                     notified += 1
                 else:
                     _alert(f"[ERROR] Discord send failed for {user_name} (entry {entry_id})")
+
+    # ==========================
+    # Deletion detection (after all fetches)
+    # ==========================
+    for state_key, bucket in user_runtime.items():
+        current_ids = bucket["current_ids"]
+        user_name   = bucket["user_name"]
+        webhook_url = bucket["webhook"]
+        state       = bucket["state"]
+
+        # nothing to compare if no state present
+        seen_entries   = list(state.get("seen_entries", []))
+        seen_updates   = dict(state.get("seen_updates", {}))
+        seen_snapshots = dict(state.get("seen_snapshots", {}))
+
+        # candidate deletions = previously seen but not seen this run
+        for eid in list(seen_entries):
+            if eid in current_ids:
+                continue
+            snap = seen_snapshots.get(eid)
+            if not snap:
+                # no snapshot -> cannot build message; drop quietly
+                continue
+
+            # Respect window to avoid noise from historical items
+            snap_updated_s = snap.get("updated") or ""
+            snap_start_s   = snap.get("start") or ""
+            def _parse_opt(ts: str):
+                try:
+                    return datetime.strptime(ts.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+                except Exception:
+                    return None
+            snap_updated = _parse_opt(snap_updated_s)
+            snap_start   = _parse_opt(snap_start_s)
+
+            in_window = False
+            if snap_updated and snap_updated >= since:
+                in_window = True
+            elif snap_start and snap_start >= since:
+                in_window = True
+
+            if not in_window:
+                continue  # don't spam deletions for old items falling out of window
+
+            # Send deleted-entry message
+            msg = _format_deleted_message(user_name, snap)
+            ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
+            if ok:
+                notified += 1
+            else:
+                _alert(f"[ERROR] Discord send failed for deleted entry (user={user_name}, id={eid})")
+
+            # Remove the tombstoned entry from state to avoid repeat notifications
+            try:
+                seen_entries.remove(eid)
+            except ValueError:
+                pass
+            seen_updates.pop(eid, None)
+            seen_snapshots.pop(eid, None)
+
+        # Save pruned state for the user
+        _save_user_state(state_key, seen_entries, seen_updates, seen_snapshots)
 
     return {"status": "complete", "notified": notified}
