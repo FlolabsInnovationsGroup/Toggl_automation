@@ -12,33 +12,31 @@ from datetime import datetime, timedelta, timezone
 # ==========================
 # ENVIRONMENT
 # ==========================
-GOOGLE_SHEET_URL      = os.getenv("GOOGLE_SHEET_URL", "")
-TEAM_GID              = os.getenv("TEAM_GID", "")
-WORKSPACES_GID        = os.getenv("WORKSPACES_GID", "")
-SYSTEM_ALERT_WEBHOOK  = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
+GOOGLE_SHEET_URL     = os.getenv("GOOGLE_SHEET_URL", "")
+TEAM_GID             = os.getenv("TEAM_GID", "")
+WORKSPACES_GID       = os.getenv("WORKSPACES_GID", "")
+SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 
-DYNAMODB_TABLE        = os.getenv("DYNAMODB_TABLE", "")
-TIME_WINDOW_DAYS      = int(os.getenv("TIME_WINDOW_DAYS", "24"))
-MAX_SEEN_IDS          = int(os.getenv("MAX_SEEN_IDS", "50"))
-HTTP_TIMEOUT          = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
-HARD_START_FILTER     = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON
-
-# NEW: send/skip Discord messages (still updates DB)
-def _env_bool(s: str, default: bool = True) -> bool:
-    if s is None:
-        return default
-    s = str(s).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
-
-SEND_NOTIFICATIONS    = _env_bool(os.getenv("SEND_NOTIFICATIONS", "1"), True)
-
-# NEW: time-aware pruning so recent IDs aren't dropped
-RETAIN_RECENT_DAYS    = int(os.getenv("RETAIN_RECENT_DAYS", str(TIME_WINDOW_DAYS * 3)))
+DYNAMODB_TABLE      = os.getenv("DYNAMODB_TABLE", "")
+TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
+MAX_SEEN_IDS        = int(os.getenv("MAX_SEEN_IDS", "50"))
+HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON
 
 # Discord rate limiting knobs
-DISCORD_MIN_INTERVAL_MS         = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))   # per-webhook gap
-DISCORD_GLOBAL_MIN_INTERVAL_MS  = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))  # global gap
-DISCORD_MAX_RETRIES             = int(os.getenv("DISCORD_MAX_RETRIES", "5"))
+DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))   # per-webhook gap
+DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))  # global gap
+DISCORD_MAX_RETRIES            = int(os.getenv("DISCORD_MAX_RETRIES", "5"))
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name, "")
+    if val == "" and default:
+        return True
+    s = (val or "").strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+# When true, DO NOT send any Discord messages; only update DynamoDB state
+DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
 
 # AWS clients
 dynamodb = boto3.resource("dynamodb")
@@ -49,7 +47,7 @@ table    = dynamodb.Table(DYNAMODB_TABLE)
 # ==========================
 def _alert(msg: str):
     print(f"[ALERT] {msg}")
-    if SYSTEM_ALERT_WEBHOOK and SEND_NOTIFICATIONS:  # respect dry-run for alert spam too
+    if SYSTEM_ALERT_WEBHOOK:
         try:
             requests.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
         except Exception:
@@ -132,18 +130,12 @@ def load_workspace_tokens() -> list[dict]:
 # ==========================
 # DynamoDB helpers
 # ==========================
-def _parse_iso_utc(ts: str):
-    try:
-        return datetime.strptime(ts.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-    except Exception:
-        return None
-
 def _get_user_state(user_name: str) -> dict:
     """
     Returns:
       {
         "seen_entries": [ids...],
-        "seen_updates": {id: updated_iso | 'deleted:<ts>'},
+        "seen_updates": {id: updated_iso},
         "seen_snapshots": {id: {dur:int, desc:str, project:str, tags:list, start:str, updated:str}}
       }
     Backwards compatible if item only has seen_entries/seen_updates.
@@ -163,55 +155,12 @@ def _get_user_state(user_name: str) -> dict:
         return {"seen_entries": [], "seen_updates": {}, "seen_snapshots": {}}
 
 def _save_user_state(user_name: str, seen_entries: list, seen_updates: dict, seen_snapshots: dict):
-    """
-    Time-aware pruning: keep anything updated within RETAIN_RECENT_DAYS,
-    then apply a soft cap by most-recently-updated, ensuring recent items survive.
-    """
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=RETAIN_RECENT_DAYS)
-
-        # IDs we definitely want to keep
-        keep_recent = set()
-        for eid, up_s in (seen_updates or {}).items():
-            # ignore tombstones for recency checks
-            if isinstance(up_s, str) and up_s.startswith("deleted:"):
-                continue
-            dt = _parse_iso_utc(up_s) if isinstance(up_s, str) else None
-            if dt and dt >= cutoff:
-                keep_recent.add(eid)
-
-        keep_ids = set(seen_entries or []) | keep_recent
-
-        # Soft cap by "most recently updated" if huge
-        if len(keep_ids) > MAX_SEEN_IDS:
-            def _upd(eid):
-                val = seen_updates.get(eid, "")
-                if isinstance(val, str) and val.startswith("deleted:"):
-                    # push deleted far back
-                    return datetime.fromtimestamp(0, tz=timezone.utc)
-                dt = _parse_iso_utc(val) if isinstance(val, str) else None
-                return dt or datetime.fromtimestamp(0, tz=timezone.utc)
-
-            sorted_all = sorted(keep_ids, key=_upd, reverse=True)
-            head = set(sorted_all[:MAX_SEEN_IDS])
-            keep_ids = head | keep_recent
-
-        # Rebuild arrays/maps with kept IDs; maintain insertion order for seen_entries where possible
-        capped_ids = [e for e in seen_entries if e in keep_ids]
-        # add any missing recent ids in deterministic (most-recent-first) order
-        missing_recent = [e for e in keep_recent if e not in capped_ids]
-        if missing_recent:
-            missing_recent.sort(key=lambda e: _parse_iso_utc(seen_updates.get(e, "")) or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
-            capped_ids.extend(missing_recent)
-
-        # final hard cap as last resort
-        if len(capped_ids) > MAX_SEEN_IDS:
-            capped_ids = capped_ids[-MAX_SEEN_IDS:]
-
+        # cap IDs; keep snapshots only for retained IDs
+        capped_ids = list(seen_entries[-MAX_SEEN_IDS:])
         keep = set(capped_ids)
-        pruned_updates   = {k: v for k, v in (seen_updates or {}).items()   if k in keep}
-        pruned_snapshots = {k: v for k, v in (seen_snapshots or {}).items() if k in keep}
-
+        pruned_updates   = {k: v for k, v in seen_updates.items() if k in keep}
+        pruned_snapshots = {k: v for k, v in seen_snapshots.items() if k in keep}
         table.put_item(Item={
             "user_name": user_name,
             "seen_entries": capped_ids,
@@ -309,8 +258,7 @@ def _sleep_ms(ms: int):
         time.sleep(ms / 1000.0)
 
 def _respect_min_interval(webhook_url: str):
-    if not SEND_NOTIFICATIONS:
-        return
+    """Ensure per-webhook spacing."""
     now = time.monotonic()
     last = _last_send_ts_per_webhook.get(webhook_url)
     if last is not None:
@@ -320,8 +268,7 @@ def _respect_min_interval(webhook_url: str):
     _last_send_ts_per_webhook[webhook_url] = time.monotonic()
 
 def _respect_global_interval():
-    if not SEND_NOTIFICATIONS:
-        return
+    """Ensure global spacing across ANY sends."""
     global _last_send_ts_global
     if DISCORD_GLOBAL_MIN_INTERVAL_MS <= 0:
         return
@@ -333,14 +280,12 @@ def _respect_global_interval():
     _last_send_ts_global = time.monotonic()
 
 def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20) -> bool:
-    """
-    Send a Discord message honoring pacing and 429/5xx backoffs.
-    Obeys SEND_NOTIFICATIONS; if disabled, does not send and returns True (as-if sent).
-    """
-    if not SEND_NOTIFICATIONS:
-        print("[DRY-RUN] Skipping Discord send; DB updated only.")
+    """Send a Discord message honoring pacing and 429/5xx backoffs."""
+    # Short-circuit in dry-run mode
+    if DRY_RUN_NO_SEND:
         return True
 
+    # Global + per-webhook spacing
     _respect_global_interval()
     _respect_min_interval(webhook_url)
 
@@ -422,6 +367,7 @@ def _format_deleted_message(user_name: str, snap: dict) -> str:
 # Lambda entrypoint
 # ==========================
 def lambda_handler(event, context):
+    # Load TEAM & WORKSPACES from Google Sheet
     team          = load_team_sheet()
     workspace_set = load_workspace_tokens()
 
@@ -440,8 +386,10 @@ def lambda_handler(event, context):
     since = now - timedelta(days=TIME_WINDOW_DAYS)
 
     notified = 0
+    skipped_notifies = 0
+    skipped_deletions = 0
 
-    # Per-user runtime aggregation for deletion detection
+    # runtime aggregation per user for deletion detection
     # state_key -> {"current_ids": set(), "user_name": str, "webhook": str, "state": dict}
     user_runtime = {}
 
@@ -476,7 +424,7 @@ def lambda_handler(event, context):
                     continue
 
                 webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
-                if not webhook_url and SEND_NOTIFICATIONS:
+                if not webhook_url:
                     _alert(f"[INFO] No webhook configured for '{user_name}' (uid: {uid}), skipping {entry_id}")
                     continue
 
@@ -513,8 +461,11 @@ def lambda_handler(event, context):
                 prev_updated_str = seen_updates.get(entry_id)
                 prev_updated = None
                 if prev_updated_str and not prev_updated_str.startswith("deleted:"):
-                    prev_updated = _parse(prev_updated_str)
-                first_seen   = prev_updated is None  # ignore tombstones
+                    try:
+                        prev_updated = _parse(prev_updated_str)
+                    except Exception:
+                        prev_updated = None
+                first_seen   = prev_updated is None  # source of truth is the updates map (ignoring tombstones)
 
                 prev_snap = seen_snapshots.get(entry_id, {})
                 prev_dur  = int(prev_snap.get("dur", duration_ms))
@@ -530,7 +481,7 @@ def lambda_handler(event, context):
                 # Always persist latest 'updated' we observed
                 seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                 if entry_id not in seen_ids:
-                    state["seen_entries"].append(entry_id)  # capped on save
+                    state["seen_entries"].append(entry_id)  # keep for quick membership; capped on save
 
                 # Build current snapshot (for future comparisons)
                 curr_snap = {
@@ -645,11 +596,15 @@ def lambda_handler(event, context):
                 lines.append("—")
                 msg = "\n".join(lines)
 
-                ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
-                if ok:
-                    notified += 1
+                # send (rate-limited) — or skip in DRY_RUN_NO_SEND
+                if DRY_RUN_NO_SEND:
+                    skipped_notifies += 1
                 else:
-                    _alert(f"[ERROR] Discord send failed for {user_name} (entry {entry_id})")
+                    ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
+                    if ok:
+                        notified += 1
+                    else:
+                        _alert(f"[ERROR] Discord send failed for {user_name} (entry {entry_id})")
 
     # ==========================
     # Deletion detection (after all fetches)
@@ -660,39 +615,52 @@ def lambda_handler(event, context):
         webhook_url = bucket["webhook"]
         state       = bucket["state"]
 
+        # nothing to compare if no state present
         seen_entries   = list(state.get("seen_entries", []))
         seen_updates   = dict(state.get("seen_updates", {}))
         seen_snapshots = dict(state.get("seen_snapshots", {}))
 
+        # candidate deletions = previously seen but not seen this run
         for eid in list(seen_entries):
             if eid in current_ids:
                 continue
             snap = seen_snapshots.get(eid)
             if not snap:
+                # no snapshot -> cannot build message; drop quietly
                 continue
 
-            # Respect window (updated OR start in window)
+            # Respect window to avoid noise from historical items
+            snap_updated_s = snap.get("updated") or ""
+            snap_start_s   = snap.get("start") or ""
             def _parse_opt(ts: str):
                 try:
                     return datetime.strptime(ts.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
                 except Exception:
                     return None
-            snap_updated = _parse_opt(snap.get("updated") or "")
-            snap_start   = _parse_opt(snap.get("start") or "")
+            snap_updated = _parse_opt(snap_updated_s)
+            snap_start   = _parse_opt(snap_start_s)
 
-            in_window = (snap_updated and snap_updated >= since) or (snap_start and snap_start >= since)
+            in_window = False
+            if snap_updated and snap_updated >= since:
+                in_window = True
+            elif snap_start and snap_start >= since:
+                in_window = True
+
             if not in_window:
-                continue
+                continue  # don't spam deletions for old items falling out of window
 
-            # Send deleted-entry message (or dry-run log)
+            # Send deleted-entry message (or skip in dry-run)
             msg = _format_deleted_message(user_name, snap)
-            ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
-            if ok:
-                notified += 1
+            if DRY_RUN_NO_SEND:
+                skipped_deletions += 1
             else:
-                _alert(f"[ERROR] Discord send failed for deleted entry (user={user_name}, id={eid})")
+                ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
+                if ok:
+                    notified += 1
+                else:
+                    _alert(f"[ERROR] Discord send failed for deleted entry (user={user_name}, id={eid})")
 
-            # Tombstone cleanup (so we won't notify again)
+            # Remove the tombstoned entry from state to avoid repeat notifications
             try:
                 seen_entries.remove(eid)
             except ValueError:
@@ -700,11 +668,13 @@ def lambda_handler(event, context):
             seen_updates.pop(eid, None)
             seen_snapshots.pop(eid, None)
 
+        # Save pruned state for the user
         _save_user_state(state_key, seen_entries, seen_updates, seen_snapshots)
 
     return {
         "status": "complete",
         "notified": notified,
-        "send_notifications": SEND_NOTIFICATIONS,
-        "retain_recent_days": RETAIN_RECENT_DAYS
+        "skipped_notifies": skipped_notifies,
+        "skipped_deletions": skipped_deletions,
+        "dry_run_no_send": DRY_RUN_NO_SEND
     }
