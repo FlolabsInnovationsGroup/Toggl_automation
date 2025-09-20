@@ -23,11 +23,10 @@ MAX_SEEN_IDS        = int(os.getenv("MAX_SEEN_IDS", "50"))
 HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON: don't notify on first-seen items started before window
 
-
 # Discord rate limiting knobs
-DISCORD_MIN_INTERVAL_MS       = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))   # per-webhook gap
-DISCORD_GLOBAL_MIN_INTERVAL_MS= int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))  # global gap
-DISCORD_MAX_RETRIES           = int(os.getenv("DISCORD_MAX_RETRIES", "5"))
+DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))   # per-webhook gap
+DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))  # global gap
+DISCORD_MAX_RETRIES            = int(os.getenv("DISCORD_MAX_RETRIES", "5"))
 
 # AWS clients
 dynamodb = boto3.resource("dynamodb")
@@ -123,29 +122,40 @@ def load_workspace_tokens() -> list[dict]:
 # ==========================
 def _get_user_state(user_name: str) -> dict:
     """
-    Returns {"seen_entries": [ids...], "seen_updates": {id: updated_iso}}
-    Backwards compatible if item only has seen_entries.
+    Returns:
+      {
+        "seen_entries": [ids...],
+        "seen_updates": {id: updated_iso},
+        "seen_snapshots": {id: {dur:int, desc:str, project:str, tags:list, start:str, updated:str}}
+      }
+    Backwards compatible if item only has seen_entries/seen_updates.
     """
     try:
         resp = table.get_item(Key={"user_name": user_name})
         item = resp.get("Item", {}) or {}
-        seen_entries = item.get("seen_entries", []) or []
-        seen_updates = item.get("seen_updates", {}) or {}
+        seen_entries   = item.get("seen_entries", []) or []
+        seen_updates   = item.get("seen_updates", {}) or {}
+        seen_snapshots = item.get("seen_snapshots", {}) or {}
         # normalize
-        seen_updates = {str(k): str(v) for k, v in seen_updates.items()}
-        return {"seen_entries": seen_entries, "seen_updates": seen_updates}
+        seen_updates   = {str(k): str(v) for k, v in seen_updates.items()}
+        seen_snapshots = {str(k): v for k, v in seen_snapshots.items()}
+        return {"seen_entries": seen_entries, "seen_updates": seen_updates, "seen_snapshots": seen_snapshots}
     except Exception as e:
         _alert(f"[ERROR] DynamoDB get error for {user_name}: {e}")
-        return {"seen_entries": [], "seen_updates": {}}
+        return {"seen_entries": [], "seen_updates": {}, "seen_snapshots": {}}
 
-def _save_user_state(user_name: str, seen_entries: list, seen_updates: dict):
+def _save_user_state(user_name: str, seen_entries: list, seen_updates: dict, seen_snapshots: dict):
     try:
-        # cap IDs; keep full updates map (it’s compact: id->short string)
-        capped_ids = seen_entries[-MAX_SEEN_IDS:]
+        # cap IDs; keep snapshots only for retained IDs
+        capped_ids = list(seen_entries[-MAX_SEEN_IDS:])
+        keep = set(capped_ids)
+        pruned_updates   = {k: v for k, v in seen_updates.items() if k in keep}
+        pruned_snapshots = {k: v for k, v in seen_snapshots.items() if k in keep}
         table.put_item(Item={
             "user_name": user_name,
             "seen_entries": capped_ids,
-            "seen_updates": seen_updates
+            "seen_updates": pruned_updates,
+            "seen_snapshots": pruned_snapshots
         })
     except Exception as e:
         _alert(f"[ERROR] DynamoDB put error for {user_name}: {e}")
@@ -202,6 +212,21 @@ def convert_ms_to_hms(milliseconds: int) -> str:
     hours   = minutes // 60
     mins    = minutes % 60
     return f"{hours}h {mins}m {seconds}s"
+
+def _format_delta_ms(delta_ms: int) -> str:
+    sign = "+" if delta_ms >= 0 else "-"
+    ms = abs(delta_ms)
+    minutes = ms // 60000
+    seconds = (ms % 60000) // 1000
+    hours   = minutes // 60
+    mins    = minutes % 60
+    return f"{sign}{hours}h {mins}m {seconds}s"
+
+def _truncate(s: str, limit: int = 140) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    return s if len(s) <= limit else (s[:limit-1] + "…")
 
 # ==========================
 # Discord rate limiting helpers
@@ -336,8 +361,8 @@ def lambda_handler(event, context):
                 duration_ms = int(entry.get("dur") or 0)
                 start_str   = entry.get("start") or ""
                 updated_str = entry.get("updated") or entry.get("at") or ""  # 'updated' preferred; 'at' fallback
-                uid = entry.get("uid")
-                
+                uid         = entry.get("uid")
+
                 if not entry_id or not user_name:
                     continue
 
@@ -357,40 +382,52 @@ def lambda_handler(event, context):
                 start_dt   = _parse(start_str) if start_str else now
                 updated_dt = _parse(updated_str) if updated_str else now
 
-                                # --- stable state key for DynamoDB (prefer uid, fallback to normalized name) ---
+                # --- stable state key for DynamoDB (prefer uid, fallback to normalized name) ---
                 state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
 
                 # --- load state ---
-                state        = _get_user_state(state_key)
-                seen_ids     = set(state["seen_entries"])
-                seen_updates = state["seen_updates"]
+                state          = _get_user_state(state_key)
+                seen_ids       = set(state["seen_entries"])
+                seen_updates   = state["seen_updates"]
+                seen_snapshots = state.get("seen_snapshots", {})
 
                 prev_updated_str = seen_updates.get(entry_id)
-                def _parse(ts: str) -> datetime:
-                    try:
-                        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
-                        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
-                    except Exception:
-                        return now
-
                 prev_updated = _parse(prev_updated_str) if prev_updated_str else None
                 first_seen   = prev_updated is None  # source of truth is the updates map
+
+                prev_snap = seen_snapshots.get(entry_id, {})
+                prev_dur  = int(prev_snap.get("dur", duration_ms))  # if absent, assume same to avoid noisy diffs
+                prev_desc = prev_snap.get("desc", description)
+                prev_proj = prev_snap.get("project", project)
+                prev_tags = prev_snap.get("tags", list(tags))
+                prev_start_str = prev_snap.get("start", start_str)
 
                 # Always persist latest 'updated' we observed
                 seen_updates[entry_id] = updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                 if entry_id not in seen_ids:
                     state["seen_entries"].append(entry_id)  # keep for quick membership; capped on save
 
+                # Build current snapshot (for future comparisons)
+                curr_snap = {
+                    "dur": duration_ms,
+                    "desc": description,
+                    "project": project,
+                    "tags": list(tags) if isinstance(tags, list) else [],
+                    "start": start_str,
+                    "updated": updated_dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+                seen_snapshots[entry_id] = curr_snap
+
                 # Decide notification:
                 should_notify = False
                 label         = "🆕 New Time Entry Added"
+                diff_lines    = []  # for "changes: ..." summary
+                display_overlines = []  # for struck-through vs new in the body
 
                 if first_seen:
-                    # First time we ever see this entry in DB.
                     # Flood guard: if the entry STARTED before the window, just ingest; don't notify.
-                    # (We still detect future edits because prev_updated now exists.)
                     if HARD_START_FILTER and start_dt < since:
-                        _save_user_state(state_key, state["seen_entries"], seen_updates)
+                        _save_user_state(state_key, state["seen_entries"], seen_updates, seen_snapshots)
                         continue
                     # Otherwise (started within window), treat as new-in-window
                     if updated_dt >= since:
@@ -402,25 +439,84 @@ def lambda_handler(event, context):
                         should_notify = True
                         label = "✍️ Time Entry Edited"
 
+                        # --- Build intuitive struck-through diffs ---
+                        # Time
+                        if duration_ms != prev_dur:
+                            delta_ms = duration_ms - prev_dur
+                            display_overlines.append(
+                                f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(duration_ms)}"
+                            )
+                            diff_lines.append(f"Δ Time {_format_delta_ms(delta_ms)}")
+                        # Project
+                        if project != prev_proj:
+                            display_overlines.append(
+                                f"📁 **Project:** ~~{prev_proj}~~ {project}"
+                            )
+                            diff_lines.append("Project changed")
+                        # Description
+                        if description != prev_desc:
+                            display_overlines.append(
+                                f"📝 **Task:** ~~{_truncate(prev_desc)}~~ {_truncate(description)}"
+                            )
+                            diff_lines.append("Description changed")
+                        # Tags (added/removed)
+                        try:
+                            old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
+                            new_set = set(tags) if isinstance(tags, list) else set()
+                            added   = sorted(list(new_set - old_set))
+                            removed = sorted(list(old_set - new_set))
+                            if added or removed:
+                                old_tags = ", ".join(sorted(old_set)) or "No tags"
+                                new_tags = ", ".join(sorted(new_set)) or "No tags"
+                                display_overlines.append(
+                                    f"🏷️ **Tags:** ~~{old_tags}~~ {new_tags}"
+                                )
+                                bits = []
+                                if added:
+                                    bits.append("+" + ", ".join(added))
+                                if removed:
+                                    bits.append("-" + ", ".join(removed))
+                                diff_lines.append("Tags " + " ".join(bits))
+                        except Exception:
+                            pass
+
                 # Persist latest state before any network call
-                _save_user_state(state_key, state["seen_entries"], seen_updates)
+                _save_user_state(state_key, state["seen_entries"], seen_updates, seen_snapshots)
 
                 if not should_notify:
                     continue
 
+                # Build message
+                base_lines = [
+                    f"## {label}",
+                    f"👤 **User**: {user_name}",
+                ]
+
+                if label.startswith("✍️") and display_overlines:
+                    # When edited, show the struck-through lines first (they already contain labels/emojis)
+                    base_lines.extend(display_overlines)
+                else:
+                    # New entry (no diffs): show the standard fields
+                    base_lines.extend([
+                        f"📁 **Project:** {project}",
+                        f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}",
+                        f"📝 **Task:** {description}",
+                        f"⏱️ **Time Tracked:** {convert_ms_to_hms(duration_ms)}",
+                    ])
+
+                base_lines.extend([
+                    f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M')}",
+                    f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M')}",
+                ])
+
+                if label.startswith("✍️") and diff_lines:
+                    base_lines.append("")
+                    base_lines.append("**changes:** " + "; ".join(diff_lines))
+
+                base_lines.append("—")
+                msg = "\n".join(base_lines)
+
                 # send (rate-limited)
-                duration_fmt = convert_ms_to_hms(duration_ms)
-                msg = (
-                    f"## {label}\n"
-                    f"👤 **User**: {user_name}\n"
-                    f"📁 Project: {project}\n"
-                    f"🏷️ Tags: {', '.join(tags) if tags else 'No tags'}\n"
-                    f"📝 Task: {description}\n"
-                    f"⏱️ **Time Tracked**: {duration_fmt}\n"
-                    f"🗓️ Start: {start_dt.strftime('%Y-%m-%d %H:%M')}\n"
-                    f"🕑 Updated: {updated_dt.strftime('%Y-%m-%d %H:%M')}\n"
-                    f"—"
-                )
                 ok = send_discord_with_backoff(webhook_url, msg, timeout=HTTP_TIMEOUT)
                 if ok:
                     notified += 1
