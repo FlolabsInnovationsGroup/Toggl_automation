@@ -243,7 +243,7 @@ def aggregate_week_from_state(user_display_name: str,
                 continue
             start_s = snap.get("start") or ""
             dur_ms  = int(snap.get("dur") or 0)
-            project = snap.get("project") or "No project"
+            project = (snap.get("project") or "No project").strip() or "No project"
 
             start_dt = _parse_iso_opt(start_s)
             if not start_dt:
@@ -269,11 +269,40 @@ def aggregate_week_from_state(user_display_name: str,
 # ==========================
 # Report formatting
 # ==========================
+def _format_project_breakdown(per_project_seconds: dict[str, int],
+                              total_seconds: int,
+                              max_rows: int = 10) -> str:
+    """
+    Returns a markdown list of per-project times, sorted by time desc.
+    Limits output to max_rows (adds a summary line if truncated).
+    """
+    if not per_project_seconds or total_seconds <= 0:
+        return ""
+
+    rows = sorted(per_project_seconds.items(), key=lambda kv: kv[1], reverse=True)
+    lines = []
+    shown = 0
+    for proj, secs in rows:
+        pct = (secs / total_seconds * 100.0) if total_seconds > 0 else 0.0
+        lines.append(f"- **{proj}** — {format_seconds_to_hm(secs)} ({pct:.1f}%)")
+        shown += 1
+        if shown >= max_rows:
+            break
+
+    if len(rows) > max_rows:
+        hidden = rows[max_rows:]
+        hidden_secs = sum(s for _, s in hidden)
+        hidden_pct = (hidden_secs / total_seconds * 100.0) if total_seconds > 0 else 0.0
+        lines.append(f"- **…and {len(hidden)} more** — {format_seconds_to_hm(hidden_secs)} ({hidden_pct:.1f}%)")
+
+    return "\n".join(lines)
+
 def build_weekly_message(username: str,
                          week_start: datetime,
                          week_end: datetime,
                          total_seconds: int,
                          total_entries: int,
+                         per_project_seconds: dict[str, int] | None,
                          weekly_commitment_hours: float | None) -> str:
     total_hours = total_seconds / 3600.0
     parts = [
@@ -286,6 +315,11 @@ def build_weekly_message(username: str,
         "",
         gamified_badge(total_hours)
     ]
+
+    # Per-project breakdown (only if we have time)
+    if total_seconds > 0 and per_project_seconds:
+        parts.append("\n### ⛏️ Time by Project")
+        parts.append(_format_project_breakdown(per_project_seconds, total_seconds, max_rows=12))
 
     if weekly_commitment_hours is not None:
         try:
@@ -340,7 +374,7 @@ def send_reports_parallel(reports: list[dict], name_to_webhook: dict) -> int:
 # Main Lambda
 # ==========================
 def lambda_handler(event, context):
-    team_cfg        = load_team_sheet()
+    team_cfg         = load_team_sheet()
     workspace_tokens = load_workspace_tokens()
 
     if not team_cfg:
@@ -393,8 +427,8 @@ def lambda_handler(event, context):
                             name_to_state_keys[nm_team].insert(0, uid_key)
 
     # Define inclusive weekly window (end of day)
-    now_utc  = datetime.now(timezone.utc)
-    week_end = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
+    now_utc   = datetime.now(timezone.utc)
+    week_end  = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
     week_start = week_end - timedelta(days=7)
 
     # Aggregate per team member from DynamoDB
@@ -405,7 +439,7 @@ def lambda_handler(event, context):
         keys = name_to_state_keys.get(nm, [])
         if not keys:
             # no keys — still produce a minimal report
-            agg = {"username": username, "total_seconds": 0, "total_entries": 0}
+            agg = {"username": username, "total_seconds": 0, "total_entries": 0, "per_project_seconds": {}}
         else:
             a = aggregate_week_from_state(username, keys, week_start, week_end)
             agg = a
@@ -416,6 +450,7 @@ def lambda_handler(event, context):
             week_end=week_end,
             total_seconds=agg["total_seconds"],
             total_entries=agg["total_entries"],
+            per_project_seconds=agg.get("per_project_seconds", {}),
             weekly_commitment_hours=name_to_commit.get(nm)
         )
         all_reports.append({"username": username, "message": msg})
