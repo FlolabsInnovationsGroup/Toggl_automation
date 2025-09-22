@@ -2,15 +2,10 @@ import os, csv, json, base64, requests, time, random, boto3
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from botocore.exceptions import ClientError
 
-# ======================================================
-# Sessions / Globals
-# ======================================================
 SESSION = requests.Session()
 
-# ======================================================
-# ENV / CONFIG (keeps originals; adds a few from live)
-# ======================================================
 GOOGLE_SHEET_URL         = os.getenv("GOOGLE_SHEET_URL", "")
 TEAM_GID                 = os.getenv("TEAM_GID", "")
 WORKSPACES_GID           = os.getenv("WORKSPACES_GID", "")
@@ -20,84 +15,44 @@ HTTP_TIMEOUT             = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 FILTER_WORKSPACE_IDS_RAW = os.getenv("FILTER_WORKSPACE_IDS", "").strip()
 DYNAMODB_TABLE           = os.getenv("DYNAMODB_TABLE", "")
 
-# History scanning controls (unchanged semantics)
 HISTORY_STEP_MONTHS        = int(os.getenv("HISTORY_STEP_MONTHS", "12"))
 HISTORY_MAX_EMPTY_WINDOWS  = int(os.getenv("HISTORY_MAX_EMPTY_WINDOWS", "2"))
 HISTORY_MAX_YEARS          = int(os.getenv("HISTORY_MAX_YEARS", "15"))
 
-# Discord rate limiting knobs (unchanged)
 DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
 DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))
 DISCORD_MAX_RETRIES            = int(os.getenv("DISCORD_MAX_RETRIES", "5"))
 
-# Optional wid filter (comma-separated list of workspace IDs)
 FILTER_WIDS = set()
 if FILTER_WORKSPACE_IDS_RAW:
     FILTER_WIDS = {int(x.strip()) for x in FILTER_WORKSPACE_IDS_RAW.split(",") if x.strip().isdigit()}
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name, "")
+    val = (os.getenv(name, "") or "").strip().lower()
     if val == "" and default:
         return True
-    return (val or "").strip().lower() in ("1","true","yes","y","on")
+    return val in ("1","true","yes","y","on")
 
-# Feature flags to mirror live script semantics
-DRY_RUN_NO_SEND    = _env_bool("DRY_RUN_NO_SEND", False)   # if true: update DB with history; don't notify
+DRY_RUN_NO_SEND    = _env_bool("DRY_RUN_NO_SEND", False)
 SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", True)
 NOTIFY_ENABLED     = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
 
-# Live schema limits
 MAX_SEEN_IDS       = int(os.getenv("MAX_SEEN_IDS", "500000"))
 
-# Backfill / v3 search settings (for dry-run DB fill)
 BACKFILL_PAGE_SIZE     = int(os.getenv("BACKFILL_PAGE_SIZE", "200"))
 BACKFILL_MAX_PAGES     = int(os.getenv("BACKFILL_MAX_PAGES", "200"))
 BACKFILL_PAUSE_MS      = int(os.getenv("BACKFILL_PAUSE_MS", "75"))
 BACKFILL_RETRY_MAX     = int(os.getenv("BACKFILL_RETRY_MAX", "5"))
 BACKFILL_RETRY_BASE_MS = int(os.getenv("BACKFILL_RETRY_BASE_MS", "250"))
 
-# ======================================================
-# AWS DynamoDB (same schema as live script)
-# ======================================================
+# New guardrails / observability
+BACKFILL_TIME_BUDGET_MS     = int(os.getenv("BACKFILL_TIME_BUDGET_MS", "60000"))  # stop backfill when < this left
+WARN_ITEM_KB_OVER           = int(os.getenv("WARN_ITEM_KB_OVER", "340"))
+ABORT_SAVE_IF_ITEM_KB_OVER  = int(os.getenv("ABORT_SAVE_IF_ITEM_KB_OVER", "380"))
+
 dynamodb = boto3.resource("dynamodb")
 table    = dynamodb.Table(DYNAMODB_TABLE)
 
-def _get_user_state(user_key: str) -> dict:
-    try:
-        resp = table.get_item(Key={"user_name": user_key})
-        item = resp.get("Item", {}) or {}
-        seen_entries   = item.get("seen_entries", []) or []
-        seen_updates   = item.get("seen_updates", {}) or {}
-        seen_snapshots = item.get("seen_snapshots", {}) or {}
-        # normalize
-        seen_updates   = {str(k): str(v) for k, v in seen_updates.items()}
-        seen_snapshots = {str(k): v for k, v in seen_snapshots.items()}
-        return {"seen_entries": seen_entries, "seen_updates": seen_updates, "seen_snapshots": seen_snapshots}
-    except Exception as e:
-        _alert(f"[ERROR] DynamoDB get error for {user_key}: {e}")
-        return {"seen_entries": [], "seen_updates": {}, "seen_snapshots": {}}
-
-def _save_user_state(user_key: str, seen_entries: list, seen_updates: dict, seen_snapshots: dict):
-    try:
-        if MAX_SEEN_IDS > 0 and len(seen_entries) > MAX_SEEN_IDS:
-            capped_ids = list(seen_entries[-MAX_SEEN_IDS:])
-        else:
-            capped_ids = list(seen_entries)
-        keep = set(capped_ids)
-        pruned_updates   = {k: v for k, v in seen_updates.items()   if k in keep}
-        pruned_snapshots = {k: v for k, v in seen_snapshots.items() if k in keep}
-        table.put_item(Item={
-            "user_name": user_key,
-            "seen_entries": capped_ids,
-            "seen_updates": pruned_updates,
-            "seen_snapshots": pruned_snapshots
-        })
-    except Exception as e:
-        _alert(f"[ERROR] DynamoDB put error for {user_key}: {e}")
-
-# ======================================================
-# Alerts
-# ======================================================
 def _alert(msg: str):
     print(f"[ALERT] {msg}")
     if SYSTEM_ALERT_WEBHOOK:
@@ -106,9 +61,91 @@ def _alert(msg: str):
         except Exception:
             pass
 
-# ======================================================
-# Sheets helpers (unchanged)
-# ======================================================
+def _estimate_item_kb(item: dict) -> int:
+    try:
+        return int(len(json.dumps(item, separators=(',',':')).encode('utf-8')) / 1024)
+    except Exception:
+        return -1
+
+def _ddb_put_with_retry(item: dict, user_key: str) -> tuple[bool, float, str]:
+    attempt = 0
+    base = 0.15
+    start = time.perf_counter()
+    while attempt <= BACKFILL_RETRY_MAX:
+        try:
+            table.put_item(Item=item)
+            latency = time.perf_counter() - start
+            return True, latency, ""
+        except ClientError as ce:
+            code = ce.response.get("Error", {}).get("Code", "")
+            if code in ("ProvisionedThroughputExceededException", "ThrottlingException") or code.startswith("5"):
+                wait_s = base * (2 ** attempt) + random.uniform(0.01, 0.08)
+                _alert(f"[WARN] DDB throttled on {user_key} (attempt {attempt+1}/{BACKFILL_RETRY_MAX}); backoff {wait_s:.2f}s ({code})")
+                time.sleep(wait_s)
+                attempt += 1
+                continue
+            latency = time.perf_counter() - start
+            return False, latency, f"{code}: {str(ce)}"
+        except Exception as e:
+            latency = time.perf_counter() - start
+            return False, latency, f"{type(e).__name__}: {e}"
+    latency = time.perf_counter() - start
+    return False, latency, "MaxRetriesExceeded"
+
+def _get_user_state(user_key: str) -> dict:
+    try:
+        resp = table.get_item(Key={"user_name": user_key})
+        item = resp.get("Item", {}) or {}
+        seen_entries   = item.get("seen_entries", []) or []
+        seen_updates   = item.get("seen_updates", {}) or {}
+        seen_snapshots = item.get("seen_snapshots", {}) or {}
+        seen_updates   = {str(k): str(v) for k, v in seen_updates.items()}
+        seen_snapshots = {str(k): v for k, v in seen_snapshots.items()}
+        return {"seen_entries": seen_entries, "seen_updates": seen_updates, "seen_snapshots": seen_snapshots}
+    except Exception as e:
+        _alert(f"[ERROR] DynamoDB get error for {user_key}: {e}")
+        return {"seen_entries": [], "seen_updates": {}, "seen_snapshots": {}}
+
+def _save_user_state(user_key: str, seen_entries: list, seen_updates: dict, seen_snapshots: dict, metrics: dict | None = None):
+    try:
+        if MAX_SEEN_IDS > 0 and len(seen_entries) > MAX_SEEN_IDS:
+            capped_ids = list(seen_entries[-MAX_SEEN_IDS:])
+        else:
+            capped_ids = list(seen_entries)
+        keep = set(capped_ids)
+        pruned_updates   = {k: v for k, v in seen_updates.items()   if k in keep}
+        pruned_snapshots = {k: v for k, v in seen_snapshots.items() if k in keep}
+        item = {
+            "user_name": user_key,
+            "seen_entries": capped_ids,
+            "seen_updates": pruned_updates,
+            "seen_snapshots": pruned_snapshots
+        }
+        approx_kb = _estimate_item_kb(item)
+        if approx_kb >= WARN_ITEM_KB_OVER:
+            _alert(f"[WARN] Large DDB item {user_key}: ~{approx_kb} KB | ids={len(capped_ids)} snaps={len(pruned_snapshots)}")
+        if approx_kb >= ABORT_SAVE_IF_ITEM_KB_OVER:
+            _alert(f"[ERROR] Aborting save for {user_key}: estimated size {approx_kb} KB ≥ {ABORT_SAVE_IF_ITEM_KB_OVER} KB")
+            if metrics is not None:
+                metrics["ddb_skipped_oversize"] += 1
+            return False
+
+        ok, latency, err = _ddb_put_with_retry(item, user_key)
+        if metrics is not None:
+            metrics["ddb_put_count"] += 1
+            metrics["ddb_put_latency_sum_sec"] += latency
+            metrics["ddb_put_max_latency_sec"]  = max(metrics["ddb_put_max_latency_sec"], latency)
+        if not ok:
+            _alert(f"[ERROR] DynamoDB put failed for {user_key} after {latency:.2f}s: {err}")
+        else:
+            print(f"[INFO] DDB put {user_key} ok in {latency:.2f}s (~{approx_kb} KB)")
+        return ok
+    except Exception as e:
+        _alert(f"[ERROR] DynamoDB put error for {user_key}: {e}")
+        if metrics is not None:
+            metrics["ddb_put_errors"] += 1
+        return False
+
 def _sheet_export_csv_url(sheet_url: str, gid: str) -> str:
     if not sheet_url or not gid:
         return ""
@@ -177,9 +214,6 @@ def load_workspace_tokens() -> list[dict]:
             continue
     return out
 
-# ======================================================
-# Toggl helpers (v9 discovery + v3 search for dry-run backfill)
-# ======================================================
 def _headers_for_token(api_token: str) -> dict:
     return {
         "Authorization": "Basic " + base64.b64encode(f"{api_token}:api_token".encode()).decode(),
@@ -191,11 +225,11 @@ def list_workspaces(api_token: str) -> list[dict]:
         r = SESSION.get("https://api.track.toggl.com/api/v9/workspaces",
                         headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
         if r.status_code != 200:
-            _alert(f"⚠️ v9/workspaces failed for token …{api_token[-4:]}: {r.status_code} {r.text}")
+            _alert(f"⚠️ v9/workspaces failed …{api_token[-4:]}: {r.status_code} {r.text}")
             return []
         return r.json() or []
     except Exception as e:
-        _alert(f"⚠️ v9/workspaces exception for token …{api_token[-4:]}: {e}")
+        _alert(f"⚠️ v9/workspaces exception …{api_token[-4:]}: {e}")
         return []
 
 def get_workspace_users(api_token: str, workspace_id: int) -> list[dict]:
@@ -214,13 +248,45 @@ def _sleep_ms(ms: int):
     if ms > 0:
         time.sleep(ms / 1000.0)
 
+def fetch_window_totals_v3(api_token: str, workspace_id: int, start_dt: datetime, end_dt: datetime, user_ids: list[int]) -> dict[int,int]:
+    """
+    Lightweight probe to see if specified users have any seconds in the window.
+    Returns dict {user_id: seconds}
+    """
+    if not user_ids:
+        return {}
+    url = f"https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries/totals"
+    payload = {
+        "start_date": start_dt.strftime("%Y-%m-%d"),
+        "end_date":   end_dt.strftime("%Y-%m-%d"),
+        "grouping":   "users",
+        "grouped":    True,
+        "user_ids":   user_ids
+    }
+    try:
+        r = SESSION.post(url, headers=_headers_for_token(api_token), json=payload, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            _alert(f"[WARN] v3 totals probe wid={workspace_id}: {r.status_code} {r.text}")
+            return {}
+        data = r.json() or {}
+        totals = {}
+        groups = data.get("groups") or data.get("data") or []
+        for g in groups:
+            uid = g.get("id") or g.get("user_id") or (g.get("group") or {}).get("id")
+            secs = g.get("seconds") or g.get("total_seconds") or 0
+            try:
+                uid = int(uid)
+                totals[uid] = int(secs or 0)
+            except Exception:
+                pass
+        return totals
+    except Exception as e:
+        _alert(f"[WARN] v3 totals probe exception wid={workspace_id}: {e}")
+        return {}
+
 def search_time_entries_v3(api_token: str, workspace_id: int,
                            start_dt: datetime, end_dt: datetime,
                            user_ids: list[int] | None = None) -> list[dict]:
-    """
-    Detailed search (Reports v3) with pagination & retries.
-    Keeps chunked windows (<= 366 days) — you already chunk by months; we reuse that.
-    """
     url = f"https://api.track.toggl.com/reports/api/v3/workspace/{workspace_id}/search/time_entries"
     params = {"page_size": BACKFILL_PAGE_SIZE, "page": 1}
     body = {
@@ -266,7 +332,6 @@ def search_time_entries_v3(api_token: str, workspace_id: int,
         if not data:
             break
 
-        # normalize
         if isinstance(data, list):
             rows = data
             total = 0
@@ -274,8 +339,7 @@ def search_time_entries_v3(api_token: str, workspace_id: int,
             rows = data.get("data") or data.get("time_entries") or data.get("results") or []
             total = int(data.get("total_count") or data.get("total") or 0)
         else:
-            rows = []
-            total = 0
+            rows, total = [], 0
 
         if not rows:
             break
@@ -289,9 +353,6 @@ def search_time_entries_v3(api_token: str, workspace_id: int,
 
     return out
 
-# ======================================================
-# Windows (unchanged logic)
-# ======================================================
 def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
     first = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=timezone.utc)
     if dt.month == 12:
@@ -307,10 +368,6 @@ def _shift_months(dt: datetime, months: int) -> datetime:
     return datetime(y, m, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 def _history_windows(end_dt: datetime):
-    """
-    Yield month-window chunks identical to your original logic, stepping HISTORY_STEP_MONTHS
-    and stopping after HISTORY_MAX_EMPTY_WINDOWS empty windows or HISTORY_MAX_YEARS cap.
-    """
     _, current_end = _month_bounds_utc(end_dt)
     max_steps = max(1, (HISTORY_MAX_YEARS * 12) // max(1, HISTORY_STEP_MONTHS))
     for _ in range(max_steps):
@@ -321,9 +378,6 @@ def _history_windows(end_dt: datetime):
         prev_day = window_start - timedelta(days=1)
         _, current_end = _month_bounds_utc(prev_day)
 
-# ======================================================
-# Backfill mapping + snapshot writing (same shape as live)
-# ======================================================
 def _parse_entry_user_id(e: dict) -> int | None:
     uid = e.get("user_id")
     if isinstance(uid, (int, float)):
@@ -372,7 +426,7 @@ def _parse_entry_seconds(e: dict) -> int:
 def _safe_str(v) -> str:
     return v if isinstance(v, str) else ""
 
-def _write_entries_to_db(primary_key: str, state_keys: list[str], entries: list[dict], user_uid: int | None):
+def _write_entries_to_db(primary_key: str, state_keys: list[str], entries: list[dict], user_uid: int | None, metrics: dict):
     if not entries:
         return 0
     st = _get_user_state(primary_key)
@@ -384,7 +438,6 @@ def _write_entries_to_db(primary_key: str, state_keys: list[str], entries: list[
     for e in entries:
         if not isinstance(e, dict):
             continue
-        # (optional) keep consistent user_uid filtering when known
         uid = _parse_entry_user_id(e)
         if user_uid is not None and uid is not None and int(uid) != int(user_uid):
             continue
@@ -416,9 +469,12 @@ def _write_entries_to_db(primary_key: str, state_keys: list[str], entries: list[
         added += 1
 
     if added:
-        _save_user_state(primary_key, seen_entries, seen_updates, seen_snapshots)
+        ok = _save_user_state(primary_key, seen_entries, seen_updates, seen_snapshots, metrics)
+        if not ok:
+            _alert(f"[WARN] Save skipped/failed for primary key {primary_key}; secondary keys not mirrored.")
+            return added
 
-    # mirror IDs to secondary keys (snapshots stay only on primary)
+    # mirror IDs to secondary keys (snapshots remain only on primary)
     for sk in state_keys[1:]:
         st2 = _get_user_state(sk)
         ids2 = list(st2.get("seen_entries", []))
@@ -432,13 +488,10 @@ def _write_entries_to_db(primary_key: str, state_keys: list[str], entries: list[
                     ups2[eid] = seen_updates[eid]
                 changed = True
         if changed:
-            _save_user_state(sk, ids2, ups2, snaps2)
+            _save_user_state(sk, ids2, ups2, snaps2, metrics)
 
     return added
 
-# ======================================================
-# Aggregation from DynamoDB only (month & lifetime)
-# ======================================================
 def _parse_iso_opt(ts: str):
     try:
         ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
@@ -446,8 +499,7 @@ def _parse_iso_opt(ts: str):
     except Exception:
         return None
 
-def aggregate_month_from_state(username: str, keys: list[str],
-                               month_start: datetime, month_end: datetime) -> dict:
+def aggregate_month_from_state(username: str, keys: list[str], month_start: datetime, month_end: datetime) -> dict:
     total_seconds = 0
     per_project_seconds = defaultdict(int)
     seen_eids = set()
@@ -470,11 +522,7 @@ def aggregate_month_from_state(username: str, keys: list[str],
                 total_seconds += secs
                 per_project_seconds[project] += secs
                 seen_eids.add(eid)
-    return {
-        "username": username,
-        "total_seconds": total_seconds,
-        "per_project_seconds": dict(per_project_seconds),
-    }
+    return {"username": username, "total_seconds": total_seconds, "per_project_seconds": dict(per_project_seconds)}
 
 def aggregate_total_from_state(keys: list[str]) -> int:
     total_seconds = 0
@@ -489,9 +537,6 @@ def aggregate_total_from_state(keys: list[str]) -> int:
             seen_eids.add(eid)
     return total_seconds
 
-# ======================================================
-# Discord formatting/sending (unchanged)
-# ======================================================
 def _sum_seconds_to_hours(seconds: int) -> float:
     return round(max(0, int(seconds)) / 3600.0, 2)
 
@@ -546,17 +591,9 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
             if resp.status_code == 204:
                 return True
             if resp.status_code == 429:
-                retry_after = None
+                ra = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-After")
                 try:
-                    retry_after = (resp.headers.get("Retry-After")
-                                   or resp.headers.get("X-RateLimit-Reset-After"))
-                    if retry_after is None:
-                        data = resp.json()
-                        retry_after = data.get("retry_after") or data.get("Retry-After")
-                except Exception:
-                    pass
-                try:
-                    wait_s = float(retry_after) if retry_after is not None else 2.0
+                    wait_s = float(ra) if ra else 2.0
                 except Exception:
                     wait_s = 2.0
                 wait_s += random.uniform(0.05, 0.25)
@@ -579,9 +616,6 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
                 return False
     return False
 
-# ======================================================
-# Lambda entrypoint
-# ======================================================
 def lambda_handler(event, context):
     team = load_team_sheet()
     if not team:
@@ -593,10 +627,8 @@ def lambda_handler(event, context):
         _alert("WORKSPACES sheet empty or unreachable.")
         return {"status": "no_workspaces"}
 
-    # Build webhook lookup by normalized name
     name_to_webhook = { _norm(t["name"]): (t.get("discord_webhook_url", "").strip()) for t in team if t.get("name") }
 
-    # Candidate state keys per team member: always include name:<normalized>
     name_to_state_keys = defaultdict(list)
     for t in team:
         nm = _norm(t["name"])
@@ -604,9 +636,8 @@ def lambda_handler(event, context):
         if k not in name_to_state_keys[nm]:
             name_to_state_keys[nm].append(k)
 
-    # Discover Toggl users to attach uid:<id> keys for better matching
-    # (does not use user tokens; only workspace tokens)
-    discovered = set()  # (wid, uid)
+    discovered = set()
+    wid_to_team_uids = defaultdict(list)  # NEW: map wid -> list of team user_ids for filtering
     for token_entry in workspaces:
         api_token = token_entry.get("api_token")
         if not api_token:
@@ -629,20 +660,29 @@ def lambda_handler(event, context):
                 if nm_ws in name_to_state_keys:
                     uid_key = f"uid:{int(uid)}"
                     if uid_key not in name_to_state_keys[nm_ws]:
-                        name_to_state_keys[nm_ws].insert(0, uid_key)  # prefer uid
+                        name_to_state_keys[nm_ws].insert(0, uid_key)
+                    wid_to_team_uids[wid].append(int(uid))
 
-    # Month window: current calendar month to now (so partial month works)
     now = datetime.now(timezone.utc)
     m_start, _m_end = _month_bounds_utc(now)
     m_end = now
 
-    # ==========================
-    # DRY-RUN: backfill DB with detailed entries using your chunked windows
-    # ==========================
-    backfilled_windows = 0
-    backfilled_entries = 0
+    metrics = {
+        "backfilled_windows": 0,
+        "backfilled_entries": 0,
+        "rows_fetched": 0,
+        "rows_skipped_by_totals": 0,
+        "windows_empty_for_team": 0,
+        "windows_skipped_timebudget": 0,
+        "ddb_put_count": 0,
+        "ddb_put_errors": 0,
+        "ddb_put_latency_sum_sec": 0.0,
+        "ddb_put_max_latency_sec": 0.0,
+        "ddb_skipped_oversize": 0,
+    }
+
+    # ========= DRY-RUN BACKFILL (with user filtering + totals probe) =========
     if DRY_RUN_NO_SEND:
-        # Walk windows exactly like your original logic
         for token_entry in workspaces:
             api_token = token_entry.get("api_token")
             if not api_token:
@@ -652,33 +692,51 @@ def lambda_handler(event, context):
                 if not wid or (FILTER_WIDS and wid not in FILTER_WIDS):
                     continue
 
-                # Build a quick map: norm_name -> user_id for this workspace (optional)
+                team_uids = wid_to_team_uids.get(wid, [])
+                if not team_uids:
+                    _alert(f"[INFO] Skipping wid={wid}: no team members in this workspace.")
+                    continue
+
+                # name -> uid (for primary key hint if missing)
                 nm_to_uid = {}
                 for u in get_workspace_users(api_token, wid):
                     uid  = u.get("id")
                     full = u.get("fullname") or u.get("name") or ""
-                    if not uid or not full:
-                        continue
-                    nm_to_uid[_norm(full)] = int(uid)
+                    if uid and full:
+                        nm_to_uid[_norm(full)] = int(uid)
 
                 empty_streak = 0
                 for (win_start, win_end) in _history_windows(now):
-                    # If we hit too many empty windows, stop for this workspace (same as original)
+                    remaining = context.get_remaining_time_in_millis() if context else 999999
+                    if remaining < BACKFILL_TIME_BUDGET_MS:
+                        metrics["windows_skipped_timebudget"] += 1
+                        _alert(f"[WARN] Stopping backfill early (wid={wid}): {remaining}ms left < budget {BACKFILL_TIME_BUDGET_MS}ms")
+                        break
                     if empty_streak >= HISTORY_MAX_EMPTY_WINDOWS:
                         break
 
-                    # Fetch detailed rows for this window
-                    rows = search_time_entries_v3(api_token, wid, win_start, win_end)
+                    # FAST PROBE: do our team users have any time in this window?
+                    totals = fetch_window_totals_v3(api_token, wid, win_start, win_end, team_uids)
+                    if not totals or sum(totals.values()) == 0:
+                        metrics["rows_skipped_by_totals"] += 1
+                        empty_streak += 1
+                        print(f"[INFO] totals probe: wid={wid} {win_start.date()}→{win_end.date()} team_seconds=0 (skip)")
+                        continue
+
+                    t0 = time.perf_counter()
+                    rows = search_time_entries_v3(api_token, wid, win_start, win_end, user_ids=team_uids)
+                    dt = time.perf_counter() - t0
+                    print(f"[INFO] v3 window wid={wid} {win_start.date()}→{win_end.date()} fetched={len(rows)} in {dt:.2f}s (team-filtered)")
                     if not rows:
                         empty_streak += 1
                         continue
-                    empty_streak = 0
-                    backfilled_windows += 1
 
-                    # Group rows by normalized name so we can upsert under correct key set
+                    metrics["backfilled_windows"] += 1
+                    metrics["rows_fetched"] += len(rows)
+
+                    # Group by normalized display name
                     rows_by_name = defaultdict(list)
                     for e in rows:
-                        # Try to pick a display name: prefer e["user"]["fullname"] when present
                         disp = ""
                         uo = e.get("user")
                         if isinstance(uo, dict):
@@ -686,17 +744,14 @@ def lambda_handler(event, context):
                         if not disp:
                             disp = (e.get("user_name") or e.get("username") or "").strip()
                         if not disp:
-                            # fallback: leave unassigned; we’ll skip if we can’t match
                             continue
                         rows_by_name[_norm(disp)].append(e)
 
-                    # Upsert into DB per matched team member (by name, and uid when available)
+                    window_added = 0
                     for nm, entries in rows_by_name.items():
                         if nm not in name_to_state_keys:
-                            # Not a team member we report on — skip
                             continue
                         state_keys = name_to_state_keys[nm]
-                        # primary key is the first (uid:.. if we discovered it, else name:..)
                         primary_key = state_keys[0]
                         user_uid = None
                         if primary_key.startswith("uid:"):
@@ -704,16 +759,21 @@ def lambda_handler(event, context):
                                 user_uid = int(primary_key.split(":",1)[1])
                             except Exception:
                                 user_uid = nm_to_uid.get(nm)
+                        added = _write_entries_to_db(primary_key, state_keys, entries, user_uid, metrics)
+                        window_added += added
+                        metrics["backfilled_entries"] += added
+                        if added:
+                            print(f"[INFO] upsert nm={nm} key={primary_key} added={added}")
 
-                        added = _write_entries_to_db(primary_key, state_keys, entries, user_uid)
-                        backfilled_entries += added
+                    if window_added == 0:
+                        empty_streak += 1
+                        metrics["windows_empty_for_team"] += 1
+                    else:
+                        empty_streak = 0
 
-                    # small pause between windows to reduce rate limiting
                     _sleep_ms(BACKFILL_PAUSE_MS)
 
-    # ==========================
-    # Compute from DynamoDB only
-    # ==========================
+    # ========= Compute from DynamoDB only =========
     sent = 0
     processed = 0
     for t in team:
@@ -721,23 +781,30 @@ def lambda_handler(event, context):
         nm = _norm(username)
         keys = name_to_state_keys.get(nm, [f"name:{nm}"])
 
+        # monthly & lifetime
+        # (Optionally, you can add per-project breakdown here if you want to show it monthly.)
         month_agg  = aggregate_month_from_state(username, keys, m_start, m_end)
         total_secs = aggregate_total_from_state(keys)
 
-        # Build message
-        month_hours = _sum_seconds_to_hours(month_agg["total_seconds"])
-        total_hours = _sum_seconds_to_hours(total_secs)
-        msg = format_discord_message(username, month_hours, total_hours, m_start, m_end)
+        msg = format_discord_message(
+            username,
+            _sum_seconds_to_hours(month_agg["total_seconds"]),
+            _sum_seconds_to_hours(total_secs),
+            m_start, m_end
+        )
         processed += 1
 
-        # Send (or skip in dry-run)
         webhook = name_to_webhook.get(nm) or DISCORD_FALLBACK_WEBHOOK
         if not webhook:
             _alert(f"ℹ️ No webhook for '{username}' and no DISCORD_FALLBACK_WEBHOOK; skipping send.")
             continue
-        ok = send_discord_with_backoff(webhook, msg, timeout=HTTP_TIMEOUT)
-        if ok:
+        if send_discord_with_backoff(webhook, msg, timeout=HTTP_TIMEOUT):
             sent += 1
+
+    # DDB perf summary
+    avg = (metrics["ddb_put_latency_sum_sec"] / metrics["ddb_put_count"]) if metrics["ddb_put_count"] else 0.0
+    print(f"[INFO] DDB puts={metrics['ddb_put_count']} avg={avg:.3f}s max={metrics['ddb_put_max_latency_sec']:.3f}s "
+          f"errors={metrics['ddb_put_errors']} oversize_skips={metrics['ddb_skipped_oversize']}")
 
     return {
         "status": "complete",
@@ -746,8 +813,8 @@ def lambda_handler(event, context):
         "notify_enabled": NOTIFY_ENABLED,
         "users_processed": processed,
         "sent": sent,
-        "backfilled_windows": backfilled_windows,
-        "backfilled_entries": backfilled_entries,
         "month_start": m_start.strftime("%Y-%m-%d"),
         "month_end":   m_end.strftime("%Y-%m-%d"),
+        # backfill metrics
+        **metrics,
     }
