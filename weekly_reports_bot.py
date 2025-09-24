@@ -271,7 +271,7 @@ def aggregate_week_from_state(user_display_name: str,
 # ==========================
 def _format_project_breakdown(per_project_seconds: dict[str, int],
                               total_seconds: int,
-                              max_rows: int = 10) -> str:
+                              max_rows: int = 15) -> str:
     """
     Returns a markdown list of per-project times, sorted by time desc.
     Limits output to max_rows (adds a summary line if truncated).
