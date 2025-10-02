@@ -354,12 +354,11 @@ def search_time_entries_v3(api_token: str, workspace_id: int,
     return out
 
 def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
-    first = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=timezone.utc)
-    if dt.month == 12:
-        next_first = datetime(dt.year + 1, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    if dt.month == 1:
+        first = datetime(dt.year - 1, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
     else:
-        next_first = datetime(dt.year, dt.month + 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    last = next_first - timedelta(seconds=1)
+        first = datetime(dt.year, dt.month - 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    last = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=timezone.utc) - timedelta(days=1)
     return first, last
 
 def _shift_months(dt: datetime, months: int) -> datetime:
@@ -664,8 +663,7 @@ def lambda_handler(event, context):
                     wid_to_team_uids[wid].append(int(uid))
 
     now = datetime.now(timezone.utc)
-    m_start, _m_end = _month_bounds_utc(now)
-    m_end = now
+    m_start, m_end = _month_bounds_utc(now)
 
     metrics = {
         "backfilled_windows": 0,
