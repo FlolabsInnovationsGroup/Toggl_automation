@@ -8,6 +8,7 @@ from io import StringIO
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 # -----------------------------
 # Globals / Sessions
@@ -181,14 +182,54 @@ def get_workspace_users(api_token: str, workspace_id: int) -> list[dict]:
     return []
 
 # ==========================
-# ISO parsing / formatting
+# Robust ISO parsing / formatting
 # ==========================
+# Accepts:
+#   - 2025-09-20T12:34:56Z
+#   - 2025-09-20T12:34:56.123Z
+#   - 2025-09-20T12:34:56+00:00 / +05:30
+#   - 2025-09-20T12:34:56.123+00:00 / +0530
+#   - 2025-09-20T12:34:56+0000
+_ISO_TZ_RE = re.compile(r"(.+?)([+-]\d{2}):?(\d{2})$")
+
+def _normalize_iso(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    # Z -> +00:00
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # Insert colon in tz if missing (e.g., +0000 -> +00:00)
+    m = _ISO_TZ_RE.match(s)
+    if m:
+        base, hh, mm = m.groups()
+        s = f"{base}{hh}:{mm}"
+    # Strip fractional seconds to seconds precision (fromisoformat handles them, but keep a fallback)
+    return s
+
 def _parse_iso_opt(ts: str):
-    try:
-        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
-        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
-    except Exception:
+    if not ts:
         return None
+    s = _normalize_iso(ts)
+    try:
+        # First try Python's tolerant ISO parser
+        return datetime.fromisoformat(s)
+    except Exception:
+        # Fallback by removing fractional seconds if present
+        try:
+            # split before timezone sign (last + or -)
+            pos = max(s.rfind("+"), s.rfind("-"))
+            if pos > 0:
+                main, tz = s[:pos], s[pos:]
+            else:
+                main, tz = s, ""
+            if "." in main:
+                main = main.split(".", 1)[0]
+            # remove colon in tz for strptime
+            tz_nocolon = tz.replace(":", "") if tz else ""
+            return datetime.strptime(main + tz_nocolon, "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return None
 
 def format_seconds_to_hm(seconds: int) -> str:
     hours = seconds // 3600
@@ -234,6 +275,7 @@ def aggregate_week_from_state(user_display_name: str,
     total_entries = 0
     per_project_seconds = defaultdict(int)
     seen_eids = set()
+    parse_fail_count = 0
 
     for state_key in possible_keys:
         st = _get_user_state(state_key)
@@ -247,6 +289,7 @@ def aggregate_week_from_state(user_display_name: str,
 
             start_dt = _parse_iso_opt(start_s)
             if not start_dt:
+                parse_fail_count += 1
                 continue
             # normalize to aware UTC if missing tz
             if not start_dt.tzinfo:
@@ -258,6 +301,9 @@ def aggregate_week_from_state(user_display_name: str,
                 total_entries += 1
                 per_project_seconds[project] += secs
                 seen_eids.add(eid)
+
+    if parse_fail_count:
+        _alert(f"[INFO] {user_display_name}: skipped {parse_fail_count} entries due to unparseable start timestamps.")
 
     return {
         "username": user_display_name,
@@ -272,29 +318,21 @@ def aggregate_week_from_state(user_display_name: str,
 def _format_project_breakdown(per_project_seconds: dict[str, int],
                               total_seconds: int,
                               max_rows: int = 15) -> str:
-    """
-    Returns a markdown list of per-project times, sorted by time desc.
-    Limits output to max_rows (adds a summary line if truncated).
-    """
     if not per_project_seconds or total_seconds <= 0:
         return ""
-
     rows = sorted(per_project_seconds.items(), key=lambda kv: kv[1], reverse=True)
-    lines = []
-    shown = 0
+    lines, shown = [], 0
     for proj, secs in rows:
         pct = (secs / total_seconds * 100.0) if total_seconds > 0 else 0.0
         lines.append(f"- **{proj}** — {format_seconds_to_hm(secs)} ({pct:.1f}%)")
         shown += 1
         if shown >= max_rows:
             break
-
     if len(rows) > max_rows:
         hidden = rows[max_rows:]
         hidden_secs = sum(s for _, s in hidden)
         hidden_pct = (hidden_secs / total_seconds * 100.0) if total_seconds > 0 else 0.0
         lines.append(f"- **…and {len(hidden)} more** — {format_seconds_to_hm(hidden_secs)} ({hidden_pct:.1f}%)")
-
     return "\n".join(lines)
 
 def build_weekly_message(username: str,
@@ -315,8 +353,6 @@ def build_weekly_message(username: str,
         "",
         gamified_badge(total_hours)
     ]
-
-    # Per-project breakdown (only if we have time)
     if total_seconds > 0 and per_project_seconds:
         parts.append("\n### ⛏️ Time by Project")
         parts.append(_format_project_breakdown(per_project_seconds, total_seconds, max_rows=12))
@@ -348,10 +384,6 @@ def _send_one(webhook_url: str, content: str) -> bool:
         return False
 
 def send_reports_parallel(reports: list[dict], name_to_webhook: dict) -> int:
-    """
-    reports: [{"username": str, "message": str}]
-    name_to_webhook: normalized name -> webhook
-    """
     futures = []
     sent = 0
     with ThreadPoolExecutor(max_workers=min(MAX_SEND_WORKERS, len(reports) or 1)) as ex:
@@ -386,8 +418,7 @@ def lambda_handler(event, context):
     name_to_commit  = { _norm(u['name']): u.get('weekly_commitment_hours') for u in team_cfg if u.get('weekly_commitment_hours') is not None }
     name_to_email   = { _norm(u['name']): (u.get('email') or "").strip().lower() for u in team_cfg }
 
-    # Candidate state keys per team member:
-    # Always include name:<normalized>. We will try to enrich with uid:<id> discovered from Toggl.
+    # Candidate state keys per team member (always include name:<normalized>)
     name_to_state_keys = defaultdict(list)
     for u in team_cfg:
         nm = _norm(u["name"])
@@ -414,19 +445,16 @@ def lambda_handler(event, context):
                     continue
                 uid_key = f"uid:{uid}"
 
-                # Match by normalized name
                 if nm_ws:
                     if nm_ws in name_to_state_keys and uid_key not in name_to_state_keys[nm_ws]:
-                        # prefer uid (put first)
                         name_to_state_keys[nm_ws].insert(0, uid_key)
 
-                # Match by email for reliability (name mismatch cases)
                 if email_ws:
                     for nm_team, team_email in name_to_email.items():
                         if team_email and team_email == email_ws and uid_key not in name_to_state_keys[nm_team]:
                             name_to_state_keys[nm_team].insert(0, uid_key)
 
-    # Define inclusive weekly window (end of day)
+    # Define inclusive weekly window (end of day UTC)
     now_utc   = datetime.now(timezone.utc)
     week_end  = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
     week_start = week_end - timedelta(days=7)
@@ -438,11 +466,9 @@ def lambda_handler(event, context):
         nm = _norm(username)
         keys = name_to_state_keys.get(nm, [])
         if not keys:
-            # no keys — still produce a minimal report
             agg = {"username": username, "total_seconds": 0, "total_entries": 0, "per_project_seconds": {}}
         else:
-            a = aggregate_week_from_state(username, keys, week_start, week_end)
-            agg = a
+            agg = aggregate_week_from_state(username, keys, week_start, week_end)
 
         msg = build_weekly_message(
             username=username,
@@ -455,7 +481,6 @@ def lambda_handler(event, context):
         )
         all_reports.append({"username": username, "message": msg})
 
-    # Send to per-user webhooks in parallel
     sent = send_reports_parallel(all_reports, name_to_webhook)
 
     return {
