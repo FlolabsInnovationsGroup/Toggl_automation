@@ -5,6 +5,7 @@ import requests
 import csv
 import time
 import random
+import re
 from io import StringIO
 import boto3
 from datetime import datetime, timedelta, timezone
@@ -51,22 +52,22 @@ NOTION_TOKEN        = os.getenv("NOTION_TOKEN", "").strip()
 NOTION_DATABASE_ID  = os.getenv("NOTION_DATABASE_ID", "").strip()          # ⌚ Time Entries
 NOTION_TEAM_DB_ID   = os.getenv("NOTION_TEAM_DB_ID", "").strip()           # 👥 Team Members
 NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "25"))            # create/update batch
-NOTION_RPS          = float(os.getenv("NOTION_RPS", "0"))                  # keep < 3 RPS
-NOTION_FLUSH_EVERY = int(os.getenv("NOTION_FLUSH_EVERY", "200"))  # tune 100–400
+NOTION_RPS          = float(os.getenv("NOTION_RPS", "0"))                  # keep < 3 RPS (0 = no delay)
+NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "200"))          # tune 100–400
 
 # Property names (override only if you renamed them in Notion)
 # IMPORTANT: Name (title) now stores the **User Key** (uid:... or name:...)
-NOTION_PROP_NAME         = os.getenv("NOTION_PROP_NAME", "User Key")                  # title
-NOTION_PROP_TEAM_MEMBER  = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")   # relation to Team Members
-NOTION_PROP_ENTRY_ID     = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")         # number
-NOTION_PROP_PROJECT      = os.getenv("NOTION_PROP_PROJECT", "Project")           # select
-NOTION_PROP_TAGS         = os.getenv("NOTION_PROP_TAGS", "Tags")                 # multi_select
-NOTION_PROP_START        = os.getenv("NOTION_PROP_START", "Start")               # date
-NOTION_PROP_END          = os.getenv("NOTION_PROP_END", "End")                   # date
-NOTION_PROP_UPDATED      = os.getenv("NOTION_PROP_UPDATED", "Updated")           # date
-NOTION_PROP_DURATION_S   = os.getenv("NOTION_PROP_DURATION_S", "Duration")       # number (seconds)
-NOTION_PROP_WORKSPACE    = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")       # number
-NOTION_PROP_DESCRIPTION  = os.getenv("NOTION_PROP_DESCRIPTION", "Description")   # rich_text
+NOTION_PROP_NAME         = os.getenv("NOTION_PROP_NAME", "User Key")       # title
+NOTION_PROP_TEAM_MEMBER  = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")  # relation to Team Members
+NOTION_PROP_ENTRY_ID     = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")        # number
+NOTION_PROP_PROJECT      = os.getenv("NOTION_PROP_PROJECT", "Project")          # select
+NOTION_PROP_TAGS         = os.getenv("NOTION_PROP_TAGS", "Tags")                # multi_select
+NOTION_PROP_START        = os.getenv("NOTION_PROP_START", "Start")              # date
+NOTION_PROP_END          = os.getenv("NOTION_PROP_END", "End")                  # date
+NOTION_PROP_UPDATED      = os.getenv("NOTION_PROP_UPDATED", "Updated")          # date
+NOTION_PROP_DURATION_S   = os.getenv("NOTION_PROP_DURATION_S", "Duration")      # number (seconds)
+NOTION_PROP_WORKSPACE    = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")      # number
+NOTION_PROP_DESCRIPTION  = os.getenv("NOTION_PROP_DESCRIPTION", "Description")  # rich_text
 
 # Optional one-shot/history backfill into Notion
 NOTION_BACKFILL              = _env_bool("NOTION_BACKFILL", False)
@@ -207,7 +208,8 @@ def _notion_ok():
     return NOTION_ENABLED and NOTION_TOKEN and NOTION_DATABASE_ID
 
 _NOTION_SCHEMA = {}  # name -> type
-_TEAM_MEM_CACHE: dict[str, str] = {}  # norm_name -> page_id
+_TEAM_MEM_CACHE: dict[str, str] = {}  # legacy single-lookups cache
+_TEAM_MEM_INDEX: list[tuple[str, str, str]] = []  # [(norm_name, original_name, page_id)]
 
 def _prop_type(name: str) -> str:
     return _NOTION_SCHEMA.get(name, "")
@@ -265,30 +267,103 @@ def _date(iso: str|None):
 def _relation(page_id: str|None):
     return {"relation": [{"id": page_id}]} if page_id else {"relation": []}
 
-def _norm_contains_filter(prop_name: str, text: str):
-    return {"property": prop_name, "title": {"contains": text}}
+def _norm_for_match(s: str) -> str:
+    """lowercase, collapse spaces, strip punctuation/diacritics-lite."""
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def _team_member_lookup_partial(name: str) -> str|None:
-    """Find Team Members page by partial name (contains). Cache results."""
-    if not NOTION_TEAM_DB_ID or not name:
+def _tokenize(s: str) -> set[str]:
+    return set(_norm_for_match(s).split())
+
+def _title_from_props(props: dict, title_prop: str = "Name") -> str:
+    p = props.get(title_prop, {})
+    if p.get("type") == "title":
+        parts = p.get("title") or []
+        return "".join([t.get("plain_text", "") for t in parts]).strip()
+    return ""
+
+def notion_build_team_members_index():
+    """Load once per run: cache (norm_name, original_name, page_id) for all Team Members."""
+    global _TEAM_MEM_INDEX
+    if not NOTION_TEAM_DB_ID:
+        return
+    if _TEAM_MEM_INDEX:  # already loaded
+        return
+
+    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query"
+    payload = {"page_size": 100}
+    start_cursor = None
+    while True:
+        body = dict(payload)
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        try:
+            r = SESSION.post(url, headers=_NOTION_HEADERS, json=body, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                _alert(f"[ALERT] Team Members index load failed: {r.status_code} {r.text}")
+                break
+            data = r.json() or {}
+            results = data.get("results") or []
+            for pg in results:
+                pid = pg.get("id")
+                nm  = _title_from_props(pg.get("properties", {}), "Name")
+                if pid and nm:
+                    _TEAM_MEM_INDEX.append((_norm_for_match(nm), nm, pid))
+            if not data.get("has_more"):
+                break
+            start_cursor = data.get("next_cursor")
+            if NOTION_RPS > 0:
+                time.sleep(1.0 / NOTION_RPS)
+        except Exception as e:
+            _alert(f"[ALERT] Team Members index exception: {e}")
+            break
+
+def _best_team_member_page_id(user_display: str) -> str | None:
+    """
+    Choose the best Team Member by fuzzy token overlap + substring/prefix bonuses.
+    Returns page_id or None if nothing reasonable is found.
+    """
+    if not user_display:
         return None
-    key = _norm(name)
-    if key in _TEAM_MEM_CACHE:
-        return _TEAM_MEM_CACHE[key]
-    payload = {"filter": _norm_contains_filter("Name", name), "page_size": 3}
-    try:
-        r = SESSION.post(f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query",
-                         headers=_NOTION_HEADERS, json=payload, timeout=HTTP_TIMEOUT)
-        if r.status_code == 200:
-            results = (r.json() or {}).get("results") or []
-            page_id = results[0]["id"] if results else None
-            _TEAM_MEM_CACHE[key] = page_id or ""
-            return page_id
-        _alert(f"[ALERT] Team Members query failed: {r.status_code} {r.text}")
+    if not _TEAM_MEM_INDEX:
+        notion_build_team_members_index()
+    if not _TEAM_MEM_INDEX:
         return None
-    except Exception as e:
-        _alert(f"[ALERT] Team Members query exception: {e}")
-        return None
+
+    in_tokens = _tokenize(user_display)
+    in_norm   = _norm_for_match(user_display)
+
+    best_pid = None
+    best_score = 0.0
+
+    for cand_norm, cand_orig, cand_pid in _TEAM_MEM_INDEX:
+        cand_tokens = set(cand_norm.split())
+
+        # Jaccard token similarity
+        if in_tokens or cand_tokens:
+            inter = len(in_tokens & cand_tokens)
+            union = len(in_tokens | cand_tokens)
+            jacc = (inter / union) if union else 0.0
+        else:
+            jacc = 0.0
+
+        # Bonuses for prefix / substring matches on normalized strings
+        bonus = 0.0
+        if cand_norm.startswith(in_norm) or in_norm.startswith(cand_norm):
+            bonus += 0.15
+        if in_norm and cand_norm and (in_norm in cand_norm or cand_norm in in_norm):
+            bonus += 0.10
+
+        score = jacc + bonus
+
+        if score > best_score:
+            best_score = score
+            best_pid = cand_pid
+
+    # Minimal score threshold to avoid random mismatches
+    return best_pid if best_score >= 0.25 else None
 
 def _prop_map_for_entry(entry_id:str, user_key:str, user_display:str,
                         project:str, tags:list[str], start_iso:str|None, end_iso:str|None,
@@ -306,8 +381,8 @@ def _prop_map_for_entry(entry_id:str, user_key:str, user_display:str,
         NOTION_PROP_WORKSPACE:   _number(int(workspace_id or 0)),
         NOTION_PROP_DESCRIPTION: _rich_text(description or ""),
     }
-    # Team Member relation (partial name match)
-    tm_page = _team_member_lookup_partial(user_display)
+    # Fuzzy Team Member relation
+    tm_page = _best_team_member_page_id(user_display)
     props[NOTION_PROP_TEAM_MEMBER] = _relation(tm_page)
     return props
 
@@ -718,9 +793,10 @@ def lambda_handler(event, context):
         _alert("WORKSPACES sheet empty or unreachable.")
         return {"status": "no_workspaces"}
 
-    # Notion: read schema once
+    # Notion: read schema once + build team index for fuzzy matching
     if _notion_ok():
         notion_load_schema()
+        notion_build_team_members_index()
 
     # Map user name -> webhook (only if we plan to send)
     if NOTIFY_ENABLED:
@@ -761,8 +837,8 @@ def lambda_handler(event, context):
                     empty_streak = 0
                     backfilled["windows"] += 1
                     if len(_notion_queue) >= NOTION_FLUSH_EVERY:
-                            notion_flush_queue()
-                    # queue to Notion (we only create/update what is missing/changed)
+                        notion_flush_queue()
+                    # queue to Notion
                     for e in rows:
                         entry_id    = str(e.get("id") or "")
                         user_name   = e.get("user") or ""
@@ -911,7 +987,7 @@ def lambda_handler(event, context):
                     workspace_id=wid,
                     description=description
                 )
-                
+
                 if len(_notion_queue) >= NOTION_FLUSH_EVERY:
                     notion_flush_queue()
 
