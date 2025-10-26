@@ -84,8 +84,8 @@ NOTION_SET_TEAM_RELATION   = _env_bool("NOTION_SET_TEAM_RELATION", True)
 NOTION_MAX_RETRIES         = int(os.getenv("NOTION_MAX_RETRIES", "6"))     # explicit Notion call retries
 
 # NEW: wide index flags (make DB a real backup)
-NOTION_WIDE_EXISTING_INDEX = _env_bool("NOTION_WIDE_EXISTING_INDEX", True)  # build global existing Entry-ID set
-NOTION_MAX_INDEX_PAGES     = int(os.getenv("NOTION_MAX_INDEX_PAGES", "10000")) # safety cap (200 * 100 = 20k rows)
+NOTION_WIDE_EXISTING_INDEX = _env_bool("NOTION_WIDE_EXISTING_INDEX", True)   # build global Entry-ID map
+NOTION_MAX_INDEX_PAGES     = int(os.getenv("NOTION_MAX_INDEX_PAGES", "1000")) # safety cap
 
 # Property names
 NOTION_PROP_NAME         = os.getenv("NOTION_PROP_NAME", "User Key")       # title
@@ -100,13 +100,16 @@ NOTION_PROP_DURATION_S   = os.getenv("NOTION_PROP_DURATION_S", "Duration")
 NOTION_PROP_WORKSPACE    = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")
 NOTION_PROP_DESCRIPTION  = os.getenv("NOTION_PROP_DESCRIPTION", "Description")
 NOTION_PROP_DELETED      = os.getenv("NOTION_PROP_DELETED", "Deleted")
-_existing_eid_to_pid: dict[str, str] = {}
 
 # Optional Notion backfill
-NOTION_BACKFILL              = _env_bool("NOTION_BACKFILL", True)
+NOTION_BACKFILL              = _env_bool("NOTION_BACKFILL", False)
 HISTORY_STEP_MONTHS          = int(os.getenv("HISTORY_STEP_MONTHS", "12"))
 HISTORY_MAX_EMPTY_WINDOWS    = int(os.getenv("HISTORY_MAX_EMPTY_WINDOWS", "2"))
 HISTORY_MAX_YEARS            = int(os.getenv("HISTORY_MAX_YEARS", "15"))
+
+# Automatic backfill trigger (turn DB into full backup gradually)
+AUTO_BACKFILL_IF_DB_SMALL         = _env_bool("AUTO_BACKFILL_IF_DB_SMALL", True)
+BACKFILL_EXISTING_EIDS_THRESHOLD  = int(os.getenv("BACKFILL_EXISTING_EIDS_THRESHOLD", "5000"))  # run until ≥ threshold
 
 # Discord rate limiting
 DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
@@ -581,16 +584,12 @@ def _build_notion_state_index(since_dt: datetime, until_dt: datetime):
             user_current_ids.setdefault(user_key, set()).add(str(eid))
     return entries_by_id, user_current_ids
 
-# ---------- WIDE EXISTING INDEX (global Entry IDs) ----------
+# ---------- WIDE EXISTING INDEX (global Entry IDs -> page_id) ----------
 def _notion_collect_all_entry_ids() -> dict[str, str]:
-    """
-    Build a global map of Entry ID -> page_id present in the Notion DB.
-    Uses a single paginated query with 'Entry ID is not empty'.
-    """
+    """Build a global map of Entry ID -> page_id present in the Notion DB."""
     eid_to_pid: dict[str, str] = {}
     if not _notion_ok() or not NOTION_WIDE_EXISTING_INDEX:
         return eid_to_pid
-
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     payload = {
         "filter": { "property": NOTION_PROP_ENTRY_ID, _prop_type(NOTION_PROP_ENTRY_ID): { "is_not_empty": True } },
@@ -623,11 +622,10 @@ def _notion_collect_all_entry_ids() -> dict[str, str]:
             results = data.get("results") or []
             for res in results:
                 pid   = res.get("id")
-                props = res.get("properties", {}) or {}
+                props = res.get("properties", {})
                 eid   = _prop_to_entry_id(props)
                 if eid and pid:
                     eid_to_pid[str(eid)] = pid
-
             pages_scanned += 1
             if not data.get("has_more"):
                 break
@@ -637,12 +635,12 @@ def _notion_collect_all_entry_ids() -> dict[str, str]:
         except Exception as e:
             _alert(f"[ALERT] Wide index exception: {e}")
             break
-
     print(f"[INFO] Wide Notion existing index size={len(eid_to_pid)} pages_scanned={pages_scanned}")
     return eid_to_pid
 
-# ---------- Query existing by Entry IDs (fast batches) ----------
+# ---------- Query existing by Entry IDs (fallback batch) ----------
 def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
+    """Return eid->page_id for provided entry_ids (only if needed)."""
     found: dict[str, str] = {}
     if not entry_ids:
         return found
@@ -689,9 +687,17 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
             _alert(f"[ALERT] Notion bulk query exception: {e}")
     return found
 
-def _notion_create_pages(pages: list[dict], context=None):
+# ==========================
+# Creation / Update helpers
+# ==========================
+def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False):
+    """
+    items: list of dicts: {"properties": {...}, "description": "...", "eid": "123"}
+    If learn_ids=True, we parse responses and update the global routing map.
+    """
     created = 0
-    for payload in pages:
+    global _existing_eid_to_pid
+    for payload in items:
         if context and _time_budget_exhausted(context):
             break
         body = {
@@ -709,6 +715,7 @@ def _notion_create_pages(pages: list[dict], context=None):
                 }
             ]
         ok = False
+        resp_json = None
         for attempt in range(NOTION_MAX_RETRIES):
             try:
                 r = SESSION.post("https://api.notion.com/v1/pages",
@@ -716,6 +723,10 @@ def _notion_create_pages(pages: list[dict], context=None):
                 if r.status_code in (200, 201):
                     created += 1
                     ok = True
+                    try:
+                        resp_json = r.json()
+                    except Exception:
+                        resp_json = None
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
                     _notion_backoff(attempt); continue
@@ -726,6 +737,12 @@ def _notion_create_pages(pages: list[dict], context=None):
                 _notion_backoff(attempt)
         if not ok:
             _alert("[ERROR] Create page failed after retries; continuing")
+        else:
+            # Learn page_id immediately to avoid future lookups in the same run
+            if learn_ids and resp_json and payload.get("eid"):
+                pid = resp_json.get("id")
+                if pid:
+                    _existing_eid_to_pid[str(payload["eid"])] = pid
         if NOTION_RPS > 0:
             time.sleep(1.0 / NOTION_RPS)
     return created
@@ -761,6 +778,7 @@ def _notion_update_pages(items: list[tuple[str, dict]], context=None):
 # Queue all intended upserts here (entry_id -> {properties..., description})
 _notion_queue: dict[str, dict] = {}
 _notion_ops_done = 0  # created + updated this invocation
+_existing_eid_to_pid: dict[str, str] = {}  # seeded from wide index; updated on-the-fly
 
 def _notion_budget_remaining() -> int:
     return max(0, NOTION_MAX_UPSERTS_PER_RUN - _notion_ops_done)
@@ -808,10 +826,9 @@ def notion_flush_queue(limit_by_budget: bool = True, context=None):
     if not items:
         return {"created": 0, "updated": 0, "skipped": 0}
 
-    # 1) Route using our local eid->pid map (zero Notion calls)
+    # Route via eid->pid map; fallback to one batch lookup for unknowns
     to_update, to_create = [], []
     unknown_eids = []
-
     for eid, payload in items:
         pid = _existing_eid_to_pid.get(eid)
         if pid:
@@ -820,11 +837,9 @@ def notion_flush_queue(limit_by_budget: bool = True, context=None):
             unknown_eids.append(eid)
             to_create.append({"eid": eid, "properties": payload["properties"], "description": payload.get("description","")})
 
-    # 2) For unknown_eids, perform ONE batch lookup to catch rows added by other processes
     if unknown_eids:
         lookup = _notion_query_existing_by_entry_ids(unknown_eids)
         if lookup:
-            # move those into updates
             still_create = []
             for item in to_create:
                 eid = item["eid"]
@@ -835,7 +850,6 @@ def notion_flush_queue(limit_by_budget: bool = True, context=None):
                     still_create.append(item)
             to_create = still_create
 
-    # 3) Execute
     created = updated = 0
 
     # Updates
@@ -846,23 +860,19 @@ def notion_flush_queue(limit_by_budget: bool = True, context=None):
             if _notion_budget_remaining() <= 0:
                 break
 
-    # Creates (note: we can't learn new page IDs without parsing responses;
-    # fine for routing on the same run; the next wide index will catch them)
+    # Creates
     if to_create and _notion_budget_remaining() > 0:
-        # Convert to the create payload shape
-        create_batches = []
+        # batch by NOTION_BATCH_SIZE
         batch = []
         for item in to_create:
-            batch.append({"properties": item["properties"], "description": item.get("description","")})
+            batch.append(item)
             if len(batch) >= NOTION_BATCH_SIZE:
-                create_batches.append(batch); batch=[]
-        if batch:
-            create_batches.append(batch)
-
-        for b in create_batches:
-            if context and _time_budget_exhausted(context): break
-            if _notion_budget_remaining() <= 0: break
-            created += _notion_create_pages(b, context=context)
+                if context and _time_budget_exhausted(context): break
+                if _notion_budget_remaining() <= 0: break
+                created += _notion_create_pages(batch, context=context, learn_ids=True)
+                batch = []
+        if batch and _notion_budget_remaining() > 0 and not (context and _time_budget_exhausted(context)):
+            created += _notion_create_pages(batch, context=context, learn_ids=True)
 
     _notion_ops_done += (created + updated)
     print(f"[INFO] Notion upsert: created={created} updated={updated} total={created+updated} budget_used={_notion_ops_done}")
@@ -903,6 +913,10 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
     return []
 
 def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, per_page:int=200):
+    """
+    Generator that yields one page (list of entries) at a time.
+    Allows the caller to continue fetching more pages ONLY if there is action budget left.
+    """
     url = "https://api.track.toggl.com/reports/api/v2/details"
     headers = _headers_for_token(api_token)
     params = {
@@ -1131,9 +1145,10 @@ def _send_all_for_webhook(wh_url, msgs):
 # Lambda entrypoint
 # ==========================
 def lambda_handler(event, context):
-    global _notion_ops_done, _START_TS
+    global _notion_ops_done, _START_TS, _existing_eid_to_pid
     _START_TS = time.monotonic()
     _notion_ops_done = 0
+    _existing_eid_to_pid = {}
 
     # Load TEAM & WORKSPACES
     team          = load_team_sheet()
@@ -1146,7 +1161,7 @@ def lambda_handler(event, context):
         _alert("WORKSPACES sheet empty or unreachable.")
         return {"status": "no_workspaces"}
 
-    # Notion: read schema once + build team index (optional, off by default)
+    # Notion: read schema once + build team index (optional)
     if _notion_ok():
         notion_load_schema()
         notion_build_team_members_index(team_sheet=team)
@@ -1164,18 +1179,22 @@ def lambda_handler(event, context):
 
     notified = 0
     outbox = {}
-    missing_webhook_warned = set()
 
-    # Build Notion-based state snapshot (window) + wide existing index of Entry IDs
+    # Build Notion-based state snapshot (window) + wide existing map of Entry IDs
     notion_entries_by_id, notion_user_ids = ({}, {})
     if _notion_ok():
-        global _existing_eid_to_pid
         notion_entries_by_id, notion_user_ids = _build_notion_state_index(since, now)
         eid_to_pid = _notion_collect_all_entry_ids() if NOTION_WIDE_EXISTING_INDEX else {}
-        wide_existing_eids = set(eid_to_pid.keys())  # keep this line if other code expects the set
         _existing_eid_to_pid = dict(eid_to_pid)  # seed routing map
     else:
-        wide_existing_eids = set()
+        eid_to_pid = {}
+        _existing_eid_to_pid = {}
+
+    # Decide if we auto-backfill (DB small)
+    auto_backfill_needed = AUTO_BACKFILL_IF_DB_SMALL and (len(eid_to_pid) < BACKFILL_EXISTING_EIDS_THRESHOLD)
+    run_backfill = NOTION_BACKFILL or auto_backfill_needed
+    if auto_backfill_needed:
+        print(f"[INFO] Auto backfill ON (existing_eids={len(eid_to_pid)} < threshold={BACKFILL_EXISTING_EIDS_THRESHOLD})")
 
     # Counters
     scanned_rows   = 0
@@ -1204,9 +1223,8 @@ def lambda_handler(event, context):
             },
         }
 
-    # ---- Optional Notion history backfill (unchanged) ----
-    backfilled = {"windows":0, "entries":0}
-    if NOTION_BACKFILL and _notion_ok() and _notion_budget_remaining() > 0 and not _time_budget_exhausted(context):
+    # ---- Optional Notion history backfill (monthly windows, action-budget aware) ----
+    if run_backfill and _notion_ok() and _notion_budget_remaining() > 0 and not _time_budget_exhausted(context):
         for token_entry in workspace_set:
             if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0:
                 break
@@ -1237,8 +1255,8 @@ def lambda_handler(event, context):
                             user_name   = e.get("user") or ""
                             if not entry_id or not user_name:
                                 continue
-                            if entry_id in wide_existing_eids:
-                                continue
+                            if entry_id in _existing_eid_to_pid:
+                                continue  # already have it
                             description = e.get("description") or "No description"
                             project     = e.get("project") or "No project"
                             tags        = e.get("tags") or []
@@ -1270,16 +1288,19 @@ def lambda_handler(event, context):
                                 deleted=False
                             )
                             if queued:
-                                acted_rows += 1; wide_existing_eids.add(entry_id)
-                            backfilled["entries"] += 1
+                                acted_rows += 1
                             if len(_notion_queue) >= NOTION_FLUSH_EVERY:
                                 notion_flush_queue(limit_by_budget=True, context=context)
+                        # end for e in page
+                    # end for page
                     if not any_page_had_rows:
                         empty_streak += 1
                     else:
                         empty_streak = 0
+
                 if _notion_queue:
                     notion_flush_queue(limit_by_budget=True, context=context)
+
         if _notion_queue and _notion_budget_remaining() > 0:
             notion_flush_queue(limit_by_budget=True, context=context)
 
@@ -1340,9 +1361,9 @@ def lambda_handler(event, context):
                     state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
                     toggl_ids_by_user.setdefault(state_key, set()).add(entry_id)
 
-                    # Snapshot in the window (for diffs), but "existence" comes from wide index
+                    # Snapshot in the window (for diffs)
                     prev_snap = notion_entries_by_id.get(entry_id, {}).get("snapshot") if _notion_ok() else None
-                    first_seen = (entry_id not in wide_existing_eids)
+                    first_seen = (entry_id not in _existing_eid_to_pid)
 
                     if prev_snap:
                         prev_dur  = int(prev_snap.get("dur_ms", duration_ms))
@@ -1375,8 +1396,7 @@ def lambda_handler(event, context):
                     # --- Queue to Notion ---
                     queue_for_notion = False
                     if first_seen:
-                        # backup guarantee: if we fetched it from Toggl, we create it
-                        queue_for_notion = True
+                        queue_for_notion = True  # backup guarantee
                     else:
                         queue_for_notion = (changed_time or changed_proj or changed_desc or changed_tags or changed_start)
 
@@ -1397,11 +1417,12 @@ def lambda_handler(event, context):
                         ):
                             acted_rows += 1
                             if first_seen:
-                                wide_existing_eids.add(entry_id)  # avoid duplicate creates in same run
+                                # avoid duplicate creates later in the run
+                                _existing_eid_to_pid.setdefault(entry_id, "")  # placeholder; actual pid learned on create
                         if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
                             notion_flush_queue(limit_by_budget=True, context=context)
 
-                    # Notifications (unchanged; still optional)
+                    # Notifications
                     if NOTIFY_ENABLED:
                         webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
                         should_notify = False
@@ -1462,6 +1483,7 @@ def lambda_handler(event, context):
                             notified += 1
                             acted_rows += 1
 
+                # periodic flush to Notion to avoid big queues / or when low on time
                 if _notion_queue and _notion_budget_remaining() > 0:
                     notion_flush_queue(limit_by_budget=True, context=context)
 
@@ -1473,17 +1495,14 @@ def lambda_handler(event, context):
             if _time_budget_exhausted(context) or _notion_budget_remaining() <= 0 or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
                 break
             snap = info["snapshot"]
-            user_key = info["user_key"] or ""
+            user_key = info.get("user_key") or ""
             start_iso = snap.get("start_iso")
             if not start_iso:
-                continue
-            start_dt = parse_iso_opt(start_iso)
-            # keep same window for deletions
-            if not start_dt:
                 continue
             current_ids = toggl_ids_by_user.get(user_key, set())
             if eid in current_ids:
                 continue  # still present
+            # Mark deleted in Notion
             if notion_queue_entry(
                 entry_id=eid,
                 user_key=user_key,
@@ -1499,21 +1518,6 @@ def lambda_handler(event, context):
                 deleted=True
             ):
                 acted_rows += 1
-
-            if NOTIFY_ENABLED and acted_rows < MAX_TOGGL_ROWS_PER_RUN:
-                disp = user_key.replace("name:","").replace("uid:","").strip() or "Unknown"
-                msg = _format_deleted_message(disp, {
-                    "project": snap.get("project"),
-                    "tags": snap.get("tags"),
-                    "desc": snap.get("desc"),
-                    "dur_ms": snap.get("dur_ms"),
-                    "start_iso": snap.get("start_iso"),
-                })
-                webhook_url = user_map.get(disp) or user_map_norm.get(_norm(disp))
-                if webhook_url:
-                    outbox.setdefault(webhook_url, []).append(msg)
-                    notified += 1
-                    acted_rows += 1
 
         if _notion_queue and _notion_budget_remaining() > 0:
             notion_flush_queue(limit_by_budget=True, context=context)
