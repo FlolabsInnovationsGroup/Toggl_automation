@@ -19,9 +19,9 @@ from urllib3.util.retry import Retry
 SESSION = requests.Session()
 
 def _mount_retries_on_session():
-    """Mount a retrying HTTPAdapter that also retries on read/connect timeouts and 429/5xx."""
-    total = int(os.getenv("REQUESTS_RETRY_TOTAL", "6"))
-    backoff = float(os.getenv("REQUESTS_RETRY_BACKOFF", "0.6"))
+    """Mount a retrying HTTPAdapter that retries on read/connect timeouts and 429/5xx."""
+    total = int(os.getenv("REQUESTS_RETRY_TOTAL", "4"))  # trimmed to avoid runaway backoff
+    backoff = float(os.getenv("REQUESTS_RETRY_BACKOFF", "0.5"))
     retry = Retry(
         total=total,
         connect=total,
@@ -48,13 +48,13 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 # --- Runtime safety caps ---
 MAX_RUNTIME_S             = int(os.getenv("MAX_RUNTIME_S", "170"))    # hard wall-clock cap
 MAX_TOGGL_ROWS_PER_RUN    = int(os.getenv("MAX_TOGGL_ROWS_PER_RUN", "800"))
-TIGHT_EXIT_SAFETY_MARGIN  = int(os.getenv("TIGHT_EXIT_SAFETY_MARGIN", "3"))
+TIGHT_EXIT_SAFETY_MARGIN  = int(os.getenv("TIGHT_EXIT_SAFETY_MARGIN", "10"))
 
 # General window / HTTP
 TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
-HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))            # default for non-Notion
-NOTION_HTTP_TIMEOUT = int(os.getenv("NOTION_HTTP_TIMEOUT_SECONDS", "45"))     # longer for Notion calls
-HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"  # default ON
+HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))         # default for non-Notion
+NOTION_HTTP_TIMEOUT = int(os.getenv("NOTION_HTTP_TIMEOUT_SECONDS", "25"))  # trimmed to fail fast
+HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.getenv(name, "")
@@ -64,33 +64,39 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return s in ("1", "true", "yes", "y", "on")
 
 # Feature flags
-DRY_RUN_NO_SEND     = _env_bool("DRY_RUN_NO_SEND", False)       # keep DB updated, but don't notify
-SEND_NOTIFICATIONS  = _env_bool("SEND_NOTIFICATIONS", True)     # master switch for notifications
+DRY_RUN_NO_SEND     = _env_bool("DRY_RUN_NO_SEND", False)
+SEND_NOTIFICATIONS  = _env_bool("SEND_NOTIFICATIONS", True)
 NOTIFY_ENABLED      = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
 
 # ===== Notion env =====
 NOTION_ENABLED      = _env_bool("NOTION_ENABLED", False)
 NOTION_TOKEN        = os.getenv("NOTION_TOKEN", "").strip()
-NOTION_DATABASE_ID  = os.getenv("NOTION_DATABASE_ID", "").strip()          # ⌚ Time Entries
-NOTION_TEAM_DB_ID   = os.getenv("NOTION_TEAM_DB_ID", "").strip()           # 👥 Team Members
-NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "50"))
-NOTION_RPS          = float(os.getenv("NOTION_RPS", "0"))                  # < 3 RPS (0 = no delay)
-NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "400"))          # amortize queries
+NOTION_DATABASE_ID  = os.getenv("NOTION_DATABASE_ID", "").strip()
+NOTION_TEAM_DB_ID   = os.getenv("NOTION_TEAM_DB_ID", "").strip()
+NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "25"))
+NOTION_RPS          = float(os.getenv("NOTION_RPS", "2"))                # stay under 3 RPS
+NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "50"))
 
-# *** Performance caps (prevents timeouts) ***
-NOTION_MAX_UPSERTS_PER_RUN = int(os.getenv("NOTION_MAX_UPSERTS_PER_RUN", "300"))
-NOTION_CREATE_ADD_BLOCKS   = _env_bool("NOTION_CREATE_ADD_BLOCKS", True)
-NOTION_SET_TEAM_RELATION   = _env_bool("NOTION_SET_TEAM_RELATION", True)
-NOTION_MAX_RETRIES         = int(os.getenv("NOTION_MAX_RETRIES", "6"))     # explicit Notion call retries
+# *** Performance caps (tight & predictable) ***
+# Total upserts cap (creates + updates) for the run:
+NOTION_MAX_UPSERTS_PER_RUN  = int(os.getenv("NOTION_MAX_UPSERTS_PER_RUN", "100"))
+# Hard cap for CREATE operations specifically (new pages):
+NOTION_MAX_CREATES_PER_RUN  = int(os.getenv("NOTION_MAX_CREATES_PER_RUN", "100"))
+NOTION_CREATE_ADD_BLOCKS    = _env_bool("NOTION_CREATE_ADD_BLOCKS", True)
+NOTION_SET_TEAM_RELATION    = _env_bool("NOTION_SET_TEAM_RELATION", True)
+NOTION_MAX_RETRIES          = int(os.getenv("NOTION_MAX_RETRIES", "4"))     # trimmed
 
-# NEW: wide index flags (make DB a real backup)
-NOTION_WIDE_EXISTING_INDEX = _env_bool("NOTION_WIDE_EXISTING_INDEX", True)   # build global Entry-ID map
-NOTION_MAX_INDEX_PAGES     = int(os.getenv("NOTION_MAX_INDEX_PAGES", "1000")) # safety cap
+# Prioritize using create budget before updates/deletes
+NOTION_PRIORITIZE_CREATES   = _env_bool("NOTION_PRIORITIZE_CREATES", True)
+
+# Index flags
+NOTION_WIDE_EXISTING_INDEX  = _env_bool("NOTION_WIDE_EXISTING_INDEX", False)  # OFF by default
+NOTION_MAX_INDEX_PAGES      = int(os.getenv("NOTION_MAX_INDEX_PAGES", "2000"))
 
 # Property names
 NOTION_PROP_NAME         = os.getenv("NOTION_PROP_NAME", "User Key")       # title
 NOTION_PROP_TEAM_MEMBER  = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")
-NOTION_PROP_ENTRY_ID     = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")   # number or rich_text
+NOTION_PROP_ENTRY_ID     = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")
 NOTION_PROP_PROJECT      = os.getenv("NOTION_PROP_PROJECT", "Project")
 NOTION_PROP_TAGS         = os.getenv("NOTION_PROP_TAGS", "Tags")
 NOTION_PROP_START        = os.getenv("NOTION_PROP_START", "Start")
@@ -101,15 +107,15 @@ NOTION_PROP_WORKSPACE    = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")
 NOTION_PROP_DESCRIPTION  = os.getenv("NOTION_PROP_DESCRIPTION", "Description")
 NOTION_PROP_DELETED      = os.getenv("NOTION_PROP_DELETED", "Deleted")
 
-# Optional Notion backfill
+# Optional Notion backfill (default OFF for latency)
 NOTION_BACKFILL              = _env_bool("NOTION_BACKFILL", False)
 HISTORY_STEP_MONTHS          = int(os.getenv("HISTORY_STEP_MONTHS", "12"))
 HISTORY_MAX_EMPTY_WINDOWS    = int(os.getenv("HISTORY_MAX_EMPTY_WINDOWS", "2"))
 HISTORY_MAX_YEARS            = int(os.getenv("HISTORY_MAX_YEARS", "15"))
 
-# Automatic backfill trigger (turn DB into full backup gradually)
-AUTO_BACKFILL_IF_DB_SMALL         = _env_bool("AUTO_BACKFILL_IF_DB_SMALL", True)
-BACKFILL_EXISTING_EIDS_THRESHOLD  = int(os.getenv("BACKFILL_EXISTING_EIDS_THRESHOLD", "5000"))  # run until ≥ threshold
+# Automatic backfill trigger (OFF by default now)
+AUTO_BACKFILL_IF_DB_SMALL         = _env_bool("AUTO_BACKFILL_IF_DB_SMALL", False)
+BACKFILL_EXISTING_EIDS_THRESHOLD  = int(os.getenv("BACKFILL_EXISTING_EIDS_THRESHOLD", "5000"))
 
 # Discord rate limiting
 DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
@@ -236,7 +242,8 @@ def _prop_type(name: str) -> str:
 def _notion_backoff(attempt:int):
     if NOTION_RPS > 0:
         time.sleep(1.0 / NOTION_RPS)
-    time.sleep(min(2.0, 0.25 * (2 ** attempt)) + random.uniform(0.02, 0.25))
+    # capped backoff so we don't burn the whole run
+    time.sleep(min(1.5, 0.25 * (2 ** attempt)) + random.uniform(0.02, 0.2))
 
 def notion_load_schema():
     if not _notion_ok():
@@ -422,6 +429,7 @@ def _prop_map_for_entry(entry_id:str, user_key:str, user_display:str,
         NOTION_PROP_WORKSPACE:   _number(int(workspace_id or 0)),
         NOTION_PROP_DESCRIPTION: _rich_text(description or ""),
     }
+    # Entry ID may be number or text in Notion:
     if str(entry_id).isdigit() and _prop_type(NOTION_PROP_ENTRY_ID) == "number":
         props[NOTION_PROP_ENTRY_ID] = {"number": int(entry_id)}
     else:
@@ -638,7 +646,7 @@ def _notion_collect_all_entry_ids() -> dict[str, str]:
     print(f"[INFO] Wide Notion existing index size={len(eid_to_pid)} pages_scanned={pages_scanned}")
     return eid_to_pid
 
-# ---------- Query existing by Entry IDs (fallback batch) ----------
+# ---------- Query existing by Entry IDs (targeted batch) ----------
 def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
     """Return eid->page_id for provided entry_ids (only if needed)."""
     found: dict[str, str] = {}
@@ -652,7 +660,8 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
             if str(eid).isdigit() and _prop_type(NOTION_PROP_ENTRY_ID) == "number":
                 ors.append({"property": NOTION_PROP_ENTRY_ID, "number": {"equals": int(eid)}})
             else:
-                ors.append({"property": NOTION_PROP_ENTRY_ID, "rich_text": {"equals": str(eid)}})
+                # Using contains (works for rich_text); we re-read the property to disambiguate later.
+                ors.append({"property": NOTION_PROP_ENTRY_ID, "rich_text": {"contains": str(eid)}})
         payload = {"filter": {"or": ors}, "page_size": len(batch)}
         try:
             for attempt in range(NOTION_MAX_RETRIES):
@@ -690,15 +699,45 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
 # ==========================
 # Creation / Update helpers
 # ==========================
+def _respect_rps():
+    if NOTION_RPS > 0:
+        time.sleep(1.0 / NOTION_RPS)
+
+# Queue all intended upserts here (entry_id -> {properties..., description})
+_notion_queue: dict[str, dict] = {}
+_notion_ops_done = 0        # created + updated this invocation
+_notion_creates_done = 0    # created only (new pages)
+_existing_eid_to_pid: dict[str, str] = {}  # seeded from optional wide index; updated on the fly
+
+def _notion_budget_remaining() -> int:
+    return max(0, NOTION_MAX_UPSERTS_PER_RUN - _notion_ops_done)
+
+def _notion_creates_remaining() -> int:
+    return max(0, NOTION_MAX_CREATES_PER_RUN - _notion_creates_done)
+
+def notion_queue_entry(entry_id:str, user_key:str, user_display:str,
+                       project:str, tags:list[str], start_iso:str|None, end_iso:str|None,
+                       updated_iso:str|None, dur_seconds:int, workspace_id:int|None,
+                       description:str|None, deleted:bool|None=False):
+    if not _notion_ok():
+        return False
+    # Allow queueing even when create budget is 0; create/update routing decided during flush.
+    if _notion_budget_remaining() <= 0:
+        return False
+    props = _prop_map_for_entry(entry_id, user_key, user_display, project, tags,
+                                start_iso, end_iso, updated_iso, dur_seconds, workspace_id,
+                                description, deleted=deleted)
+    _notion_queue[str(entry_id)] = {"properties": props, "description": description or ""}
+    return True
+
 def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False):
-    """
-    items: list of dicts: {"properties": {...}, "description": "...", "eid": "123"}
-    If learn_ids=True, we parse responses and update the global routing map.
-    """
+    """items: list of dicts: {"properties": {...}, "description": "...", "eid": "123"}"""
+    global _notion_creates_done, _notion_ops_done, _existing_eid_to_pid
     created = 0
-    global _existing_eid_to_pid
     for payload in items:
         if context and _time_budget_exhausted(context):
+            break
+        if _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
             break
         body = {
             "parent": {"database_id": NOTION_DATABASE_ID},
@@ -722,6 +761,8 @@ def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False)
                                  headers=_NOTION_HEADERS, json=body, timeout=NOTION_HTTP_TIMEOUT)
                 if r.status_code in (200, 201):
                     created += 1
+                    _notion_creates_done += 1
+                    _notion_ops_done += 1
                     ok = True
                     try:
                         resp_json = r.json()
@@ -738,19 +779,20 @@ def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False)
         if not ok:
             _alert("[ERROR] Create page failed after retries; continuing")
         else:
-            # Learn page_id immediately to avoid future lookups in the same run
             if learn_ids and resp_json and payload.get("eid"):
                 pid = resp_json.get("id")
                 if pid:
                     _existing_eid_to_pid[str(payload["eid"])] = pid
-        if NOTION_RPS > 0:
-            time.sleep(1.0 / NOTION_RPS)
+        _respect_rps()
     return created
 
 def _notion_update_pages(items: list[tuple[str, dict]], context=None):
+    global _notion_ops_done
     updated = 0
     for page_id, props in items:
         if context and _time_budget_exhausted(context):
+            break
+        if _notion_budget_remaining() <= 0:
             break
         body = {"properties": props}
         ok = False
@@ -760,6 +802,7 @@ def _notion_update_pages(items: list[tuple[str, dict]], context=None):
                                   headers=_NOTION_HEADERS, json=body, timeout=NOTION_HTTP_TIMEOUT)
                 if r.status_code == 200:
                     updated += 1
+                    _notion_ops_done += 1
                     ok = True
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
@@ -771,31 +814,8 @@ def _notion_update_pages(items: list[tuple[str, dict]], context=None):
                 _notion_backoff(attempt)
         if not ok:
             _alert(f"[ERROR] Update page {page_id} failed after retries; continuing")
-        if NOTION_RPS > 0:
-            time.sleep(1.0 / NOTION_RPS)
+        _respect_rps()
     return updated
-
-# Queue all intended upserts here (entry_id -> {properties..., description})
-_notion_queue: dict[str, dict] = {}
-_notion_ops_done = 0  # created + updated this invocation
-_existing_eid_to_pid: dict[str, str] = {}  # seeded from wide index; updated on-the-fly
-
-def _notion_budget_remaining() -> int:
-    return max(0, NOTION_MAX_UPSERTS_PER_RUN - _notion_ops_done)
-
-def notion_queue_entry(entry_id:str, user_key:str, user_display:str,
-                       project:str, tags:list[str], start_iso:str|None, end_iso:str|None,
-                       updated_iso:str|None, dur_seconds:int, workspace_id:int|None,
-                       description:str|None, deleted:bool|None=False):
-    if not _notion_ok():
-        return False
-    if _notion_budget_remaining() <= 0:
-        return False
-    props = _prop_map_for_entry(entry_id, user_key, user_display, project, tags,
-                                start_iso, end_iso, updated_iso, dur_seconds, workspace_id,
-                                description, deleted=deleted)
-    _notion_queue[str(entry_id)] = {"properties": props, "description": description or ""}
-    return True
 
 def _pop_queue_items(limit: int | None) -> list[tuple[str, dict]]:
     if not _notion_queue:
@@ -808,20 +828,18 @@ def _pop_queue_items(limit: int | None) -> list[tuple[str, dict]]:
     return items
 
 def notion_flush_queue(limit_by_budget: bool = True, context=None):
-    global _notion_ops_done, _existing_eid_to_pid
     if not _notion_ok() or not _notion_queue:
         return {"created": 0, "updated": 0, "skipped": 0}
     if context and _time_budget_exhausted(context):
         return {"created": 0, "updated": 0, "skipped": len(_notion_queue)}
 
-    budget = _notion_budget_remaining() if limit_by_budget else None
-    if budget == 0:
+    upsert_budget = _notion_budget_remaining() if limit_by_budget else None
+    if upsert_budget == 0:
         return {"created": 0, "updated": 0, "skipped": len(_notion_queue)}
 
     low_time = context and (context.get_remaining_time_in_millis() <= (TIGHT_EXIT_SAFETY_MARGIN + 1) * 1000)
     take_cap = 100 if low_time else NOTION_FLUSH_EVERY
-
-    to_take = min(budget, take_cap) if budget is not None else take_cap
+    to_take = min(upsert_budget or take_cap, take_cap)
     items = _pop_queue_items(to_take)
     if not items:
         return {"created": 0, "updated": 0, "skipped": 0}
@@ -852,30 +870,28 @@ def notion_flush_queue(limit_by_budget: bool = True, context=None):
 
     created = updated = 0
 
-    # Updates
-    if to_update:
-        for i in range(0, len(to_update), NOTION_BATCH_SIZE):
-            if context and _time_budget_exhausted(context): break
-            updated += _notion_update_pages(to_update[i:i+NOTION_BATCH_SIZE], context=context)
-            if _notion_budget_remaining() <= 0:
-                break
-
-    # Creates
-    if to_create and _notion_budget_remaining() > 0:
-        # batch by NOTION_BATCH_SIZE
+    # CREATES FIRST (so we guarantee insert capacity)
+    if to_create and _notion_creates_remaining() > 0 and _notion_budget_remaining() > 0:
         batch = []
         for item in to_create:
+            if _notion_creates_remaining() <= 0 or _notion_budget_remaining() <= 0:
+                break
             batch.append(item)
             if len(batch) >= NOTION_BATCH_SIZE:
-                if context and _time_budget_exhausted(context): break
-                if _notion_budget_remaining() <= 0: break
                 created += _notion_create_pages(batch, context=context, learn_ids=True)
                 batch = []
-        if batch and _notion_budget_remaining() > 0 and not (context and _time_budget_exhausted(context)):
+        if batch and _notion_creates_remaining() > 0 and _notion_budget_remaining() > 0 and not (context and _time_budget_exhausted(context)):
             created += _notion_create_pages(batch, context=context, learn_ids=True)
 
-    _notion_ops_done += (created + updated)
-    print(f"[INFO] Notion upsert: created={created} updated={updated} total={created+updated} budget_used={_notion_ops_done}")
+    # UPDATES AFTER (if general budget remains)
+    if to_update and _notion_budget_remaining() > 0:
+        for i in range(0, len(to_update), NOTION_BATCH_SIZE):
+            if context and _time_budget_exhausted(context): break
+            if _notion_budget_remaining() <= 0: break
+            updated += _notion_update_pages(to_update[i:i+NOTION_BATCH_SIZE], context=context)
+
+    print(f"[INFO] Notion upsert: created={created} updated={updated} total={created+updated} "
+          f"creates_done={_notion_creates_done}/{NOTION_MAX_CREATES_PER_RUN} upserts_done={_notion_ops_done}/{NOTION_MAX_UPSERTS_PER_RUN}")
     return {"created": created, "updated": updated, "skipped": 0}
 
 # ==========================
@@ -1145,9 +1161,10 @@ def _send_all_for_webhook(wh_url, msgs):
 # Lambda entrypoint
 # ==========================
 def lambda_handler(event, context):
-    global _notion_ops_done, _START_TS, _existing_eid_to_pid
+    global _notion_ops_done, _notion_creates_done, _START_TS, _existing_eid_to_pid
     _START_TS = time.monotonic()
     _notion_ops_done = 0
+    _notion_creates_done = 0
     _existing_eid_to_pid = {}
 
     # Load TEAM & WORKSPACES
@@ -1180,27 +1197,26 @@ def lambda_handler(event, context):
     notified = 0
     outbox = {}
 
-    # Build Notion-based state snapshot (window) + wide existing map of Entry IDs
+    # Build Notion-based state snapshot (window) + (optional) wide existing map of Entry IDs
     notion_entries_by_id, notion_user_ids = ({}, {})
     if _notion_ok():
         notion_entries_by_id, notion_user_ids = _build_notion_state_index(since, now)
         eid_to_pid = _notion_collect_all_entry_ids() if NOTION_WIDE_EXISTING_INDEX else {}
-        _existing_eid_to_pid = dict(eid_to_pid)  # seed routing map
+        _existing_eid_to_pid = dict(eid_to_pid)
     else:
-        eid_to_pid = {}
         _existing_eid_to_pid = {}
 
     # Decide if we auto-backfill (DB small)
-    auto_backfill_needed = AUTO_BACKFILL_IF_DB_SMALL and (len(eid_to_pid) < BACKFILL_EXISTING_EIDS_THRESHOLD)
+    auto_backfill_needed = AUTO_BACKFILL_IF_DB_SMALL and False  # explicitly off unless enabled
     run_backfill = NOTION_BACKFILL or auto_backfill_needed
     if auto_backfill_needed:
-        print(f"[INFO] Auto backfill ON (existing_eids={len(eid_to_pid)} < threshold={BACKFILL_EXISTING_EIDS_THRESHOLD})")
+        print(f"[INFO] Auto backfill ON (existing_eids small)")
 
     # Counters
     scanned_rows   = 0
     acted_rows     = 0
 
-    # Short-circuit: if we have no Notion budget and notifications are off, exit early.
+    # Fast exit if no Notion budget and notifications are off
     if _notion_ok() and _notion_budget_remaining() <= 0 and not NOTIFY_ENABLED:
         return {
             "status": "complete",
@@ -1223,32 +1239,32 @@ def lambda_handler(event, context):
             },
         }
 
-    # ---- Optional Notion history backfill (monthly windows, action-budget aware) ----
+    # ---- Optional Notion history backfill (only if explicitly ON) ----
     if run_backfill and _notion_ok() and _notion_budget_remaining() > 0 and not _time_budget_exhausted(context):
         for token_entry in workspace_set:
-            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0:
+            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                 break
             api_token = token_entry["api_token"]
             workspaces = get_workspaces_for_token(api_token)
             for ws in workspaces:
-                if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0:
+                if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                     break
                 wid = ws.get("id")
                 if not wid:
                     continue
                 empty_streak = 0
                 for (win_start, win_end) in _history_windows(now):
-                    if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0:
+                    if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                         break
                     if empty_streak >= HISTORY_MAX_EMPTY_WINDOWS:
                         break
                     any_page_had_rows = False
                     for page in iter_workspace_entries_pages(api_token, wid, win_start, win_end, per_page=200):
-                        if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0:
+                        if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                             break
                         any_page_had_rows = True
                         for e in page:
-                            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0:
+                            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                                 break
                             scanned_rows += 1
                             entry_id    = str(e.get("id") or "")
@@ -1289,7 +1305,7 @@ def lambda_handler(event, context):
                             )
                             if queued:
                                 acted_rows += 1
-                            if len(_notion_queue) >= NOTION_FLUSH_EVERY:
+                            if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
                                 notion_flush_queue(limit_by_budget=True, context=context)
                         # end for e in page
                     # end for page
@@ -1308,7 +1324,7 @@ def lambda_handler(event, context):
     toggl_ids_by_user: dict[str, set] = {}
 
     for token_entry in workspace_set:
-        if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
+        if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
             break
         api_token = token_entry["api_token"]
         workspaces = get_workspaces_for_token(api_token)
@@ -1317,19 +1333,20 @@ def lambda_handler(event, context):
             continue
 
         for ws in workspaces:
-            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
+            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                 break
             wid = ws.get("id")
             if not wid:
                 continue
 
-            print(f"[DEBUG] Streaming entries from workspace {wid} (action budget left={MAX_TOGGL_ROWS_PER_RUN - acted_rows})")
+            print(f"[DEBUG] Streaming entries from workspace {wid} "
+                  f"(create_budget={_notion_creates_remaining()} upsert_budget={_notion_budget_remaining()})")
             for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=200):
-                if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
+                if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                     break
                 print(f"[DEBUG] Page fetched with {len(page)} entries from workspace {wid}")
                 for entry in page:
-                    if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
+                    if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
                         break
                     scanned_rows += 1
 
@@ -1396,11 +1413,12 @@ def lambda_handler(event, context):
                     # --- Queue to Notion ---
                     queue_for_notion = False
                     if first_seen:
-                        queue_for_notion = True  # backup guarantee
+                        queue_for_notion = True  # backup guarantee (create)
                     else:
-                        queue_for_notion = (changed_time or changed_proj or changed_desc or changed_tags or changed_start)
+                        if not NOTION_PRIORITIZE_CREATES:
+                            queue_for_notion = (changed_time or changed_proj or changed_desc or changed_tags or changed_start)
 
-                    if _notion_budget_remaining() > 0 and queue_for_notion:
+                    if _notion_budget_remaining() > 0 and (_notion_creates_remaining() > 0 if first_seen else True) and queue_for_notion:
                         if notion_queue_entry(
                             entry_id=entry_id,
                             user_key=state_key,
@@ -1418,7 +1436,7 @@ def lambda_handler(event, context):
                             acted_rows += 1
                             if first_seen:
                                 # avoid duplicate creates later in the run
-                                _existing_eid_to_pid.setdefault(entry_id, "")  # placeholder; actual pid learned on create
+                                _existing_eid_to_pid.setdefault(entry_id, "")
                         if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
                             notion_flush_queue(limit_by_budget=True, context=context)
 
@@ -1433,24 +1451,28 @@ def lambda_handler(event, context):
                             if updated_dt >= since:
                                 should_notify = True
                         else:
-                            if (updated_dt and prev_updated and updated_dt > prev_updated) and (updated_dt >= since) and queue_for_notion:
-                                should_notify = True
-                                label = "✍️ Time Entry Edited"
-                                if changed_time:
-                                    diff_lines.append(f"Δ Time {_format_delta_ms(duration_ms - prev_dur)}")
-                                if changed_proj:
-                                    diff_lines.append("Project changed")
-                                if changed_desc:
-                                    diff_lines.append("Description changed")
-                                if changed_tags:
-                                    added   = sorted(list(new_set - old_set))
-                                    removed = sorted(list(old_set - new_set))
-                                    bits = []
-                                    if added:   bits.append("+" + ", ".join(added))
-                                    if removed: bits.append("-" + ", ".join(removed))
-                                    diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
-                                if changed_start:
-                                    diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
+                            if (prev_updated and updated_dt > prev_updated) and (updated_dt >= since) and (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
+                                if NOTION_PRIORITIZE_CREATES and _notion_creates_remaining() > 0:
+                                    # delay non-create activity in notify-heavy runs
+                                    should_notify = False
+                                else:
+                                    should_notify = True
+                                    label = "✍️ Time Entry Edited"
+                                    if changed_time:
+                                        diff_lines.append(f"Δ Time {_format_delta_ms(duration_ms - prev_dur)}")
+                                    if changed_proj:
+                                        diff_lines.append("Project changed")
+                                    if changed_desc:
+                                        diff_lines.append("Description changed")
+                                    if changed_tags:
+                                        added   = sorted(list(new_set - old_set))
+                                        removed = sorted(list(old_set - new_set))
+                                        bits = []
+                                        if added:   bits.append("+" + ", ".join(added))
+                                        if removed: bits.append("-" + ", ".join(removed))
+                                        diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
+                                    if changed_start:
+                                        diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
 
                         if should_notify and webhook_url:
                             lines = [
@@ -1483,44 +1505,49 @@ def lambda_handler(event, context):
                             notified += 1
                             acted_rows += 1
 
-                # periodic flush to Notion to avoid big queues / or when low on time
+                # periodic flush to Notion
                 if _notion_queue and _notion_budget_remaining() > 0:
                     notion_flush_queue(limit_by_budget=True, context=context)
 
+                # Early stop once create budget is reached
+                if _notion_creates_remaining() <= 0 or _notion_budget_remaining() <= 0:
+                    break
+
     # ==========================
-    # Deletion detection (Notion is the state) — action/time-aware
+    # Deletion detection (only if create budget is satisfied or not prioritized)
     # ==========================
     if _notion_ok() and _notion_budget_remaining() > 0 and not _time_budget_exhausted(context) and acted_rows < MAX_TOGGL_ROWS_PER_RUN:
-        for eid, info in notion_entries_by_id.items():
-            if _time_budget_exhausted(context) or _notion_budget_remaining() <= 0 or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
-                break
-            snap = info["snapshot"]
-            user_key = info.get("user_key") or ""
-            start_iso = snap.get("start_iso")
-            if not start_iso:
-                continue
-            current_ids = toggl_ids_by_user.get(user_key, set())
-            if eid in current_ids:
-                continue  # still present
-            # Mark deleted in Notion
-            if notion_queue_entry(
-                entry_id=eid,
-                user_key=user_key,
-                user_display=user_key,
-                project=snap.get("project") or "No project",
-                tags=list(snap.get("tags") or []),
-                start_iso=snap.get("start_iso"),
-                end_iso=snap.get("end_iso"),
-                updated_iso=snap.get("updated_iso"),
-                dur_seconds=max(0, int(snap.get("dur_ms",0)) // 1000),
-                workspace_id=None,
-                description=snap.get("desc") or "",
-                deleted=True
-            ):
-                acted_rows += 1
+        if (not NOTION_PRIORITIZE_CREATES) or (_notion_creates_remaining() <= 0):
+            for eid, info in notion_entries_by_id.items():
+                if _time_budget_exhausted(context) or _notion_budget_remaining() <= 0 or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
+                    break
+                snap = info["snapshot"]
+                user_key = info.get("user_key") or ""
+                start_iso = snap.get("start_iso")
+                if not start_iso:
+                    continue
+                current_ids = toggl_ids_by_user.get(user_key, set())
+                if eid in current_ids:
+                    continue  # still present
+                # Mark deleted in Notion (consumes upsert budget, not create budget)
+                if notion_queue_entry(
+                    entry_id=eid,
+                    user_key=user_key,
+                    user_display=user_key,
+                    project=snap.get("project") or "No project",
+                    tags=list(snap.get("tags") or []),
+                    start_iso=snap.get("start_iso"),
+                    end_iso=snap.get("end_iso"),
+                    updated_iso=snap.get("updated_iso"),
+                    dur_seconds=max(0, int(snap.get("dur_ms",0)) // 1000),
+                    workspace_id=None,
+                    description=snap.get("desc") or "",
+                    deleted=True
+                ):
+                    acted_rows += 1
 
-        if _notion_queue and _notion_budget_remaining() > 0:
-            notion_flush_queue(limit_by_budget=True, context=context)
+            if _notion_queue and _notion_budget_remaining() > 0:
+                notion_flush_queue(limit_by_budget=True, context=context)
 
     # ==========================
     # Send Discord messages
@@ -1545,6 +1572,8 @@ def lambda_handler(event, context):
         "notion": {
             "budget_used": _notion_ops_done,
             "budget_cap": NOTION_MAX_UPSERTS_PER_RUN,
+            "create_budget_used": _notion_creates_done,
+            "create_budget_cap": NOTION_MAX_CREATES_PER_RUN,
             "queue_left": len(_notion_queue),
         },
         "runtime": {
