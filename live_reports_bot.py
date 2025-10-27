@@ -10,6 +10,12 @@ from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# In-run caches and guards to reduce duplicate Toggl calls
+_WS_CACHE_BY_TOKEN: dict[str, list[dict]] = {}
+_USERS_CACHE: dict[tuple[str,int], dict[int,str]] = {}
+_PROJECTS_CACHE: dict[tuple[str,int], dict[int,str]] = {}
+_EXHAUSTED_TOKENS: set[str] = set()
+
 # ==========================
 # Robust HTTP session (shared)
 # ==========================
@@ -60,6 +66,8 @@ TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
 HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 NOTION_HTTP_TIMEOUT = int(os.getenv("NOTION_HTTP_TIMEOUT_SECONDS", "25"))
 HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"
+TOGGL_REPORTS_USER_AGENT = os.getenv("TOGGL_REPORTS_USER_AGENT", "TogglAutomationBot/1.0")
+TOGGL_USE_REPORTS_ONLY = os.getenv("TOGGL_USE_REPORTS_ONLY", "1").strip().lower() in ("1","true","yes","y","on")
 
 def _env_bool(name: str, default: bool = False) -> bool:
     s = (os.getenv(name, "").strip().lower())
@@ -75,8 +83,9 @@ NOTIFY_ENABLED      = SEND_NOTIFICATIONS  # True = notify mode, False = dry-fill
 NOTION_TOKEN        = os.getenv("NOTION_TOKEN", "").strip()
 NOTION_DATABASE_ID  = os.getenv("NOTION_DATABASE_ID", "").strip()
 NOTION_TEAM_DB_ID   = os.getenv("NOTION_TEAM_DB_ID", "").strip()
-NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "75"))  # larger default for faster backfill
-NOTION_RPS          = float(os.getenv("NOTION_RPS", "2.5"))      # safe default; Notion soft limit ~3 rps
+# Default to slightly higher throughput while respecting Notion limits
+NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "100"))  # larger default for faster backfill
+NOTION_RPS          = float(os.getenv("NOTION_RPS", "3.0"))      # Notion soft limit ~3 rps
 NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "150"))
 
 # (Instrumentation only; no gating)
@@ -656,20 +665,23 @@ def _build_notion_state_index(since_dt: datetime, until_dt: datetime):
     return entries_by_id, user_current_ids
 
 # ---------- Query existing by Entry IDs (targeted batch) ----------
-def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
-    found: dict[str, str] = {}
+def _notion_query_existing_by_entry_ids(entry_ids: list[str], with_snapshots: bool = False) -> dict[str, any]:
+    """Query Notion for a set of Entry IDs. If with_snapshots, returns eid -> {page_id, snapshot, user_key}.
+    Otherwise returns eid -> page_id.
+    """
+    found: dict[str, any] = {}
     if not entry_ids:
         return found
     chunk = 25
     for i in range(0, len(entry_ids), chunk):
-        batch = entry_ids[i:i+chunk]
+        batch = [str(e) for e in entry_ids[i:i+chunk]]
         ors = []
         for eid in batch:
             if str(eid).isdigit() and _prop_type(NOTION_PROP_ENTRY_ID) == "number":
                 ors.append({"property": NOTION_PROP_ENTRY_ID, "number": {"equals": int(eid)}})
             else:
                 ors.append({"property": NOTION_PROP_ENTRY_ID, "rich_text": {"contains": str(eid)}})
-        payload = {"filter": {"or": ors}, "page_size": len(batch)}
+        payload = {"filter": {"or": ors}, "page_size": min(len(batch), 100)}
         try:
             for attempt in range(NOTION_MAX_RETRIES):
                 try:
@@ -689,16 +701,39 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
                 continue
 
             for res in (r.json() or {}).get("results", []):
-                pid = res["id"]
+                pid = res.get("id")
                 props = res.get("properties", {})
                 val = props.get(NOTION_PROP_ENTRY_ID, {})
-                if val.get("type") == "number":
+                if (val or {}).get("type") == "number":
                     eid_val = str(int(val.get("number") or 0))
                 else:
                     rt = (val.get("rich_text") or [])
-                    eid_val = "".join([t.get("plain_text","") for t in rt]) if rt else ""
-                if eid_val:
+                    eid_val = "".join([t.get("plain_text", "") for t in rt]) if rt else ""
+                if not eid_val:
+                    continue
+                if not with_snapshots:
                     found[eid_val] = pid
+                else:
+                    user_key   = _prop_to_title_text(props, NOTION_PROP_NAME)
+                    project    = _prop_to_select_name(props, NOTION_PROP_PROJECT)
+                    tags       = _prop_to_tags(props, NOTION_PROP_TAGS)
+                    start_iso  = _prop_to_date_iso(props, NOTION_PROP_START)
+                    end_iso    = _prop_to_date_iso(props, NOTION_PROP_END)
+                    updated_iso= _prop_to_date_iso(props, NOTION_PROP_UPDATED)
+                    dur_s      = _prop_to_number(props, NOTION_PROP_DURATION_S) or 0
+                    desc       = _prop_to_text(props, NOTION_PROP_DESCRIPTION)
+                    deleted    = _prop_to_checkbox(props, NOTION_PROP_DELETED) if NOTION_PROP_DELETED in _NOTION_SCHEMA else False
+                    snap = {
+                        "dur_ms": int(dur_s * 1000),
+                        "desc": desc or "No description",
+                        "project": project or "No project",
+                        "tags": list(tags) if isinstance(tags, list) else [],
+                        "start_iso": start_iso or "",
+                        "end_iso": end_iso or "",
+                        "updated_iso": updated_iso or "",
+                        "deleted": bool(deleted),
+                    }
+                    found[eid_val] = {"page_id": pid, "snapshot": snap, "user_key": user_key}
         except Exception as e:
             _alert(f"Notion bulk query exception: {e}")
     return found
@@ -894,14 +929,29 @@ def notion_flush_queue(context=None):
 # Toggl API helpers (use v9, not Reports API)
 # ==========================
 def _headers_for_token(api_token: str) -> dict:
-    return { "Authorization": "Basic " + base64.b64encode(f"{api_token}:api_token".encode()).decode() }
+    return {
+        "Authorization": "Basic " + base64.b64encode(f"{api_token}:api_token".encode()).decode(),
+        "Accept": "application/json",
+    }
 
 def get_workspaces_for_token(api_token: str) -> list[dict]:
+    # Avoid re-calling for tokens that already exceeded quota this run
+    if api_token in _EXHAUSTED_TOKENS:
+        return []
+    # In-run caching to limit repeated calls across code paths
+    if api_token in _WS_CACHE_BY_TOKEN:
+        return _WS_CACHE_BY_TOKEN.get(api_token, [])
+
     url = "https://api.track.toggl.com/api/v9/workspaces"
     try:
         r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
-            return r.json() or []
+            data = r.json() or []
+            _WS_CACHE_BY_TOKEN[api_token] = data
+            return data
+        # Handle quota/plan errors gracefully and avoid retry storms in-run
+        if r.status_code == 402:
+            _EXHAUSTED_TOKENS.add(api_token)
         _alert(f"get_workspaces_for_token: {r.status_code} {r.text}")
     except Exception as e:
         _alert(f"get_workspaces_for_token exception: {e}")
@@ -909,6 +959,13 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
 
 def get_workspace_users_map(api_token: str, workspace_id: int) -> dict[int, str]:
     """Map user_id -> display name for a workspace."""
+    # In-run cache keyed by (token, workspace)
+    cache_key = (api_token, int(workspace_id))
+    if api_token in _EXHAUSTED_TOKENS:
+        return _USERS_CACHE.get(cache_key, {})
+    if cache_key in _USERS_CACHE:
+        return _USERS_CACHE[cache_key]
+
     url = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/workspace_users"
     try:
         r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
@@ -920,7 +977,10 @@ def get_workspace_users_map(api_token: str, workspace_id: int) -> dict[int, str]
                 nm = u.get("name") or u.get("fullname") or u.get("email") or f"user:{uid}"
                 if uid is not None:
                     out[int(uid)] = nm
+            _USERS_CACHE[cache_key] = out
             return out
+        if r.status_code == 402:
+            _EXHAUSTED_TOKENS.add(api_token)
         _alert(f"workspace_users fetch failed: {r.status_code} - {r.text}")
     except Exception as e:
         _alert(f"workspace_users exception: {e}")
@@ -928,6 +988,12 @@ def get_workspace_users_map(api_token: str, workspace_id: int) -> dict[int, str]
 
 def get_workspace_projects_map(api_token: str, workspace_id: int) -> dict[int, str]:
     """Map project_id -> project name."""
+    cache_key = (api_token, int(workspace_id))
+    if api_token in _EXHAUSTED_TOKENS:
+        return _PROJECTS_CACHE.get(cache_key, {})
+    if cache_key in _PROJECTS_CACHE:
+        return _PROJECTS_CACHE[cache_key]
+
     url = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/projects"
     try:
         r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
@@ -938,7 +1004,10 @@ def get_workspace_projects_map(api_token: str, workspace_id: int) -> dict[int, s
                 nm = p.get("name") or f"project:{pid}"
                 if pid is not None:
                     out[int(pid)] = nm
+            _PROJECTS_CACHE[cache_key] = out
             return out
+        if r.status_code == 402:
+            _EXHAUSTED_TOKENS.add(api_token)
         _alert(f"projects fetch failed: {r.status_code} - {r.text}")
     except Exception as e:
         _alert(f"projects exception: {e}")
@@ -947,52 +1016,58 @@ def get_workspace_projects_map(api_token: str, workspace_id: int) -> dict[int, s
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
-def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, per_page:int=2000):
+def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, per_page:int=200):
     """
-    Generator that yields one page (list of entries) at a time from v9 time_entries.
-    Falls back gracefully if pagination params are not supported.
+    Use Toggl Reports API (v2 details) to fetch time entries for a workspace.
+    Yields one list of entries per page. Stops on 402 (plan/quota) and caches exhausted token.
     """
-    base = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/time_entries"
+    if api_token in _EXHAUSTED_TOKENS:
+        return
     headers = _headers_for_token(api_token)
+    url = "https://api.track.toggl.com/reports/api/v2/details"
 
-    params = {
-        "start_date": _iso(since_dt),
-        "end_date": _iso(until_dt),
-        "page": 1,
-        "per_page": per_page,
-    }
-
-    # Try paginated fetch; if API returns a list and page grows empty, stop
-    seen_any = False
-    for _ in range(500):  # hard safety
+    page = 1
+    total_count = None
+    # Clamp per_page to Reports API limits
+    try:
+        per_page = int(per_page)
+    except Exception:
+        per_page = 200
+    if per_page <= 0 or per_page > 200:
+        per_page = 200
+    while True:
+        if total_count is not None and (page - 1) * per_page >= total_count:
+            break
+        params = {
+            "workspace_id": int(workspace_id),
+            "since": since_dt.strftime("%Y-%m-%d"),
+            "until": until_dt.strftime("%Y-%m-%d"),
+            "user_agent": TOGGL_REPORTS_USER_AGENT,
+            "page": page,
+            "per_page": per_page,
+        }
         try:
-            resp = SESSION.get(base, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-            if resp.status_code == 402:
-                _alert("Payment required on Reports API — ensure we are using v9 time_entries. (This call should not be Reports.)")
+            resp = SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            code = resp.status_code
+            if code == 402:
+                _EXHAUSTED_TOKENS.add(api_token)
+                _alert(f"details fetch failed: 402 - {resp.text}")
                 break
-            if resp.status_code != 200:
-                _alert(f"time_entries fetch failed: {resp.status_code} - {resp.text}")
+            if code != 200:
+                _alert(f"details fetch failed: {code} - {resp.text}")
                 break
-            data = resp.json() or []
-            if isinstance(data, dict):
-                # Some deployments may wrap results
-                data = data.get("data") or []
-            if not data:
-                if not seen_any:
-                    # Some servers ignore pagination params; try without them once.
-                    resp2 = SESSION.get(base, headers=headers, params={"start_date": _iso(since_dt), "end_date": _iso(until_dt)}, timeout=HTTP_TIMEOUT)
-                    if resp2.status_code == 200:
-                        data2 = resp2.json() or []
-                        if data2:
-                            yield data2
+            body = resp.json() or {}
+            entries = body.get("data") or []
+            total_count = body.get("total_count") or (total_count if total_count is not None else 0)
+            if not entries:
                 break
-            seen_any = True
-            yield data
-            if len(data) < params["per_page"]:
+            yield entries
+            # per_page from response may differ; respect param used
+            if len(entries) < per_page:
                 break
-            params["page"] += 1
+            page += 1
         except Exception as e:
-            _alert(f"time_entries exception: {e}")
+            _alert(f"details exception: {e}")
             break
 
 # History windows
@@ -1224,6 +1299,8 @@ def _collect_all_workspaces(workspace_set: list[dict], context):
         if _time_budget_exhausted(context):
             break
         api_token = token_entry["api_token"]
+        if api_token in _EXHAUSTED_TOKENS:
+            continue
         for ws in get_workspaces_for_token(api_token):
             wid = ws.get("id")
             if wid and wid not in seen_wids:
@@ -1251,8 +1328,12 @@ def _dry_fill_db_from_oldest(team, workspace_set, context):
     total_created = 0
     windows_processed = 0
     skipped_windows = 0
-
-    for (win_start, win_end) in windows:
+    consecutive_empty = 0
+    # Exponential jump-through for empty windows so we approach present quickly in one run
+    jump_size = 1  # in window units
+    idx = 0
+    while idx < len(windows):
+        win_start, win_end = windows[idx]
         if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
             _alert("Time budget nearly exhausted during dry-fill; stopping.")
             break
@@ -1265,6 +1346,10 @@ def _dry_fill_db_from_oldest(team, workspace_set, context):
         scanned_this_window = 0
 
         for (api_token, wid) in ws_pairs:
+            if (api_token, wid) in globals().get('_TE_UNSUPPORTED', set()):
+                continue
+            if api_token in _EXHAUSTED_TOKENS:
+                continue
             if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
                 break
 
@@ -1324,12 +1409,23 @@ def _dry_fill_db_from_oldest(team, workspace_set, context):
         if created_this_window > 0:
             windows_processed += 1
             print(f"[DRY-FILL] Window {win_start.date()}..{win_end.date()}: created {created_this_window}")
+            consecutive_empty = 0
+            jump_size = 1
         else:
             skipped_windows += 1
             print(f"[DRY-FILL] Window {win_start.date()}..{win_end.date()}: nothing to create")
+            consecutive_empty += 1
+            if consecutive_empty >= HISTORY_MAX_EMPTY_WINDOWS:
+                # Skip ahead exponentially to reach present faster
+                idx = min(idx + max(1, jump_size), len(windows))
+                jump_size = min(jump_size * 2, 24)  # cap jumps to 24 windows
+                consecutive_empty = 0
+                continue
 
         if _remaining_s(context) <= FINAL_RESERVE_S:
             break
+
+        idx += 1
 
     # Drain any remainder
     if _notion_queue and not _time_budget_exhausted(context):
@@ -1423,9 +1519,9 @@ def lambda_handler(event, context):
     display_by_user_key = {} # user_key -> user_display (for deletions)
 
     # Build Notion-based state snapshot (window) and seed eid->pid only from window
-    notion_entries_by_id, notion_user_ids = _build_notion_state_index(since, now)
-    for eid, info in notion_entries_by_id.items():
-        _existing_eid_to_pid[eid] = info["page_id"]
+    # Defer expensive Notion window scan; we will look up only EIDs we see from Toggl
+    notion_entries_by_id = {}
+    notion_user_ids = {}
 
     # Counters
     scanned_rows   = 0
@@ -1436,205 +1532,213 @@ def lambda_handler(event, context):
 
     # ---- Live window: detect changes, compose notifications, and DEFER Notion writes until after notify ----
     early_send_triggered = False
-    for token_entry in workspace_set:
+    # Deduplicate workspaces across tokens to avoid re-scanning and API quota waste
+    ws_pairs = _collect_all_workspaces(workspace_set, context)
+
+    for (api_token, wid) in ws_pairs:
         if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
             early_send_triggered = True
             break
-        api_token = token_entry["api_token"]
-        workspaces = get_workspaces_for_token(api_token)
-        if not workspaces:
-            _alert(f"No workspaces visible for token ending …{api_token[-4:]}")
+        if api_token in _EXHAUSTED_TOKENS:
             continue
 
-        for ws in workspaces:
-            if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
-                early_send_triggered = True
-                break
-            wid = ws.get("id")
-            if not wid:
-                continue
-
-            # Hydrate maps so we can label notifications properly
+        # Hydrate maps so we can label notifications properly
+        if TOGGL_USE_REPORTS_ONLY:
+            # Reports details include 'user' and 'project' strings; avoid extra calls
+            user_name_map = {}
+            project_name_map = {}
+        else:
             user_name_map = get_workspace_users_map(api_token, wid)
             project_name_map = get_workspace_projects_map(api_token, wid)
 
-            print(f"[DEBUG] Streaming v9 entries from workspace {wid}")
-            for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=2000):
+        print(f"[DEBUG] Streaming reports entries from workspace {wid}")
+        for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=200):
+            if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+                early_send_triggered = True
+                break
+            print(f"[DEBUG] Page fetched with {len(page)} entries from workspace {wid}")
+            # Preload Notion state for EIDs in this page only (fast path)
+            eids_in_page = [str((e.get("id") or "")) for e in page if (e.get("id") or "")]
+            unknown = [eid for eid in eids_in_page if eid not in _existing_eid_to_pid and eid not in notion_entries_by_id]
+            if unknown:
+                lookup = _notion_query_existing_by_entry_ids(unknown, with_snapshots=True)
+                for eid, info in lookup.items():
+                    pid = info.get("page_id")
+                    if pid:
+                        _existing_eid_to_pid[eid] = pid
+                        notion_entries_by_id[eid] = {"page_id": pid, "snapshot": info.get("snapshot"), "user_key": info.get("user_key")}
+            for entry in page:
                 if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
                     early_send_triggered = True
                     break
-                print(f"[DEBUG] Page fetched with {len(page)} entries from workspace {wid}")
-                for entry in page:
-                    if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
-                        early_send_triggered = True
-                        break
-                    scanned_rows += 1
-                    if scanned_rows >= SCAN_ROW_SOFT_CAP:
-                        early_send_triggered = True
-                        break
+                scanned_rows += 1
+                if scanned_rows >= SCAN_ROW_SOFT_CAP:
+                    early_send_triggered = True
+                    break
 
-                    # Enrich v9 record with names for normalization / notifications
-                    uid = entry.get("user_id") or entry.get("uid")
-                    pid = entry.get("project_id") or entry.get("pid")
-                    e = dict(entry)  # copy
-                    if "user" not in e:
-                        if uid is not None:
-                            e["uid"] = uid
-                            e["user"] = user_name_map.get(int(uid), f"uid:{uid}")
-                    if "project" not in e:
-                        if pid is not None:
-                            e["pid"] = pid
-                            e["project"] = project_name_map.get(int(pid), "No project")
-                    if "updated" not in e and "at" in e:
-                        e["updated"] = e.get("at")
-                    if "dur" not in e and "duration" in e:
-                        e["dur"] = max(0, int(e.get("duration") or 0)) * 1000
+                # Enrich v9 record with names for normalization / notifications
+                uid = entry.get("user_id") or entry.get("uid")
+                pid = entry.get("project_id") or entry.get("pid")
+                e = dict(entry)  # copy
+                if "user" not in e:
+                    if uid is not None:
+                        e["uid"] = uid
+                        e["user"] = user_name_map.get(int(uid), f"uid:{uid}")
+                if "project" not in e:
+                    if pid is not None:
+                        e["pid"] = pid
+                        e["project"] = project_name_map.get(int(pid), "No project")
+                if "updated" not in e and "at" in e:
+                    e["updated"] = e.get("at")
+                    e["updated"] = e.get("at")
+                if "dur" not in e and "duration" in e:
+                    e["dur"] = max(0, int(e.get("duration") or 0)) * 1000
 
-                    norm = _normalize_toggl_entry(e, now)
-                    entry_id   = norm["eid"]
-                    user_name  = norm["user_display"]
-                    user_key   = norm["user_key"]
-                    if not entry_id or not user_name:
-                        continue
+                norm = _normalize_toggl_entry(e, now)
+                entry_id   = norm["eid"]
+                user_name  = norm["user_display"]
+                user_key   = norm["user_key"]
+                if not entry_id or not user_name:
+                    continue
 
-                    toggl_map[entry_id] = dict(norm)
-                    toggl_ids_by_user.setdefault(user_key, set()).add(entry_id)
+                toggl_map[entry_id] = dict(norm)
+                toggl_ids_by_user.setdefault(user_key, set()).add(entry_id)
 
-                    # Map webhook for this user_key
-                    wh = user_map.get(user_name) or user_map_norm.get(_norm(user_name)) or ""
-                    if wh:
-                        webhook_by_user_key[user_key] = wh
-                        display_by_user_key[user_key] = user_name
+                # Map webhook for this user_key
+                wh = user_map.get(user_name) or user_map_norm.get(_norm(user_name)) or ""
+                if wh:
+                    webhook_by_user_key[user_key] = wh
+                    display_by_user_key[user_key] = user_name
 
-                    prev_info = notion_entries_by_id.get(entry_id)
-                    prev_snap = prev_info.get("snapshot") if prev_info else None
-                    first_seen = (entry_id not in _existing_eid_to_pid)
+                prev_info = notion_entries_by_id.get(entry_id)
+                prev_snap = prev_info.get("snapshot") if prev_info else None
+                first_seen = (entry_id not in _existing_eid_to_pid)
 
-                    # Determine differences
-                    changed_time = changed_proj = changed_desc = changed_tags = changed_start = False
-                    start_dt = parse_iso(norm["start_iso"], now) if norm["start_iso"] else now
-                    prev_updated = None
-                    if prev_snap:
-                        prev_dur  = int(prev_snap.get("dur_ms", norm["dur_seconds"]*1000))
-                        prev_desc = prev_snap.get("desc", norm["description"])
-                        prev_proj = prev_snap.get("project", norm["project"])
-                        prev_tags = prev_snap.get("tags", list(norm["tags"]))
-                        prev_start_str = prev_snap.get("start_iso", norm["start_iso"])
-                        prev_start_dt = parse_iso(prev_start_str, now) if prev_start_str else start_dt
-                        prev_updated_str = prev_snap.get("updated_iso", norm["updated_iso"])
-                        prev_updated = parse_iso_opt(prev_updated_str) if prev_updated_str else None
+                # Determine differences
+                changed_time = changed_proj = changed_desc = changed_tags = changed_start = False
+                start_dt = parse_iso(norm["start_iso"], now) if norm["start_iso"] else now
+                prev_updated = None
+                if prev_snap:
+                    prev_dur  = int(prev_snap.get("dur_ms", norm["dur_seconds"]*1000))
+                    prev_desc = prev_snap.get("desc", norm["description"])
+                    prev_proj = prev_snap.get("project", norm["project"])
+                    prev_tags = prev_snap.get("tags", list(norm["tags"]))
+                    prev_start_str = prev_snap.get("start_iso", norm["start_iso"])
+                    prev_start_dt = parse_iso(prev_start_str, now) if prev_start_str else start_dt
+                    prev_updated_str = prev_snap.get("updated_iso", norm["updated_iso"])
+                    prev_updated = parse_iso_opt(prev_updated_str) if prev_updated_str else None
 
-                        changed_time  = (norm["dur_seconds"]*1000) != prev_dur
-                        changed_proj  = norm["project"] != prev_proj
-                        changed_desc  = norm["description"] != prev_desc
-                        try:
-                            old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
-                            new_set = set(norm["tags"]) if isinstance(norm["tags"], list) else set()
-                        except Exception:
-                            old_set, new_set = set(), set()
-                        changed_tags  = (old_set != new_set)
-                        changed_start = (start_dt != prev_start_dt)
+                    changed_time  = (norm["dur_seconds"]*1000) != prev_dur
+                    changed_proj  = norm["project"] != prev_proj
+                    changed_desc  = norm["description"] != prev_desc
+                    try:
+                        old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
+                        new_set = set(norm["tags"]) if isinstance(norm["tags"], list) else set()
+                    except Exception:
+                        old_set, new_set = set(), set()
+                    changed_tags  = (old_set != new_set)
+                    changed_start = (start_dt != prev_start_dt)
 
-                    needs_upsert = first_seen or changed_time or changed_proj or changed_desc or changed_tags or changed_start
-                    if not needs_upsert:
-                        continue  # no DB change & no notification
+                needs_upsert = first_seen or changed_time or changed_proj or changed_desc or changed_tags or changed_start
+                if not needs_upsert:
+                    continue  # no DB change & no notification
 
-                    # --- Build message & decide notification ---
-                    webhook_url = wh
-                    should_notify = False
-                    diff_lines = []
-                    updated_dt = parse_iso(norm["updated_iso"], now) if norm["updated_iso"] else now
-                    label = "🆕 New Time Entry Added"
+                # --- Build message & decide notification ---
+                webhook_url = wh
+                should_notify = False
+                diff_lines = []
+                updated_dt = parse_iso(norm["updated_iso"], now) if norm["updated_iso"] else now
+                label = "New Time Entry Added"
 
-                    if first_seen:
+                if first_seen:
+                    should_notify = True
+                    if updated_dt < since:
+                        label = "Backfill Time Entry Added"
+                else:
+                    if (prev_updated and updated_dt > prev_updated) and (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
                         should_notify = True
-                        if updated_dt < since:
-                            label = "🆕 Backfill Time Entry Added"
-                    else:
-                        if (prev_updated and updated_dt > prev_updated) and (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
-                            should_notify = True
-                            label = "✍️ Time Entry Edited"
-                            if changed_time:
-                                prev_dur_ms = int(prev_snap.get("dur_ms", 0))
-                                diff_lines.append(f"Δ Time {_format_delta_ms(norm['dur_seconds']*1000 - prev_dur_ms)}")
-                            if changed_proj:
-                                diff_lines.append("Project changed")
-                            if changed_desc:
-                                diff_lines.append("Description changed")
-                            if changed_tags:
-                                old_set = set(prev_snap.get("tags") or [])
-                                new_set = set(norm["tags"] or [])
-                                added   = sorted(list(new_set - old_set))
-                                removed = sorted(list(old_set - new_set))
-                                bits = []
-                                if added:   bits.append("+" + ", ".join(added))
-                                if removed: bits.append("-" + ", ".join(removed))
-                                diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
-                            if changed_start:
-                                prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if prev_snap.get("start_iso") else start_dt
-                                diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
+                        label = "Time Entry Edited"
+                        if changed_time:
+                            prev_dur_ms = int(prev_snap.get("dur_ms", 0))
+                            diff_lines.append(f"? Time {_format_delta_ms(norm['dur_seconds']*1000 - prev_dur_ms)}")
+                        if changed_proj:
+                            diff_lines.append("Project changed")
+                        if changed_desc:
+                            diff_lines.append("Description changed")
+                        if changed_tags:
+                            old_set = set(prev_snap.get("tags") or [])
+                            new_set = set(norm["tags"] or [])
+                            added   = sorted(list(new_set - old_set))
+                            removed = sorted(list(old_set - new_set))
+                            bits = []
+                            if added:   bits.append("+" + ", ".join(added))
+                            if removed: bits.append("-" + ", ".join(removed))
+                            diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
+                        if changed_start:
+                            prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if prev_snap.get("start_iso") else start_dt
+                            diff_lines.append(f"? Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
 
-                    if not webhook_url or not should_notify:
-                        continue
+                if not webhook_url or not should_notify:
+                    continue
 
-                    prev_dur_ms = int(prev_snap.get("dur_ms", norm["dur_seconds"]*1000)) if prev_snap else norm["dur_seconds"]*1000
-                    prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if (prev_snap and prev_snap.get("start_iso")) else start_dt
-                    prev_desc = prev_snap.get("desc") if prev_snap else norm["description"]
-                    prev_proj = prev_snap.get("project") if prev_snap else norm["project"]
-                    old_set = set(prev_snap.get("tags") or []) if prev_snap else set(norm["tags"] or [])
+                prev_dur_ms = int(prev_snap.get("dur_ms", norm["dur_seconds"]*1000)) if prev_snap else norm["dur_seconds"]*1000
+                prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if (prev_snap and prev_snap.get("start_iso")) else start_dt
+                prev_desc = prev_snap.get("desc") if prev_snap else norm["description"]
+                prev_proj = prev_snap.get("project") if prev_snap else norm["project"]
+                old_set = set(prev_snap.get("tags") or []) if prev_snap else set(norm["tags"] or [])
 
-                    changed_proj_flag = (label.startswith("✍️") and changed_proj)
-                    changed_tags_flag = (label.startswith("✍️") and changed_tags)
-                    changed_desc_flag = (label.startswith("✍️") and changed_desc)
-                    changed_time_flag = (label.startswith("✍️") and changed_time)
-                    changed_start_flag= (label.startswith("✍️") and changed_start)
+                changed_proj_flag = (label.startswith("Time Entry Edited") and changed_proj)
+                changed_tags_flag = (label.startswith("Time Entry Edited") and changed_tags)
+                changed_desc_flag = (label.startswith("Time Entry Edited") and changed_desc)
+                changed_time_flag = (label.startswith("Time Entry Edited") and changed_time)
+                changed_start_flag= (label.startswith("Time Entry Edited") and changed_start)
 
-                    lines = [
-                        f"## {label}",
-                        f"👤 **User**: {user_name}",
-                        f"📁 **Project:** {norm['project'] if not changed_proj_flag else f'~~{prev_proj}~~ {norm['project']}'}",
-                        f"🏷️ **Tags:** " + (
-                            (", ".join(norm["tags"]) if norm["tags"] else "No tags") if not changed_tags_flag
-                            else f"~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(norm['tags'])) or 'No tags'}"
-                        ),
-                        f"📝 **Task:** " + (
-                            f"~~{_truncate(prev_desc)}~~ {_truncate(norm['description'])}" if changed_desc_flag
-                            else _truncate(norm["description"])
-                        ),
-                        f"⏱️ **Time Tracked:** " + (
-                            f"~~{convert_ms_to_hms(prev_dur_ms)}~~ {convert_ms_to_hms(norm['dur_seconds']*1000)}" if changed_time_flag
-                            else convert_ms_to_hms(norm["dur_seconds"]*1000)
-                        ),
-                        f"🗓️ **Start:** " + (
-                            f"~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}" if changed_start_flag
-                            else start_dt.strftime('%Y-%m-%d %H:%M:%S')
-                        ),
-                        f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                        "—"
-                    ]
-                    if label.startswith("✍️") and diff_lines:
-                        lines.insert(-1, "**changes:** " + "; ".join(diff_lines))
+                lines = [
+                    f"## {label}",
+                    f"?? **User**: {user_name}",
+                    f"?? **Project:** {norm['project'] if not changed_proj_flag else f'~~{prev_proj}~~ {norm['project']}'}",
+                    "??? **Tags:** " + (
+                        (", ".join(norm["tags"]) if norm["tags"] else "No tags") if not changed_tags_flag
+                        else f"~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(norm['tags'])) or 'No tags'}"
+                    ),
+                    "?? **Task:** " + (
+                        f"~~{_truncate(prev_desc)}~~ {_truncate(norm['description'])}" if changed_desc_flag
+                        else _truncate(norm["description"])
+                    ),
+                    "?? **Time Tracked:** " + (
+                        f"~~{convert_ms_to_hms(prev_dur_ms)}~~ {convert_ms_to_hms(norm['dur_seconds']*1000)}" if changed_time_flag
+                        else convert_ms_to_hms(norm["dur_seconds"]*1000)
+                    ),
+                    "??? **Start:** " + (
+                        f"~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}" if changed_start_flag
+                        else start_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    ),
+                    f"?? **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+                    "�"
+                ]
+                if label.startswith("Time Entry Edited") and diff_lines:
+                    lines.insert(-1, "**changes:** " + "; ".join(diff_lines))
 
-                    outbox.setdefault(wh, []).append("\n".join(lines))
-                    notified += 1
-                    acted_rows += 1
+                outbox.setdefault(wh, []).append("\n".join(lines))
+                notified += 1
+                acted_rows += 1
 
-                    # Stash the Notion upsert to execute ONLY AFTER the notify succeeds
-                    upsert_payload = dict(
-                        entry_id=entry_id,
-                        user_key=user_key,
-                        user_display=user_name,
-                        project=norm["project"],
-                        tags=norm["tags"],
-                        start_iso=norm["start_iso"],
-                        end_iso=norm["end_iso"],
-                        updated_iso=norm["updated_iso"],
-                        dur_seconds=norm["dur_seconds"],
-                        workspace_id=wid,
-                        description=norm["description"],
-                        deleted=False
-                    )
-                    pending_by_webhook.setdefault(wh, []).append(upsert_payload)
+                # Stash the Notion upsert to execute ONLY AFTER the notify succeeds
+                upsert_payload = dict(
+                    entry_id=entry_id,
+                    user_key=user_key,
+                    user_display=user_name,
+                    project=norm["project"],
+                    tags=norm["tags"],
+                    start_iso=norm["start_iso"],
+                    end_iso=norm["end_iso"],
+                    updated_iso=norm["updated_iso"],
+                    dur_seconds=norm["dur_seconds"],
+                    workspace_id=wid,
+                    description=norm["description"],
+                    deleted=False
+                )
+                pending_by_webhook.setdefault(wh, []).append(upsert_payload)
 
                 if early_send_triggered:
                     break
@@ -1647,8 +1751,9 @@ def lambda_handler(event, context):
     # perform the quiet-run create-only right now and exit early.
     if notified == 0 and not outbox and _must_leave_for_quiet_create(context):
         quiet_created = 0
-        notion_entries_by_id2, _ = _build_notion_state_index(since, now)
-        notion_ids = set(notion_entries_by_id2.keys())
+        # Query Notion only for the EIDs we saw from Toggl
+        notion_lookup = _notion_query_existing_by_entry_ids(list(toggl_map.keys()))
+        notion_ids = set(notion_lookup.keys())
         toggl_ids  = set(toggl_map.keys())
         missing_ids = [eid for eid in (toggl_ids - notion_ids)]
         for eid in missing_ids:
@@ -1789,8 +1894,9 @@ def lambda_handler(event, context):
     quiet_add_summary = {}
     if notified == 0 and not _time_budget_exhausted(context) and _remaining_s(context) > (FINAL_RESERVE_S + 2):
         created = 0
-        notion_entries_by_id2, _ = _build_notion_state_index(since, now)
-        notion_ids = set(notion_entries_by_id2.keys())
+        # Query Notion only for the EIDs we saw from Toggl
+        notion_lookup = _notion_query_existing_by_entry_ids(list(toggl_map.keys()))
+        notion_ids = set(notion_lookup.keys())
         toggl_ids  = set(toggl_map.keys())
         missing_ids = [eid for eid in (toggl_ids - notion_ids)]
         for eid in missing_ids:
