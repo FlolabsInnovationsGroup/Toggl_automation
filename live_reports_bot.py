@@ -20,7 +20,7 @@ SESSION = requests.Session()
 
 def _mount_retries_on_session():
     """Mount a retrying HTTPAdapter that retries on read/connect timeouts and 429/5xx."""
-    total = int(os.getenv("REQUESTS_RETRY_TOTAL", "4"))  # trimmed to avoid runaway backoff
+    total = int(os.getenv("REQUESTS_RETRY_TOTAL", "4"))
     backoff = float(os.getenv("REQUESTS_RETRY_BACKOFF", "0.5"))
     retry = Retry(
         total=total,
@@ -29,7 +29,7 @@ def _mount_retries_on_session():
         status=total,
         backoff_factor=backoff,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST", "PATCH"])
+        allowed_methods=frozenset(["GET", "POST", "PATCH"]),
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=64)
     SESSION.mount("https://", adapter)
@@ -45,53 +45,45 @@ TEAM_GID             = os.getenv("TEAM_GID", "")
 WORKSPACES_GID       = os.getenv("WORKSPACES_GID", "")
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 
-# --- Runtime safety caps ---
-MAX_RUNTIME_S             = int(os.getenv("MAX_RUNTIME_S", "170"))    # hard wall-clock cap
-MAX_TOGGL_ROWS_PER_RUN    = int(os.getenv("MAX_TOGGL_ROWS_PER_RUN", "800"))
-TIGHT_EXIT_SAFETY_MARGIN  = int(os.getenv("TIGHT_EXIT_SAFETY_MARGIN", "10"))
+# --- Runtime safety caps & stage reserves ---
+MAX_RUNTIME_S             = int(os.getenv("MAX_RUNTIME_S", "240"))  # soft cap when context missing
+MAX_TOGGL_ROWS_PER_RUN    = int(os.getenv("MAX_TOGGL_ROWS_PER_RUN", "1000000"))
+TIGHT_EXIT_SAFETY_MARGIN  = int(os.getenv("TIGHT_EXIT_SAFETY_MARGIN", "20"))
+SEND_RESERVE_S            = int(os.getenv("SEND_RESERVE_S", "60"))   # only used in notify mode
+COMMIT_RESERVE_S          = int(os.getenv("COMMIT_RESERVE_S", "45")) # only used in notify mode
+QUIET_CREATE_RESERVE_S    = int(os.getenv("QUIET_CREATE_RESERVE_S", "25"))
+FINAL_RESERVE_S           = int(os.getenv("FINAL_RESERVE_S", "10"))
+SCAN_ROW_SOFT_CAP         = int(os.getenv("SCAN_ROW_SOFT_CAP", "5000"))
 
 # General window / HTTP
 TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
-HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))         # default for non-Notion
-NOTION_HTTP_TIMEOUT = int(os.getenv("NOTION_HTTP_TIMEOUT_SECONDS", "25"))  # trimmed to fail fast
+HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+NOTION_HTTP_TIMEOUT = int(os.getenv("NOTION_HTTP_TIMEOUT_SECONDS", "25"))
 HARD_START_FILTER   = os.getenv("HARD_START_FILTER", "1") == "1"
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name, "")
-    if val == "" and default:
+    s = (os.getenv(name, "").strip().lower())
+    if s == "" and default:
         return True
-    s = (val or "").strip().lower()
     return s in ("1", "true", "yes", "y", "on")
 
-# Feature flags
-DRY_RUN_NO_SEND     = _env_bool("DRY_RUN_NO_SEND", False)
+# Single feature flag: SEND_NOTIFICATIONS controls behavior
 SEND_NOTIFICATIONS  = _env_bool("SEND_NOTIFICATIONS", True)
-NOTIFY_ENABLED      = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
+NOTIFY_ENABLED      = SEND_NOTIFICATIONS  # True = notify mode, False = dry-fill mode
 
-# ===== Notion env =====
-NOTION_ENABLED      = _env_bool("NOTION_ENABLED", False)
+# ===== Notion env (MANDATORY) =====
 NOTION_TOKEN        = os.getenv("NOTION_TOKEN", "").strip()
 NOTION_DATABASE_ID  = os.getenv("NOTION_DATABASE_ID", "").strip()
 NOTION_TEAM_DB_ID   = os.getenv("NOTION_TEAM_DB_ID", "").strip()
-NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "25"))
-NOTION_RPS          = float(os.getenv("NOTION_RPS", "2"))                # stay under 3 RPS
-NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "50"))
+NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "75"))  # larger default for faster backfill
+NOTION_RPS          = float(os.getenv("NOTION_RPS", "2.5"))      # safe default; Notion soft limit ~3 rps
+NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "150"))
 
-# *** Performance caps (tight & predictable) ***
-# Total upserts cap (creates + updates) for the run:
-NOTION_MAX_UPSERTS_PER_RUN  = int(os.getenv("NOTION_MAX_UPSERTS_PER_RUN", "100"))
-# Hard cap for CREATE operations specifically (new pages):
-NOTION_MAX_CREATES_PER_RUN  = int(os.getenv("NOTION_MAX_CREATES_PER_RUN", "100"))
+# (Instrumentation only; no gating)
+NOTION_MAX_UPSERTS_PER_RUN  = int(os.getenv("NOTION_MAX_UPSERTS_PER_RUN", "100000000"))
 NOTION_CREATE_ADD_BLOCKS    = _env_bool("NOTION_CREATE_ADD_BLOCKS", True)
 NOTION_SET_TEAM_RELATION    = _env_bool("NOTION_SET_TEAM_RELATION", True)
-NOTION_MAX_RETRIES          = int(os.getenv("NOTION_MAX_RETRIES", "4"))     # trimmed
-
-# Prioritize using create budget before updates/deletes
-NOTION_PRIORITIZE_CREATES   = _env_bool("NOTION_PRIORITIZE_CREATES", True)
-
-# Index flags
-NOTION_WIDE_EXISTING_INDEX  = _env_bool("NOTION_WIDE_EXISTING_INDEX", False)  # OFF by default
-NOTION_MAX_INDEX_PAGES      = int(os.getenv("NOTION_MAX_INDEX_PAGES", "2000"))
+NOTION_MAX_RETRIES          = int(os.getenv("NOTION_MAX_RETRIES", "4"))
 
 # Property names
 NOTION_PROP_NAME         = os.getenv("NOTION_PROP_NAME", "User Key")       # title
@@ -107,15 +99,10 @@ NOTION_PROP_WORKSPACE    = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")
 NOTION_PROP_DESCRIPTION  = os.getenv("NOTION_PROP_DESCRIPTION", "Description")
 NOTION_PROP_DELETED      = os.getenv("NOTION_PROP_DELETED", "Deleted")
 
-# Optional Notion backfill (default OFF for latency)
-NOTION_BACKFILL              = _env_bool("NOTION_BACKFILL", False)
+# Backfill window settings (used by dry-fill mode)
 HISTORY_STEP_MONTHS          = int(os.getenv("HISTORY_STEP_MONTHS", "12"))
 HISTORY_MAX_EMPTY_WINDOWS    = int(os.getenv("HISTORY_MAX_EMPTY_WINDOWS", "2"))
 HISTORY_MAX_YEARS            = int(os.getenv("HISTORY_MAX_YEARS", "15"))
-
-# Automatic backfill trigger (OFF by default now)
-AUTO_BACKFILL_IF_DB_SMALL         = _env_bool("AUTO_BACKFILL_IF_DB_SMALL", False)
-BACKFILL_EXISTING_EIDS_THRESHOLD  = int(os.getenv("BACKFILL_EXISTING_EIDS_THRESHOLD", "5000"))
 
 # Discord rate limiting
 DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
@@ -127,13 +114,25 @@ _START_TS = None  # set at lambda start
 def _elapsed_s() -> float:
     return time.monotonic() - _START_TS if _START_TS is not None else 0.0
 
+def _remaining_s(context) -> float:
+    """Best-effort remaining seconds based on Lambda context; fallback to MAX_RUNTIME_S."""
+    try:
+        return max(0.0, context.get_remaining_time_in_millis() / 1000.0)
+    except Exception:
+        return max(0.0, MAX_RUNTIME_S - _elapsed_s())
+
 def _time_budget_exhausted(context) -> bool:
-    if _elapsed_s() > (MAX_RUNTIME_S - TIGHT_EXIT_SAFETY_MARGIN):
-        return True
     try:
         return context.get_remaining_time_in_millis() <= TIGHT_EXIT_SAFETY_MARGIN * 1000
     except Exception:
-        return False
+        return _elapsed_s() > (MAX_RUNTIME_S - TIGHT_EXIT_SAFETY_MARGIN)
+
+def _must_leave_for_send_and_commit(context) -> bool:
+    """Stop scanning when we need to reserve time to SEND + COMMIT writes (notify mode only)."""
+    return _remaining_s(context) <= (SEND_RESERVE_S + COMMIT_RESERVE_S + TIGHT_EXIT_SAFETY_MARGIN)
+
+def _must_leave_for_quiet_create(context) -> bool:
+    return _remaining_s(context) <= (QUIET_CREATE_RESERVE_S + TIGHT_EXIT_SAFETY_MARGIN)
 
 # ==========================
 # Alerts
@@ -221,15 +220,18 @@ def load_workspace_tokens() -> list[dict]:
     return out
 
 # ==========================
-# Notion client
+# Notion client (mandatory)
 # ==========================
 _NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
-def _notion_ok():
-    return NOTION_ENABLED and NOTION_TOKEN and NOTION_DATABASE_ID
+
+def _require_notion_config():
+    if not (NOTION_TOKEN and NOTION_DATABASE_ID):
+        _alert("Notion is misconfigured. Provide NOTION_TOKEN and NOTION_DATABASE_ID.")
+        raise RuntimeError("Notion configuration missing")
 
 _NOTION_SCHEMA = {}  # name -> type
 _TEAM_MEM_INDEX: list[tuple[str, str, str]] = []
@@ -242,12 +244,10 @@ def _prop_type(name: str) -> str:
 def _notion_backoff(attempt:int):
     if NOTION_RPS > 0:
         time.sleep(1.0 / NOTION_RPS)
-    # capped backoff so we don't burn the whole run
     time.sleep(min(1.5, 0.25 * (2 ** attempt)) + random.uniform(0.02, 0.2))
 
 def notion_load_schema():
-    if not _notion_ok():
-        return
+    _require_notion_config()
     try:
         for attempt in range(NOTION_MAX_RETRIES):
             try:
@@ -257,13 +257,13 @@ def notion_load_schema():
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
                     _notion_backoff(attempt); continue
-                _alert(f"[ALERT] Notion schema read failed: {r.status_code} {r.text}")
+                _alert(f"Notion schema read failed: {r.status_code} {r.text}")
                 return
             except (requests.Timeout, requests.ConnectionError) as e:
-                _alert(f"[WARN] Notion schema timeout/retry: {e}")
+                _alert(f"Notion schema timeout/retry: {e}")
                 _notion_backoff(attempt)
         else:
-            _alert("[ALERT] Notion schema read exhausted retries"); return
+            _alert("Notion schema read exhausted retries"); return
 
         props = (r.json() or {}).get("properties", {}) or {}
         for name, meta in props.items():
@@ -275,11 +275,11 @@ def notion_load_schema():
         }
         missing = [p for p in needed if p not in _NOTION_SCHEMA]
         if missing:
-            _alert(f"[ALERT] Notion DB missing expected properties: {missing}")
+            _alert(f"Notion DB missing expected properties: {missing}")
         if _prop_type(NOTION_PROP_NAME) != "title":
-            _alert(f"[ALERT] '{NOTION_PROP_NAME}' must be a title property.")
+            _alert(f"'{NOTION_PROP_NAME}' must be a title property.")
     except Exception as e:
-        _alert(f"[ALERT] Notion schema exception: {e}")
+        _alert(f"Notion schema exception: {e}")
 
 def _title_prop(text: str):
     return {"title": [{"type":"text","text":{"content": text or ""}}]}
@@ -291,11 +291,77 @@ def _number(n: int|float|None):
     if n is None: return {"number": None}
     return {"number": float(n)}
 
+# ---------- Notion-safe date helpers ----------
+def parse_iso(ts: str, default_now: datetime) -> datetime:
+    """Parse common ISO forms; accept 'Z', '+00:00', '+0000'."""
+    try:
+        if not ts:
+            return default_now
+        ts2 = ts.strip().replace("Z", "+00:00")
+        if re.search(r"[+-]\d{4}$", ts2):
+            ts2 = ts2[:-5] + ts2[-5:-2] + ":" + ts2[-2:]
+        return datetime.fromisoformat(ts2)
+    except Exception:
+        try:
+            ts3 = ts.replace("Z", "+0000").replace("+00:00", "+0000")
+            return datetime.strptime(ts3, "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return default_now
+
+def parse_iso_opt(ts: str):
+    try:
+        if not ts:
+            return None
+        ts2 = ts.strip().replace("Z", "+00:00")
+        if re.search(r"[+-]\d{4}$", ts2):
+            ts2 = ts2[:-5] + ts2[-5:-2] + ":" + ts2[-2:]
+        return datetime.fromisoformat(ts2)
+    except Exception:
+        try:
+            ts3 = ts.replace("Z", "+0000").replace("+00:00", "+0000")
+            return datetime.strptime(ts3, "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return None
+
+def _to_notion_datetime_str(ts: str|None, default_now: datetime) -> str|None:
+    """Canonicalize to RFC3339 'YYYY-MM-DDTHH:MM:SS+00:00' (UTC)."""
+    if not ts:
+        return None
+    dt = parse_iso(ts, default_now).astimezone(timezone.utc).replace(microsecond=0)
+    return dt.isoformat()
+
+def _title_from_props(props: dict, title_prop: str) -> str:
+    p = props.get(title_prop, {})
+    if p.get("type") == "title":
+        parts = p.get("title") or []
+        return "".join([t.get("plain_text", "") for t in parts]).strip()
+    return ""
+
+def _sanitize_select_value(name: str, fallback: str = "No project") -> str:
+    s = (name or fallback).strip()
+    s = re.sub(r"[\r\n]", " ", s)
+    s = s.replace(",", " / ")
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        s = fallback
+    if len(s) > 99:
+        s = s[:99]
+    return s
+
+def _sanitize_tag_value(tag: str) -> str:
+    s = str(tag or "").strip()
+    s = re.sub(r"[\r\n]", " ", s)
+    s = s.replace(",", " / ")
+    s = re.sub(r"\s+", " ", s)
+    if len(s) > 99:
+        s = s[:99]
+    return s
+
 def _select(name: str):
-    return {"select": {"name": name or "No project"}}
+    return {"select": {"name": _sanitize_select_value(name, "No project")}}
 
 def _multi_select(tags: list[str]|None):
-    tags = [str(x) for x in (tags or [])]
+    tags = [ _sanitize_tag_value(str(x)) for x in (tags or []) if str(x).strip() ]
     return {"multi_select": [{"name": t} for t in tags]}
 
 def _date(iso: str|None):
@@ -316,13 +382,7 @@ def _norm_for_match(s: str) -> str:
 def _tokenize(s: str) -> set[str]:
     return set(_norm_for_match(s).split())
 
-def _title_from_props(props: dict, title_prop: str) -> str:
-    p = props.get(title_prop, {})
-    if p.get("type") == "title":
-        parts = p.get("title") or []
-        return "".join([t.get("plain_text", "") for t in parts]).strip()
-    return ""
-
+# Team relation search
 def notion_build_team_members_index(team_sheet: list[dict] | None = None):
     if not NOTION_SET_TEAM_RELATION:
         return
@@ -350,13 +410,13 @@ def notion_build_team_members_index(team_sheet: list[dict] | None = None):
                         break
                     if r.status_code in (429, 500, 502, 503, 504):
                         _notion_backoff(attempt); continue
-                    _alert(f"[ALERT] Team Members index load failed: {r.status_code} {r.text}")
+                    _alert(f"Team Members index load failed: {r.status_code} {r.text}")
                     return
                 except (requests.Timeout, requests.ConnectionError) as e:
-                    _alert(f"[WARN] Team index timeout/retry: {e}")
+                    _alert(f"Team index timeout/retry: {e}")
                     _notion_backoff(attempt)
             else:
-                _alert("[ALERT] Team Members index exhausted retries"); return
+                _alert("Team Members index exhausted retries"); return
 
             data = r.json() or {}
             results = data.get("results") or []
@@ -372,7 +432,7 @@ def notion_build_team_members_index(team_sheet: list[dict] | None = None):
             if NOTION_RPS > 0:
                 time.sleep(1.0 / NOTION_RPS)
         except Exception as e:
-            _alert(f"[ALERT] Team Members index exception: {e}")
+            _alert(f"Team Members index exception: {e}")
             break
 
     if team_sheet:
@@ -418,18 +478,22 @@ def _prop_map_for_entry(entry_id:str, user_key:str, user_display:str,
                         project:str, tags:list[str], start_iso:str|None, end_iso:str|None,
                         updated_iso:str|None, dur_seconds:int, workspace_id:int|None,
                         description:str|None, deleted:bool|None=False):
+    now = datetime.now(timezone.utc)
+    start_iso_n   = _to_notion_datetime_str(start_iso, now) if start_iso else None
+    end_iso_n     = _to_notion_datetime_str(end_iso, now) if end_iso else None
+    updated_iso_n = _to_notion_datetime_str(updated_iso, now) if updated_iso else None
+
     props = {
         NOTION_PROP_NAME:        _title_prop(user_key),
         NOTION_PROP_PROJECT:     _select(project),
         NOTION_PROP_TAGS:        _multi_select(tags),
-        NOTION_PROP_START:       _date(start_iso),
-        NOTION_PROP_END:         _date(end_iso),
-        NOTION_PROP_UPDATED:     _date(updated_iso),
+        NOTION_PROP_START:       _date(start_iso_n),
+        NOTION_PROP_END:         _date(end_iso_n),
+        NOTION_PROP_UPDATED:     _date(updated_iso_n),
         NOTION_PROP_DURATION_S:  _number(int(dur_seconds or 0)),
         NOTION_PROP_WORKSPACE:   _number(int(workspace_id or 0)),
         NOTION_PROP_DESCRIPTION: _rich_text(description or ""),
     }
-    # Entry ID may be number or text in Notion:
     if str(entry_id).isdigit() and _prop_type(NOTION_PROP_ENTRY_ID) == "number":
         props[NOTION_PROP_ENTRY_ID] = {"number": int(entry_id)}
     else:
@@ -510,8 +574,7 @@ def _prop_to_title_text(props: dict, name:str) -> str:
     return ""
 
 def _notion_fetch_entries_in_window(since_dt: datetime, until_dt: datetime) -> list[dict]:
-    if not _notion_ok():
-        return []
+    _require_notion_config()
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     results = []
     payload = {
@@ -535,13 +598,13 @@ def _notion_fetch_entries_in_window(since_dt: datetime, until_dt: datetime) -> l
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
                     _notion_backoff(attempt); continue
-                _alert(f"[ALERT] Notion state query failed: {r.status_code} {r.text}")
+                _alert(f"Notion state query failed: {r.status_code} {r.text}")
                 return results
             except (requests.Timeout, requests.ConnectionError) as e:
-                _alert(f"[WARN] Notion query timeout/retry: {e}")
+                _alert(f"Notion query timeout/retry: {e}")
                 _notion_backoff(attempt)
         else:
-            _alert("[ALERT] Notion state query exhausted retries")
+            _alert("Notion state query exhausted retries")
             return results
 
         data = r.json() or {}
@@ -592,63 +655,8 @@ def _build_notion_state_index(since_dt: datetime, until_dt: datetime):
             user_current_ids.setdefault(user_key, set()).add(str(eid))
     return entries_by_id, user_current_ids
 
-# ---------- WIDE EXISTING INDEX (global Entry IDs -> page_id) ----------
-def _notion_collect_all_entry_ids() -> dict[str, str]:
-    """Build a global map of Entry ID -> page_id present in the Notion DB."""
-    eid_to_pid: dict[str, str] = {}
-    if not _notion_ok() or not NOTION_WIDE_EXISTING_INDEX:
-        return eid_to_pid
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    payload = {
-        "filter": { "property": NOTION_PROP_ENTRY_ID, _prop_type(NOTION_PROP_ENTRY_ID): { "is_not_empty": True } },
-        "page_size": 100
-    }
-    start_cursor = None
-    pages_scanned = 0
-    while True and pages_scanned < NOTION_MAX_INDEX_PAGES:
-        body = dict(payload)
-        if start_cursor:
-            body["start_cursor"] = start_cursor
-        try:
-            for attempt in range(NOTION_MAX_RETRIES):
-                try:
-                    r = SESSION.post(url, headers=_NOTION_HEADERS, json=body, timeout=NOTION_HTTP_TIMEOUT)
-                    if r.status_code == 200:
-                        break
-                    if r.status_code in (429, 500, 502, 503, 504):
-                        _notion_backoff(attempt); continue
-                    _alert(f"[ALERT] Wide index query failed: {r.status_code} {r.text}")
-                    return eid_to_pid
-                except (requests.Timeout, requests.ConnectionError) as e:
-                    _alert(f"[WARN] Wide index timeout/retry: {e}")
-                    _notion_backoff(attempt)
-            else:
-                _alert("[ALERT] Wide index exhausted retries")
-                return eid_to_pid
-
-            data = r.json() or {}
-            results = data.get("results") or []
-            for res in results:
-                pid   = res.get("id")
-                props = res.get("properties", {})
-                eid   = _prop_to_entry_id(props)
-                if eid and pid:
-                    eid_to_pid[str(eid)] = pid
-            pages_scanned += 1
-            if not data.get("has_more"):
-                break
-            start_cursor = data.get("next_cursor")
-            if NOTION_RPS > 0:
-                time.sleep(1.0 / NOTION_RPS)
-        except Exception as e:
-            _alert(f"[ALERT] Wide index exception: {e}")
-            break
-    print(f"[INFO] Wide Notion existing index size={len(eid_to_pid)} pages_scanned={pages_scanned}")
-    return eid_to_pid
-
 # ---------- Query existing by Entry IDs (targeted batch) ----------
 def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
-    """Return eid->page_id for provided entry_ids (only if needed)."""
     found: dict[str, str] = {}
     if not entry_ids:
         return found
@@ -660,7 +668,6 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
             if str(eid).isdigit() and _prop_type(NOTION_PROP_ENTRY_ID) == "number":
                 ors.append({"property": NOTION_PROP_ENTRY_ID, "number": {"equals": int(eid)}})
             else:
-                # Using contains (works for rich_text); we re-read the property to disambiguate later.
                 ors.append({"property": NOTION_PROP_ENTRY_ID, "rich_text": {"contains": str(eid)}})
         payload = {"filter": {"or": ors}, "page_size": len(batch)}
         try:
@@ -672,13 +679,13 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
                         break
                     if r.status_code in (429, 500, 502, 503, 504):
                         _notion_backoff(attempt); continue
-                    _alert(f"[ALERT] Notion bulk query failed: {r.status_code} {r.text}")
+                    _alert(f"Notion bulk query failed: {r.status_code} {r.text}")
                     break
                 except (requests.Timeout, requests.ConnectionError) as e:
-                    _alert(f"[WARN] Notion bulk query timeout/retry: {e}")
+                    _alert(f"Notion bulk query timeout/retry: {e}")
                     _notion_backoff(attempt)
             else:
-                _alert("[ALERT] Notion bulk query exhausted retries")
+                _alert("Notion bulk query exhausted retries")
                 continue
 
             for res in (r.json() or {}).get("results", []):
@@ -693,7 +700,7 @@ def _notion_query_existing_by_entry_ids(entry_ids: list[str]) -> dict[str, str]:
                 if eid_val:
                     found[eid_val] = pid
         except Exception as e:
-            _alert(f"[ALERT] Notion bulk query exception: {e}")
+            _alert(f"Notion bulk query exception: {e}")
     return found
 
 # ==========================
@@ -706,38 +713,24 @@ def _respect_rps():
 # Queue all intended upserts here (entry_id -> {properties..., description})
 _notion_queue: dict[str, dict] = {}
 _notion_ops_done = 0        # created + updated this invocation
-_notion_creates_done = 0    # created only (new pages)
-_existing_eid_to_pid: dict[str, str] = {}  # seeded from optional wide index; updated on the fly
-
-def _notion_budget_remaining() -> int:
-    return max(0, NOTION_MAX_UPSERTS_PER_RUN - _notion_ops_done)
-
-def _notion_creates_remaining() -> int:
-    return max(0, NOTION_MAX_CREATES_PER_RUN - _notion_creates_done)
+_existing_eid_to_pid: dict[str, str] = {}  # seeded from window; updated on the fly
 
 def notion_queue_entry(entry_id:str, user_key:str, user_display:str,
                        project:str, tags:list[str], start_iso:str|None, end_iso:str|None,
                        updated_iso:str|None, dur_seconds:int, workspace_id:int|None,
                        description:str|None, deleted:bool|None=False):
-    if not _notion_ok():
-        return False
-    # Allow queueing even when create budget is 0; create/update routing decided during flush.
-    if _notion_budget_remaining() <= 0:
-        return False
     props = _prop_map_for_entry(entry_id, user_key, user_display, project, tags,
                                 start_iso, end_iso, updated_iso, dur_seconds, workspace_id,
                                 description, deleted=deleted)
-    _notion_queue[str(entry_id)] = {"properties": props, "description": description or ""}
+    _notion_queue[str(entry_id)] = {"properties": props, "description": description or "", "eid": entry_id}
     return True
 
 def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False):
-    """items: list of dicts: {"properties": {...}, "description": "...", "eid": "123"}"""
-    global _notion_creates_done, _notion_ops_done, _existing_eid_to_pid
+    """Create pages; if Notion returns 409 conflict, look up and update instead."""
+    global _notion_ops_done, _existing_eid_to_pid
     created = 0
     for payload in items:
         if context and _time_budget_exhausted(context):
-            break
-        if _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
             break
         body = {
             "parent": {"database_id": NOTION_DATABASE_ID},
@@ -761,7 +754,6 @@ def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False)
                                  headers=_NOTION_HEADERS, json=body, timeout=NOTION_HTTP_TIMEOUT)
                 if r.status_code in (200, 201):
                     created += 1
-                    _notion_creates_done += 1
                     _notion_ops_done += 1
                     ok = True
                     try:
@@ -769,15 +761,26 @@ def _notion_create_pages(items: list[dict], context=None, learn_ids: bool=False)
                     except Exception:
                         resp_json = None
                     break
+                if r.status_code == 409:
+                    eid = str(payload.get("eid") or "")
+                    if eid:
+                        lookup = _notion_query_existing_by_entry_ids([eid])
+                        pid = lookup.get(eid)
+                        if pid:
+                            _existing_eid_to_pid[eid] = pid
+                            _notion_update_pages([(pid, payload["properties"])], context=context)
+                            ok = True
+                            break
+                    _notion_backoff(attempt); continue
                 if r.status_code in (429, 500, 502, 503, 504):
                     _notion_backoff(attempt); continue
-                _alert(f"[ALERT] Notion create failed: {r.status_code} {r.text}")
+                _alert(f"Notion create failed: {r.status_code} {r.text}")
                 break
             except (requests.Timeout, requests.ConnectionError) as e:
-                _alert(f"[WARN] Notion create timeout/retry: {e}")
+                _alert(f"Notion create timeout/retry: {e}")
                 _notion_backoff(attempt)
         if not ok:
-            _alert("[ERROR] Create page failed after retries; continuing")
+            _alert("Create page failed after retries; continuing")
         else:
             if learn_ids and resp_json and payload.get("eid"):
                 pid = resp_json.get("id")
@@ -792,8 +795,6 @@ def _notion_update_pages(items: list[tuple[str, dict]], context=None):
     for page_id, props in items:
         if context and _time_budget_exhausted(context):
             break
-        if _notion_budget_remaining() <= 0:
-            break
         body = {"properties": props}
         ok = False
         for attempt in range(NOTION_MAX_RETRIES):
@@ -805,15 +806,15 @@ def _notion_update_pages(items: list[tuple[str, dict]], context=None):
                     _notion_ops_done += 1
                     ok = True
                     break
-                if r.status_code in (429, 500, 502, 503, 504):
+                if r.status_code in (409, 429, 500, 502, 503, 504):
                     _notion_backoff(attempt); continue
-                _alert(f"[ALERT] Notion update failed: {r.status_code} {r.text}")
+                _alert(f"Notion update failed: {r.status_code} {r.text}")
                 break
             except (requests.Timeout, requests.ConnectionError) as e:
-                _alert(f"[WARN] Notion update timeout/retry: {e}")
+                _alert(f"Notion update timeout/retry: {e}")
                 _notion_backoff(attempt)
         if not ok:
-            _alert(f"[ERROR] Update page {page_id} failed after retries; continuing")
+            _alert(f"Update page {page_id} failed after retries; continuing")
         _respect_rps()
     return updated
 
@@ -827,92 +828,70 @@ def _pop_queue_items(limit: int | None) -> list[tuple[str, dict]]:
         _notion_queue.pop(eid, None)
     return items
 
-def notion_flush_queue(limit_by_budget: bool = True, context=None):
-    if not _notion_ok() or not _notion_queue:
+def notion_flush_queue(context=None):
+    """Flush everything in the queue (adaptive batching)."""
+    if not _notion_queue:
         return {"created": 0, "updated": 0, "skipped": 0}
-    if context and _time_budget_exhausted(context):
-        return {"created": 0, "updated": 0, "skipped": len(_notion_queue)}
-
-    upsert_budget = _notion_budget_remaining() if limit_by_budget else None
-    if upsert_budget == 0:
-        return {"created": 0, "updated": 0, "skipped": len(_notion_queue)}
-
-    low_time = context and (context.get_remaining_time_in_millis() <= (TIGHT_EXIT_SAFETY_MARGIN + 1) * 1000)
-    take_cap = 100 if low_time else NOTION_FLUSH_EVERY
-    to_take = min(upsert_budget or take_cap, take_cap)
-    items = _pop_queue_items(to_take)
-    if not items:
-        return {"created": 0, "updated": 0, "skipped": 0}
-
-    # Route via eid->pid map; fallback to one batch lookup for unknowns
-    to_update, to_create = [], []
-    unknown_eids = []
-    for eid, payload in items:
-        pid = _existing_eid_to_pid.get(eid)
-        if pid:
-            to_update.append((pid, payload["properties"]))
-        else:
-            unknown_eids.append(eid)
-            to_create.append({"eid": eid, "properties": payload["properties"], "description": payload.get("description","")})
-
-    if unknown_eids:
-        lookup = _notion_query_existing_by_entry_ids(unknown_eids)
-        if lookup:
-            still_create = []
-            for item in to_create:
-                eid = item["eid"]
-                if eid in lookup:
-                    to_update.append((lookup[eid], item["properties"]))
-                    _existing_eid_to_pid[eid] = lookup[eid]
-                else:
-                    still_create.append(item)
-            to_create = still_create
-
     created = updated = 0
 
-    # CREATES FIRST (so we guarantee insert capacity)
-    if to_create and _notion_creates_remaining() > 0 and _notion_budget_remaining() > 0:
-        batch = []
-        for item in to_create:
-            if _notion_creates_remaining() <= 0 or _notion_budget_remaining() <= 0:
-                break
-            batch.append(item)
-            if len(batch) >= NOTION_BATCH_SIZE:
+    while _notion_queue and not (context and _time_budget_exhausted(context)):
+        if _remaining_s(context) <= FINAL_RESERVE_S:
+            break
+
+        take_cap = NOTION_FLUSH_EVERY
+        items = _pop_queue_items(take_cap)
+        if not items:
+            break
+
+        # Route via eid->pid map; fallback to one batch lookup for unknowns
+        to_update, to_create = [], []
+        unknown_eids = []
+        for eid, payload in items:
+            pid = _existing_eid_to_pid.get(eid)
+            if pid:
+                to_update.append((pid, payload["properties"]))
+            else:
+                unknown_eids.append(eid)
+                to_create.append({"eid": eid, "properties": payload["properties"], "description": payload.get("description","")})
+
+        if unknown_eids:
+            lookup = _notion_query_existing_by_entry_ids(unknown_eids)
+            if lookup:
+                still_create = []
+                for item in to_create:
+                    eid = item["eid"]
+                    if eid in lookup:
+                        to_update.append((lookup[eid], item["properties"]))
+                        _existing_eid_to_pid[eid] = lookup[eid]
+                    else:
+                        still_create.append(item)
+                to_create = still_create
+
+        # Updates first
+        if to_update:
+            for i in range(0, len(to_update), NOTION_BATCH_SIZE):
+                if _remaining_s(context) <= FINAL_RESERVE_S:
+                    break
+                updated += _notion_update_pages(to_update[i:i+NOTION_BATCH_SIZE], context=context)
+
+        # Creates
+        if to_create and _remaining_s(context) > FINAL_RESERVE_S:
+            batch = []
+            for item in to_create:
+                batch.append(item)
+                if len(batch) >= NOTION_BATCH_SIZE:
+                    created += _notion_create_pages(batch, context=context, learn_ids=True)
+                    batch = []
+                if _remaining_s(context) <= FINAL_RESERVE_S:
+                    break
+            if batch and _remaining_s(context) > FINAL_RESERVE_S:
                 created += _notion_create_pages(batch, context=context, learn_ids=True)
-                batch = []
-        if batch and _notion_creates_remaining() > 0 and _notion_budget_remaining() > 0 and not (context and _time_budget_exhausted(context)):
-            created += _notion_create_pages(batch, context=context, learn_ids=True)
 
-    # UPDATES AFTER (if general budget remains)
-    if to_update and _notion_budget_remaining() > 0:
-        for i in range(0, len(to_update), NOTION_BATCH_SIZE):
-            if context and _time_budget_exhausted(context): break
-            if _notion_budget_remaining() <= 0: break
-            updated += _notion_update_pages(to_update[i:i+NOTION_BATCH_SIZE], context=context)
-
-    print(f"[INFO] Notion upsert: created={created} updated={updated} total={created+updated} "
-          f"creates_done={_notion_creates_done}/{NOTION_MAX_CREATES_PER_RUN} upserts_done={_notion_ops_done}/{NOTION_MAX_UPSERTS_PER_RUN}")
+    print(f"[INFO] Notion flush: created={created} updated={updated} total={created+updated}")
     return {"created": created, "updated": updated, "skipped": 0}
 
 # ==========================
-# Timestamp parsers
-# ==========================
-def parse_iso(ts: str, default_now: datetime) -> datetime:
-    try:
-        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
-        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
-    except Exception:
-        return default_now
-
-def parse_iso_opt(ts: str):
-    try:
-        ts = ts.replace("Z", "+0000").replace("+00:00", "+0000")
-        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
-    except Exception:
-        return None
-
-# ==========================
-# Toggl API helpers
+# Toggl API helpers (use v9, not Reports API)
 # ==========================
 def _headers_for_token(api_token: str) -> dict:
     return { "Authorization": "Basic " + base64.b64encode(f"{api_token}:api_token".encode()).decode() }
@@ -923,49 +902,100 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
         r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
             return r.json() or []
-        _alert(f"[ERROR] get_workspaces_for_token: {r.status_code} {r.text}")
+        _alert(f"get_workspaces_for_token: {r.status_code} {r.text}")
     except Exception as e:
-        _alert(f"[ERROR] get_workspaces_for_token exception: {e}")
+        _alert(f"get_workspaces_for_token exception: {e}")
     return []
 
-def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, per_page:int=200):
+def get_workspace_users_map(api_token: str, workspace_id: int) -> dict[int, str]:
+    """Map user_id -> display name for a workspace."""
+    url = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/workspace_users"
+    try:
+        r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            out = {}
+            for u in (r.json() or []):
+                # Try common fields; fall back to generic
+                uid = u.get("user_id") or u.get("id")
+                nm = u.get("name") or u.get("fullname") or u.get("email") or f"user:{uid}"
+                if uid is not None:
+                    out[int(uid)] = nm
+            return out
+        _alert(f"workspace_users fetch failed: {r.status_code} - {r.text}")
+    except Exception as e:
+        _alert(f"workspace_users exception: {e}")
+    return {}
+
+def get_workspace_projects_map(api_token: str, workspace_id: int) -> dict[int, str]:
+    """Map project_id -> project name."""
+    url = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/projects"
+    try:
+        r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            out = {}
+            for p in (r.json() or []):
+                pid = p.get("id")
+                nm = p.get("name") or f"project:{pid}"
+                if pid is not None:
+                    out[int(pid)] = nm
+            return out
+        _alert(f"projects fetch failed: {r.status_code} - {r.text}")
+    except Exception as e:
+        _alert(f"projects exception: {e}")
+    return {}
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, per_page:int=2000):
     """
-    Generator that yields one page (list of entries) at a time.
-    Allows the caller to continue fetching more pages ONLY if there is action budget left.
+    Generator that yields one page (list of entries) at a time from v9 time_entries.
+    Falls back gracefully if pagination params are not supported.
     """
-    url = "https://api.track.toggl.com/reports/api/v2/details"
+    base = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/time_entries"
     headers = _headers_for_token(api_token)
+
     params = {
-        "workspace_id": workspace_id,
-        "since": since_dt.strftime("%Y-%m-%d"),
-        "until": until_dt.strftime("%Y-%m-%d"),
-        "user_agent": "toggl-discord-bot",
+        "start_date": _iso(since_dt),
+        "end_date": _iso(until_dt),
         "page": 1,
         "per_page": per_page,
     }
-    last_total = 0
-    MAX_PAGES = 200
-    for _ in range(MAX_PAGES):
-        resp = SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            _alert(f"[ERROR] details fetch failed: {resp.status_code} - {resp.text}")
-            break
-        data = resp.json() or {}
-        entries = data.get("data") or []
-        total_count = int(data.get("total_count") or 0)
-        if not entries:
-            break
-        yield entries
-        if total_count and params["page"] * per_page >= total_count:
-            break
-        if total_count and len(entries) == 0:
-            break
-        if (params["page"] > 1) and (total_count == last_total):
-            break
-        last_total = total_count
-        params["page"] += 1
 
-# History windows (for optional Notion backfill)
+    # Try paginated fetch; if API returns a list and page grows empty, stop
+    seen_any = False
+    for _ in range(500):  # hard safety
+        try:
+            resp = SESSION.get(base, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 402:
+                _alert("Payment required on Reports API — ensure we are using v9 time_entries. (This call should not be Reports.)")
+                break
+            if resp.status_code != 200:
+                _alert(f"time_entries fetch failed: {resp.status_code} - {resp.text}")
+                break
+            data = resp.json() or []
+            if isinstance(data, dict):
+                # Some deployments may wrap results
+                data = data.get("data") or []
+            if not data:
+                if not seen_any:
+                    # Some servers ignore pagination params; try without them once.
+                    resp2 = SESSION.get(base, headers=headers, params={"start_date": _iso(since_dt), "end_date": _iso(until_dt)}, timeout=HTTP_TIMEOUT)
+                    if resp2.status_code == 200:
+                        data2 = resp2.json() or []
+                        if data2:
+                            yield data2
+                break
+            seen_any = True
+            yield data
+            if len(data) < params["per_page"]:
+                break
+            params["page"] += 1
+        except Exception as e:
+            _alert(f"time_entries exception: {e}")
+            break
+
+# History windows
 def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
     first = datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=timezone.utc)
     if dt.month == 12:
@@ -990,6 +1020,9 @@ def _history_windows(end_dt: datetime):
         yield (window_start, window_end)
         prev_day = window_start - timedelta(days=1)
         _, current_end = _month_bounds_utc(prev_day)
+
+def _history_windows_oldest_first(end_dt: datetime):
+    return list(reversed(list(_history_windows(end_dt))))
 
 # ==========================
 # Formatting helpers
@@ -1102,7 +1135,7 @@ def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20)
     return False
 
 # ==========================
-# Deleted-entry message
+# Deleted-entry message (notify mode)
 # ==========================
 def _strike(s: str) -> str:
     return f"~~{s}~~"
@@ -1114,7 +1147,7 @@ def _format_deleted_message(user_name: str, snap: dict) -> str:
     dur_ms  = int(snap.get("dur_ms", 0))
     start_s = snap.get("start_iso") or ""
     try:
-        start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+        start_dt = parse_iso(start_s, datetime.now(timezone.utc))
         start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         start_str = start_s or "unknown"
@@ -1135,7 +1168,182 @@ def _format_deleted_message(user_name: str, snap: dict) -> str:
     return "\n".join(lines)
 
 # ==========================
-# Batch helpers for Discord
+# Normalization helper (supports Reports+v9 shapes)
+# ==========================
+def _normalize_toggl_entry(e: dict, now: datetime) -> dict:
+    entry_id    = str(e.get("id") or "")
+    # Prefer explicit 'user', else resolve from uid/user_id; fallback to key-ish label
+    uid         = e.get("uid") or e.get("user_id")
+    user_name   = e.get("user") or (f"uid:{uid}" if uid is not None else "")
+    description = e.get("description") or "No description"
+    project     = e.get("project") or "No project"
+    tags        = e.get("tags") or []
+    # duration: Reports 'dur' in ms; v9 'duration' in seconds (possibly negative while running)
+    if e.get("dur") is not None:
+        duration_ms = int(e.get("dur") or 0)
+    else:
+        duration_ms = max(0, int(e.get("duration") or 0)) * 1000
+    start_str   = e.get("start") or ""
+    end_str     = e.get("end") or e.get("stop") or ""
+    updated_str = e.get("updated") or e.get("at") or ""
+    if not end_str and start_str and duration_ms > 0:
+        try:
+            sdt = parse_iso(start_str, now)
+            edt = sdt + timedelta(milliseconds=duration_ms)
+            end_str = edt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        except Exception:
+            end_str = ""
+
+    # Canonicalize all datetimes to Notion format (UTC RFC3339)
+    start_iso = _to_notion_datetime_str(start_str, now) if start_str else None
+    end_iso   = _to_notion_datetime_str(end_str, now) if end_str else None
+    updated_iso = _to_notion_datetime_str(updated_str, now) if updated_str else None
+
+    state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
+    return {
+        "eid": entry_id,
+        "user_display": user_name,
+        "user_key": state_key,
+        "project": project,
+        "tags": list(tags) if isinstance(tags, list) else [],
+        "start_iso": start_iso,
+        "end_iso": end_iso,
+        "updated_iso": updated_iso,
+        "dur_seconds": max(0, duration_ms // 1000),
+        "description": description,
+    }
+
+# ==========================
+# DRY-FILL mode (no notifications): oldest-first create-only backfill
+# ==========================
+def _collect_all_workspaces(workspace_set: list[dict], context):
+    """Return unique list of tuples (api_token, workspace_id). Avoid scanning the same workspace twice."""
+    pairs = []
+    seen_wids = set()
+    for token_entry in workspace_set:
+        if _time_budget_exhausted(context):
+            break
+        api_token = token_entry["api_token"]
+        for ws in get_workspaces_for_token(api_token):
+            wid = ws.get("id")
+            if wid and wid not in seen_wids:
+                pairs.append((api_token, wid))
+                seen_wids.add(wid)
+    return pairs
+
+def _dry_fill_db_from_oldest(team, workspace_set, context):
+    """
+    When NOTIFY_ENABLED is False:
+    - Iterate historical windows from oldest to newest.
+    - For each window, create any missing Notion pages for Toggl entries in that window.
+    - No Discord notifications, no edits/deletes.
+    """
+    _require_notion_config()
+
+    # Load schema + team index (for relations)
+    notion_load_schema()
+    notion_build_team_members_index(team_sheet=team)
+
+    now = datetime.now(timezone.utc)
+    windows = _history_windows_oldest_first(now)  # oldest -> newest
+    ws_pairs = _collect_all_workspaces(workspace_set, context)
+
+    total_created = 0
+    windows_processed = 0
+    skipped_windows = 0
+
+    for (win_start, win_end) in windows:
+        if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
+            _alert("Time budget nearly exhausted during dry-fill; stopping.")
+            break
+
+        # Build Notion state for this window; seed eid->pid so we create only missing ones
+        notion_entries_by_id, _ = _build_notion_state_index(win_start, win_end)
+        existing_eids = set(notion_entries_by_id.keys())
+
+        created_this_window = 0
+        scanned_this_window = 0
+
+        for (api_token, wid) in ws_pairs:
+            if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
+                break
+
+            # For dry-fill we only need entries; no need to hydrate user/project names here
+            for page in iter_workspace_entries_pages(api_token, wid, win_start, win_end, per_page=2000):
+                if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
+                    break
+                for e in page:
+                    if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
+                        break
+                    scanned_this_window += 1
+                    if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN:
+                        break
+
+                    norm = _normalize_toggl_entry(e, now)
+                    eid = norm["eid"]
+                    if not eid or not norm["user_display"]:
+                        continue
+
+                    if eid in existing_eids:
+                        continue  # already in Notion for this window
+
+                    # Queue create
+                    notion_queue_entry(
+                        entry_id=eid,
+                        user_key=norm["user_key"],
+                        user_display=norm["user_display"],
+                        project=norm["project"],
+                        tags=norm["tags"],
+                        start_iso=norm["start_iso"],
+                        end_iso=norm["end_iso"],
+                        updated_iso=norm["updated_iso"],
+                        dur_seconds=norm["dur_seconds"],
+                        workspace_id=wid,
+                        description=norm["description"],
+                        deleted=False
+                    )
+                    existing_eids.add(eid)  # prevent duplicates in same run
+
+                    if len(_notion_queue) >= NOTION_FLUSH_EVERY:
+                        res = notion_flush_queue(context=context)
+                        created_this_window += res.get("created", 0)
+                        total_created += res.get("created", 0)
+
+                if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN:
+                    break
+
+            if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN:
+                break
+
+        # Final flush for the window
+        if _notion_queue and not _time_budget_exhausted(context) and _remaining_s(context) > FINAL_RESERVE_S:
+            res = notion_flush_queue(context=context)
+            created_this_window += res.get("created", 0)
+            total_created += res.get("created", 0)
+
+        if created_this_window > 0:
+            windows_processed += 1
+            print(f"[DRY-FILL] Window {win_start.date()}..{win_end.date()}: created {created_this_window}")
+        else:
+            skipped_windows += 1
+            print(f"[DRY-FILL] Window {win_start.date()}..{win_end.date()}: nothing to create")
+
+        if _remaining_s(context) <= FINAL_RESERVE_S:
+            break
+
+    # Drain any remainder
+    if _notion_queue and not _time_budget_exhausted(context):
+        res = notion_flush_queue(context=context)
+        total_created += res.get("created", 0)
+
+    return {
+        "created": total_created,
+        "windows_processed": windows_processed,
+        "skipped_windows": skipped_windows
+    }
+
+# ==========================
+# Batch helpers for Discord (notify mode)
 # ==========================
 def _chunk_messages(msgs, limit=1999, sep="\n\n"):
     chunk, size = [], 0
@@ -1151,21 +1359,23 @@ def _chunk_messages(msgs, limit=1999, sep="\n\n"):
         yield sep.join(chunk)
 
 def _send_all_for_webhook(wh_url, msgs):
-    sent = 0
+    sent_chunks = 0
     for payload in _chunk_messages(msgs):
         if send_discord_with_backoff(wh_url, payload, timeout=HTTP_TIMEOUT):
-            sent += 1
-    return wh_url, sent
+            sent_chunks += 1
+    return wh_url, sent_chunks
 
 # ==========================
 # Lambda entrypoint
 # ==========================
 def lambda_handler(event, context):
-    global _notion_ops_done, _notion_creates_done, _START_TS, _existing_eid_to_pid
+    global _notion_ops_done, _START_TS, _existing_eid_to_pid
     _START_TS = time.monotonic()
     _notion_ops_done = 0
-    _notion_creates_done = 0
     _existing_eid_to_pid = {}
+
+    # Fail fast if Notion is not configured
+    _require_notion_config()
 
     # Load TEAM & WORKSPACES
     team          = load_team_sheet()
@@ -1178,60 +1388,302 @@ def lambda_handler(event, context):
         _alert("WORKSPACES sheet empty or unreachable.")
         return {"status": "no_workspaces"}
 
-    # Notion: read schema once + build team index (optional)
-    if _notion_ok():
-        notion_load_schema()
-        notion_build_team_members_index(team_sheet=team)
+    # If notifications are disabled -> DRY-FILL MODE (create-only, oldest-first), then exit
+    if not NOTIFY_ENABLED:
+        dry_result = _dry_fill_db_from_oldest(team, workspace_set, context)
+        return {
+            "status": "complete_dry_fill",
+            "send_notifications": SEND_NOTIFICATIONS,
+            "notion": {"budget_used": _notion_ops_done, "queue_left": len(_notion_queue)},
+            "dry_fill": dry_result,
+            "runtime": {
+                "elapsed_s": round(_elapsed_s(), 3),
+                "remaining_s": round(_remaining_s(context), 3),
+                "max_runtime_s": MAX_RUNTIME_S,
+            },
+        }
 
-    # Map user name -> webhook (only if we plan to send)
-    if NOTIFY_ENABLED:
-        user_map = { t["name"]: t.get("discord_webhook_url", "").strip() for t in team if t.get("discord_webhook_url") }
-        user_map_norm = { _norm(k): v for k, v in user_map.items() }
-    else:
-        user_map = {}
-        user_map_norm = {}
+    # ==========================
+    # NOTIFY MODE: detect changes, notify, then commit writes
+    # ==========================
+    notion_load_schema()
+    notion_build_team_members_index(team_sheet=team)
+
+    # Map user name -> webhook
+    user_map = { t["name"]: t.get("discord_webhook_url", "").strip() for t in team if t.get("discord_webhook_url") }
+    user_map_norm = { _norm(k): v for k, v in user_map.items() }
 
     now   = datetime.now(timezone.utc)
     since = now - timedelta(days=TIME_WINDOW_DAYS)
 
     notified = 0
-    outbox = {}
+    outbox = {}  # webhook -> [message strings]
+    pending_by_webhook = {}  # webhook -> [upsert_payloads]
+    webhook_by_user_key = {} # "uid:123" or "name:john doe" -> webhook
+    display_by_user_key = {} # user_key -> user_display (for deletions)
 
-    # Build Notion-based state snapshot (window) + (optional) wide existing map of Entry IDs
-    notion_entries_by_id, notion_user_ids = ({}, {})
-    if _notion_ok():
-        notion_entries_by_id, notion_user_ids = _build_notion_state_index(since, now)
-        eid_to_pid = _notion_collect_all_entry_ids() if NOTION_WIDE_EXISTING_INDEX else {}
-        _existing_eid_to_pid = dict(eid_to_pid)
-    else:
-        _existing_eid_to_pid = {}
-
-    # Decide if we auto-backfill (DB small)
-    auto_backfill_needed = AUTO_BACKFILL_IF_DB_SMALL and False  # explicitly off unless enabled
-    run_backfill = NOTION_BACKFILL or auto_backfill_needed
-    if auto_backfill_needed:
-        print(f"[INFO] Auto backfill ON (existing_eids small)")
+    # Build Notion-based state snapshot (window) and seed eid->pid only from window
+    notion_entries_by_id, notion_user_ids = _build_notion_state_index(since, now)
+    for eid, info in notion_entries_by_id.items():
+        _existing_eid_to_pid[eid] = info["page_id"]
 
     # Counters
     scanned_rows   = 0
     acted_rows     = 0
 
-    # Fast exit if no Notion budget and notifications are off
-    if _notion_ok() and _notion_budget_remaining() <= 0 and not NOTIFY_ENABLED:
+    toggl_map: dict[str, dict] = {}  # eid -> normalized snapshot for quiet-run create
+    toggl_ids_by_user: dict[str, set] = {}
+
+    # ---- Live window: detect changes, compose notifications, and DEFER Notion writes until after notify ----
+    early_send_triggered = False
+    for token_entry in workspace_set:
+        if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+            early_send_triggered = True
+            break
+        api_token = token_entry["api_token"]
+        workspaces = get_workspaces_for_token(api_token)
+        if not workspaces:
+            _alert(f"No workspaces visible for token ending …{api_token[-4:]}")
+            continue
+
+        for ws in workspaces:
+            if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+                early_send_triggered = True
+                break
+            wid = ws.get("id")
+            if not wid:
+                continue
+
+            # Hydrate maps so we can label notifications properly
+            user_name_map = get_workspace_users_map(api_token, wid)
+            project_name_map = get_workspace_projects_map(api_token, wid)
+
+            print(f"[DEBUG] Streaming v9 entries from workspace {wid}")
+            for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=2000):
+                if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+                    early_send_triggered = True
+                    break
+                print(f"[DEBUG] Page fetched with {len(page)} entries from workspace {wid}")
+                for entry in page:
+                    if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+                        early_send_triggered = True
+                        break
+                    scanned_rows += 1
+                    if scanned_rows >= SCAN_ROW_SOFT_CAP:
+                        early_send_triggered = True
+                        break
+
+                    # Enrich v9 record with names for normalization / notifications
+                    uid = entry.get("user_id") or entry.get("uid")
+                    pid = entry.get("project_id") or entry.get("pid")
+                    e = dict(entry)  # copy
+                    if "user" not in e:
+                        if uid is not None:
+                            e["uid"] = uid
+                            e["user"] = user_name_map.get(int(uid), f"uid:{uid}")
+                    if "project" not in e:
+                        if pid is not None:
+                            e["pid"] = pid
+                            e["project"] = project_name_map.get(int(pid), "No project")
+                    if "updated" not in e and "at" in e:
+                        e["updated"] = e.get("at")
+                    if "dur" not in e and "duration" in e:
+                        e["dur"] = max(0, int(e.get("duration") or 0)) * 1000
+
+                    norm = _normalize_toggl_entry(e, now)
+                    entry_id   = norm["eid"]
+                    user_name  = norm["user_display"]
+                    user_key   = norm["user_key"]
+                    if not entry_id or not user_name:
+                        continue
+
+                    toggl_map[entry_id] = dict(norm)
+                    toggl_ids_by_user.setdefault(user_key, set()).add(entry_id)
+
+                    # Map webhook for this user_key
+                    wh = user_map.get(user_name) or user_map_norm.get(_norm(user_name)) or ""
+                    if wh:
+                        webhook_by_user_key[user_key] = wh
+                        display_by_user_key[user_key] = user_name
+
+                    prev_info = notion_entries_by_id.get(entry_id)
+                    prev_snap = prev_info.get("snapshot") if prev_info else None
+                    first_seen = (entry_id not in _existing_eid_to_pid)
+
+                    # Determine differences
+                    changed_time = changed_proj = changed_desc = changed_tags = changed_start = False
+                    start_dt = parse_iso(norm["start_iso"], now) if norm["start_iso"] else now
+                    prev_updated = None
+                    if prev_snap:
+                        prev_dur  = int(prev_snap.get("dur_ms", norm["dur_seconds"]*1000))
+                        prev_desc = prev_snap.get("desc", norm["description"])
+                        prev_proj = prev_snap.get("project", norm["project"])
+                        prev_tags = prev_snap.get("tags", list(norm["tags"]))
+                        prev_start_str = prev_snap.get("start_iso", norm["start_iso"])
+                        prev_start_dt = parse_iso(prev_start_str, now) if prev_start_str else start_dt
+                        prev_updated_str = prev_snap.get("updated_iso", norm["updated_iso"])
+                        prev_updated = parse_iso_opt(prev_updated_str) if prev_updated_str else None
+
+                        changed_time  = (norm["dur_seconds"]*1000) != prev_dur
+                        changed_proj  = norm["project"] != prev_proj
+                        changed_desc  = norm["description"] != prev_desc
+                        try:
+                            old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
+                            new_set = set(norm["tags"]) if isinstance(norm["tags"], list) else set()
+                        except Exception:
+                            old_set, new_set = set(), set()
+                        changed_tags  = (old_set != new_set)
+                        changed_start = (start_dt != prev_start_dt)
+
+                    needs_upsert = first_seen or changed_time or changed_proj or changed_desc or changed_tags or changed_start
+                    if not needs_upsert:
+                        continue  # no DB change & no notification
+
+                    # --- Build message & decide notification ---
+                    webhook_url = wh
+                    should_notify = False
+                    diff_lines = []
+                    updated_dt = parse_iso(norm["updated_iso"], now) if norm["updated_iso"] else now
+                    label = "🆕 New Time Entry Added"
+
+                    if first_seen:
+                        should_notify = True
+                        if updated_dt < since:
+                            label = "🆕 Backfill Time Entry Added"
+                    else:
+                        if (prev_updated and updated_dt > prev_updated) and (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
+                            should_notify = True
+                            label = "✍️ Time Entry Edited"
+                            if changed_time:
+                                prev_dur_ms = int(prev_snap.get("dur_ms", 0))
+                                diff_lines.append(f"Δ Time {_format_delta_ms(norm['dur_seconds']*1000 - prev_dur_ms)}")
+                            if changed_proj:
+                                diff_lines.append("Project changed")
+                            if changed_desc:
+                                diff_lines.append("Description changed")
+                            if changed_tags:
+                                old_set = set(prev_snap.get("tags") or [])
+                                new_set = set(norm["tags"] or [])
+                                added   = sorted(list(new_set - old_set))
+                                removed = sorted(list(old_set - new_set))
+                                bits = []
+                                if added:   bits.append("+" + ", ".join(added))
+                                if removed: bits.append("-" + ", ".join(removed))
+                                diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
+                            if changed_start:
+                                prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if prev_snap.get("start_iso") else start_dt
+                                diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
+
+                    if not webhook_url or not should_notify:
+                        continue
+
+                    prev_dur_ms = int(prev_snap.get("dur_ms", norm["dur_seconds"]*1000)) if prev_snap else norm["dur_seconds"]*1000
+                    prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if (prev_snap and prev_snap.get("start_iso")) else start_dt
+                    prev_desc = prev_snap.get("desc") if prev_snap else norm["description"]
+                    prev_proj = prev_snap.get("project") if prev_snap else norm["project"]
+                    old_set = set(prev_snap.get("tags") or []) if prev_snap else set(norm["tags"] or [])
+
+                    changed_proj_flag = (label.startswith("✍️") and changed_proj)
+                    changed_tags_flag = (label.startswith("✍️") and changed_tags)
+                    changed_desc_flag = (label.startswith("✍️") and changed_desc)
+                    changed_time_flag = (label.startswith("✍️") and changed_time)
+                    changed_start_flag= (label.startswith("✍️") and changed_start)
+
+                    lines = [
+                        f"## {label}",
+                        f"👤 **User**: {user_name}",
+                        f"📁 **Project:** {norm['project'] if not changed_proj_flag else f'~~{prev_proj}~~ {norm['project']}'}",
+                        f"🏷️ **Tags:** " + (
+                            (", ".join(norm["tags"]) if norm["tags"] else "No tags") if not changed_tags_flag
+                            else f"~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(norm['tags'])) or 'No tags'}"
+                        ),
+                        f"📝 **Task:** " + (
+                            f"~~{_truncate(prev_desc)}~~ {_truncate(norm['description'])}" if changed_desc_flag
+                            else _truncate(norm["description"])
+                        ),
+                        f"⏱️ **Time Tracked:** " + (
+                            f"~~{convert_ms_to_hms(prev_dur_ms)}~~ {convert_ms_to_hms(norm['dur_seconds']*1000)}" if changed_time_flag
+                            else convert_ms_to_hms(norm["dur_seconds"]*1000)
+                        ),
+                        f"🗓️ **Start:** " + (
+                            f"~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}" if changed_start_flag
+                            else start_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        ),
+                        f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+                        "—"
+                    ]
+                    if label.startswith("✍️") and diff_lines:
+                        lines.insert(-1, "**changes:** " + "; ".join(diff_lines))
+
+                    outbox.setdefault(wh, []).append("\n".join(lines))
+                    notified += 1
+                    acted_rows += 1
+
+                    # Stash the Notion upsert to execute ONLY AFTER the notify succeeds
+                    upsert_payload = dict(
+                        entry_id=entry_id,
+                        user_key=user_key,
+                        user_display=user_name,
+                        project=norm["project"],
+                        tags=norm["tags"],
+                        start_iso=norm["start_iso"],
+                        end_iso=norm["end_iso"],
+                        updated_iso=norm["updated_iso"],
+                        dur_seconds=norm["dur_seconds"],
+                        workspace_id=wid,
+                        description=norm["description"],
+                        deleted=False
+                    )
+                    pending_by_webhook.setdefault(wh, []).append(upsert_payload)
+
+                if early_send_triggered:
+                    break
+            if early_send_triggered:
+                break
+        if early_send_triggered:
+            break
+
+    # If we're running out of time and have not queued any notifications,
+    # perform the quiet-run create-only right now and exit early.
+    if notified == 0 and not outbox and _must_leave_for_quiet_create(context):
+        quiet_created = 0
+        notion_entries_by_id2, _ = _build_notion_state_index(since, now)
+        notion_ids = set(notion_entries_by_id2.keys())
+        toggl_ids  = set(toggl_map.keys())
+        missing_ids = [eid for eid in (toggl_ids - notion_ids)]
+        for eid in missing_ids:
+            t = toggl_map[eid]
+            notion_queue_entry(
+                entry_id=eid,
+                user_key=t["user_key"],
+                user_display=t["user_display"],
+                project=t["project"],
+                tags=t["tags"],
+                start_iso=t["start_iso"],
+                end_iso=t["end_iso"],
+                updated_iso=t["updated_iso"],
+                dur_seconds=t["dur_seconds"],
+                workspace_id=None,
+                description=t["description"],
+                deleted=False
+            )
+            if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
+                res = notion_flush_queue(context=context)
+                quiet_created += res["created"]
+            if _remaining_s(context) <= FINAL_RESERVE_S:
+                break
+        if _notion_queue and _remaining_s(context) > FINAL_RESERVE_S:
+            res = notion_flush_queue(context=context)
+            quiet_created += res["created"]
+
         return {
-            "status": "complete",
-            "notified": 0,
-            "dry_run_no_send": DRY_RUN_NO_SEND,
+            "status": "complete_quiet_early",
             "send_notifications": SEND_NOTIFICATIONS,
-            "notify_enabled": NOTIFY_ENABLED,
-            "state_backend": "notion",
-            "notion": {
-                "budget_used": _notion_ops_done,
-                "budget_cap": NOTION_MAX_UPSERTS_PER_RUN,
-                "queue_left": len(_notion_queue),
-            },
+            "notion": {"budget_used": _notion_ops_done, "queue_left": len(_notion_queue)},
+            "quiet_add": {"created": quiet_created},
             "runtime": {
                 "elapsed_s": round(_elapsed_s(), 3),
+                "remaining_s": round(_remaining_s(context), 3),
                 "max_runtime_s": MAX_RUNTIME_S,
                 "scanned_rows": scanned_rows,
                 "acted_rows": acted_rows,
@@ -1239,345 +1691,152 @@ def lambda_handler(event, context):
             },
         }
 
-    # ---- Optional Notion history backfill (only if explicitly ON) ----
-    if run_backfill and _notion_ok() and _notion_budget_remaining() > 0 and not _time_budget_exhausted(context):
-        for token_entry in workspace_set:
-            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
+    # ==========================
+    # Deletion detection (notify mode only)
+    # ==========================
+    if not _time_budget_exhausted(context) and _remaining_s(context) > (SEND_RESERVE_S // 2):
+        for eid, info in notion_entries_by_id.items():
+            if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
                 break
-            api_token = token_entry["api_token"]
-            workspaces = get_workspaces_for_token(api_token)
-            for ws in workspaces:
-                if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                    break
-                wid = ws.get("id")
-                if not wid:
-                    continue
-                empty_streak = 0
-                for (win_start, win_end) in _history_windows(now):
-                    if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                        break
-                    if empty_streak >= HISTORY_MAX_EMPTY_WINDOWS:
-                        break
-                    any_page_had_rows = False
-                    for page in iter_workspace_entries_pages(api_token, wid, win_start, win_end, per_page=200):
-                        if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                            break
-                        any_page_had_rows = True
-                        for e in page:
-                            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                                break
-                            scanned_rows += 1
-                            entry_id    = str(e.get("id") or "")
-                            user_name   = e.get("user") or ""
-                            if not entry_id or not user_name:
-                                continue
-                            if entry_id in _existing_eid_to_pid:
-                                continue  # already have it
-                            description = e.get("description") or "No description"
-                            project     = e.get("project") or "No project"
-                            tags        = e.get("tags") or []
-                            duration_ms = int(e.get("dur") or 0)
-                            start_str   = e.get("start") or ""
-                            end_str     = e.get("end") or e.get("stop") or ""
-                            updated_str = e.get("updated") or e.get("at") or ""
-                            uid         = e.get("uid")
-                            if not end_str and start_str and duration_ms > 0:
-                                try:
-                                    sdt = parse_iso(start_str, now)
-                                    edt = sdt + timedelta(milliseconds=duration_ms)
-                                    end_str = edt.strftime("%Y-%m-%dT%H:%M:%S%z")
-                                except Exception:
-                                    end_str = ""
-                            state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
-                            queued = notion_queue_entry(
-                                entry_id=entry_id,
-                                user_key=state_key,
-                                user_display=user_name,
-                                project=project,
-                                tags=list(tags) if isinstance(tags, list) else [],
-                                start_iso=start_str or None,
-                                end_iso=end_str or None,
-                                updated_iso=updated_str or None,
-                                dur_seconds=max(0, duration_ms // 1000),
-                                workspace_id=wid,
-                                description=description,
-                                deleted=False
-                            )
-                            if queued:
-                                acted_rows += 1
-                            if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
-                                notion_flush_queue(limit_by_budget=True, context=context)
-                        # end for e in page
-                    # end for page
-                    if not any_page_had_rows:
-                        empty_streak += 1
-                    else:
-                        empty_streak = 0
-
-                if _notion_queue:
-                    notion_flush_queue(limit_by_budget=True, context=context)
-
-        if _notion_queue and _notion_budget_remaining() > 0:
-            notion_flush_queue(limit_by_budget=True, context=context)
-
-    # ---- Live window fetch + notifications + Notion upserts (Notion = state/backup) ----
-    toggl_ids_by_user: dict[str, set] = {}
-
-    for token_entry in workspace_set:
-        if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-            break
-        api_token = token_entry["api_token"]
-        workspaces = get_workspaces_for_token(api_token)
-        if not workspaces:
-            _alert(f"⚠️ No workspaces visible for token ending …{api_token[-4:]}")
-            continue
-
-        for ws in workspaces:
-            if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                break
-            wid = ws.get("id")
-            if not wid:
+            if eid in toggl_map:
                 continue
+            snap = info["snapshot"]
+            user_key = info.get("user_key") or ""
+            if not user_key:
+                continue
+            webhook_url = webhook_by_user_key.get(user_key)
+            if not webhook_url:
+                # Can't notify this user -> skip DB change to respect policy
+                continue
+            user_display = display_by_user_key.get(user_key, user_key)
+            msg = _format_deleted_message(user_display, snap)
+            outbox.setdefault(webhook_url, []).append(msg)
+            notified += 1
+            acted_rows += 1
 
-            print(f"[DEBUG] Streaming entries from workspace {wid} "
-                  f"(create_budget={_notion_creates_remaining()} upsert_budget={_notion_budget_remaining()})")
-            for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=200):
-                if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                    break
-                print(f"[DEBUG] Page fetched with {len(page)} entries from workspace {wid}")
-                for entry in page:
-                    if _time_budget_exhausted(context) or acted_rows >= MAX_TOGGL_ROWS_PER_RUN or _notion_budget_remaining() <= 0 or _notion_creates_remaining() <= 0:
-                        break
-                    scanned_rows += 1
-
-                    entry_id    = str(entry.get("id") or "")
-                    user_name   = entry.get("user") or ""
-                    if not entry_id or not user_name:
-                        continue
-
-                    description = entry.get("description") or "No description"
-                    project     = entry.get("project") or "No project"
-                    tags        = entry.get("tags") or []
-                    duration_ms = int(entry.get("dur") or 0)
-                    start_str   = entry.get("start") or ""
-                    end_str     = entry.get("end") or entry.get("stop") or ""
-                    updated_str = entry.get("updated") or entry.get("at") or ""
-                    uid         = entry.get("uid")
-
-                    if not end_str and start_str and duration_ms > 0:
-                        try:
-                            sdt = parse_iso(start_str, now)
-                            edt = sdt + timedelta(milliseconds=duration_ms)
-                            end_str = edt.strftime("%Y-%m-%dT%H:%M:%S%z")
-                        except Exception:
-                            end_str = ""
-
-                    start_dt   = parse_iso(start_str, now) if start_str else now
-                    updated_dt = parse_iso(updated_str, now) if updated_str else now
-
-                    state_key = f"uid:{uid}" if uid is not None else f"name:{_norm(user_name)}"
-                    toggl_ids_by_user.setdefault(state_key, set()).add(entry_id)
-
-                    # Snapshot in the window (for diffs)
-                    prev_snap = notion_entries_by_id.get(entry_id, {}).get("snapshot") if _notion_ok() else None
-                    first_seen = (entry_id not in _existing_eid_to_pid)
-
-                    if prev_snap:
-                        prev_dur  = int(prev_snap.get("dur_ms", duration_ms))
-                        prev_desc = prev_snap.get("desc", description)
-                        prev_proj = prev_snap.get("project", project)
-                        prev_tags = prev_snap.get("tags", list(tags))
-                        prev_start_str = prev_snap.get("start_iso", start_str)
-                        prev_start_dt = parse_iso(prev_start_str, now) if prev_start_str else start_dt
-                        prev_updated_str = prev_snap.get("updated_iso", updated_str)
-                        prev_updated = parse_iso_opt(prev_updated_str) if prev_updated_str else None
-                    else:
-                        prev_dur = duration_ms
-                        prev_desc = description
-                        prev_proj = project
-                        prev_tags = list(tags)
-                        prev_start_dt = start_dt
-                        prev_updated = None
-
-                    changed_time  = duration_ms != prev_dur
-                    changed_proj  = project != prev_proj
-                    changed_desc  = description != prev_desc
-                    try:
-                        old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
-                        new_set = set(tags) if isinstance(tags, list) else set()
-                    except Exception:
-                        old_set, new_set = set(), set()
-                    changed_tags  = old_set != new_set
-                    changed_start = (start_dt != prev_start_dt)
-
-                    # --- Queue to Notion ---
-                    queue_for_notion = False
-                    if first_seen:
-                        queue_for_notion = True  # backup guarantee (create)
-                    else:
-                        if not NOTION_PRIORITIZE_CREATES:
-                            queue_for_notion = (changed_time or changed_proj or changed_desc or changed_tags or changed_start)
-
-                    if _notion_budget_remaining() > 0 and (_notion_creates_remaining() > 0 if first_seen else True) and queue_for_notion:
-                        if notion_queue_entry(
-                            entry_id=entry_id,
-                            user_key=state_key,
-                            user_display=user_name,
-                            project=project,
-                            tags=list(tags) if isinstance(tags, list) else [],
-                            start_iso=start_str or None,
-                            end_iso=end_str or None,
-                            updated_iso=updated_str or None,
-                            dur_seconds=max(0, duration_ms // 1000),
-                            workspace_id=wid,
-                            description=description,
-                            deleted=False
-                        ):
-                            acted_rows += 1
-                            if first_seen:
-                                # avoid duplicate creates later in the run
-                                _existing_eid_to_pid.setdefault(entry_id, "")
-                        if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
-                            notion_flush_queue(limit_by_budget=True, context=context)
-
-                    # Notifications
-                    if NOTIFY_ENABLED:
-                        webhook_url = user_map.get(user_name) or user_map_norm.get(_norm(user_name))
-                        should_notify = False
-                        diff_lines = []
-                        label = "🆕 New Time Entry Added"
-
-                        if first_seen:
-                            if updated_dt >= since:
-                                should_notify = True
-                        else:
-                            if (prev_updated and updated_dt > prev_updated) and (updated_dt >= since) and (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
-                                if NOTION_PRIORITIZE_CREATES and _notion_creates_remaining() > 0:
-                                    # delay non-create activity in notify-heavy runs
-                                    should_notify = False
-                                else:
-                                    should_notify = True
-                                    label = "✍️ Time Entry Edited"
-                                    if changed_time:
-                                        diff_lines.append(f"Δ Time {_format_delta_ms(duration_ms - prev_dur)}")
-                                    if changed_proj:
-                                        diff_lines.append("Project changed")
-                                    if changed_desc:
-                                        diff_lines.append("Description changed")
-                                    if changed_tags:
-                                        added   = sorted(list(new_set - old_set))
-                                        removed = sorted(list(old_set - new_set))
-                                        bits = []
-                                        if added:   bits.append("+" + ", ".join(added))
-                                        if removed: bits.append("-" + ", ".join(removed))
-                                        diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
-                                    if changed_start:
-                                        diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
-
-                        if should_notify and webhook_url:
-                            lines = [
-                                f"## {label}",
-                                f"👤 **User**: {user_name}",
-                                f"📁 **Project:** {project if not (label.startswith('✍️') and changed_proj) else f'~~{prev_proj}~~ {project}'}",
-                                f"🏷️ **Tags:** " + (
-                                    (", ".join(tags) if tags else "No tags") if not (label.startswith("✍️") and changed_tags)
-                                    else f"~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(new_set)) or 'No tags'}"
-                                ),
-                                f"📝 **Task:** " + (
-                                    f"~~{_truncate(prev_desc)}~~ {_truncate(description)}" if (label.startswith('✍️') and changed_desc)
-                                    else _truncate(description)
-                                ),
-                                f"⏱️ **Time Tracked:** " + (
-                                    f"~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(duration_ms)}" if (label.startswith('✍️') and changed_time)
-                                    else convert_ms_to_hms(duration_ms)
-                                ),
-                                f"🗓️ **Start:** " + (
-                                    f"~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}" if (label.startswith('✍️') and changed_start)
-                                    else start_dt.strftime('%Y-%m-%d %H:%M:%S')
-                                ),
-                                f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                            ]
-                            if label.startswith("✍️") and diff_lines:
-                                lines.append("")
-                                lines.append("**changes:** " + "; ".join(diff_lines))
-                            lines.append("—")
-                            outbox.setdefault(webhook_url, []).append("\n".join(lines))
-                            notified += 1
-                            acted_rows += 1
-
-                # periodic flush to Notion
-                if _notion_queue and _notion_budget_remaining() > 0:
-                    notion_flush_queue(limit_by_budget=True, context=context)
-
-                # Early stop once create budget is reached
-                if _notion_creates_remaining() <= 0 or _notion_budget_remaining() <= 0:
-                    break
+            pending_by_webhook.setdefault(webhook_url, []).append(dict(
+                entry_id=eid,
+                user_key=user_key,
+                user_display=user_display,
+                project=snap.get("project") or "No project",
+                tags=list(snap.get("tags") or []),
+                start_iso=snap.get("start_iso"),
+                end_iso=snap.get("end_iso"),
+                updated_iso=snap.get("updated_iso"),
+                dur_seconds=max(0, int(snap.get("dur_ms",0)) // 1000),
+                workspace_id=None,
+                description=snap.get("desc") or "",
+                deleted=True
+            ))
 
     # ==========================
-    # Deletion detection (only if create budget is satisfied or not prioritized)
+    # Send Discord messages (top priority)
     # ==========================
-    if _notion_ok() and _notion_budget_remaining() > 0 and not _time_budget_exhausted(context) and acted_rows < MAX_TOGGL_ROWS_PER_RUN:
-        if (not NOTION_PRIORITIZE_CREATES) or (_notion_creates_remaining() <= 0):
-            for eid, info in notion_entries_by_id.items():
-                if _time_budget_exhausted(context) or _notion_budget_remaining() <= 0 or acted_rows >= MAX_TOGGL_ROWS_PER_RUN:
-                    break
-                snap = info["snapshot"]
-                user_key = info.get("user_key") or ""
-                start_iso = snap.get("start_iso")
-                if not start_iso:
-                    continue
-                current_ids = toggl_ids_by_user.get(user_key, set())
-                if eid in current_ids:
-                    continue  # still present
-                # Mark deleted in Notion (consumes upsert budget, not create budget)
-                if notion_queue_entry(
-                    entry_id=eid,
-                    user_key=user_key,
-                    user_display=user_key,
-                    project=snap.get("project") or "No project",
-                    tags=list(snap.get("tags") or []),
-                    start_iso=snap.get("start_iso"),
-                    end_iso=snap.get("end_iso"),
-                    updated_iso=snap.get("updated_iso"),
-                    dur_seconds=max(0, int(snap.get("dur_ms",0)) // 1000),
-                    workspace_id=None,
-                    description=snap.get("desc") or "",
-                    deleted=True
-                ):
-                    acted_rows += 1
-
-            if _notion_queue and _notion_budget_remaining() > 0:
-                notion_flush_queue(limit_by_budget=True, context=context)
-
-    # ==========================
-    # Send Discord messages
-    # ==========================
+    successful_webhooks = set()
     if NOTIFY_ENABLED and outbox and not _time_budget_exhausted(context):
         max_workers = min(8, len(outbox))
+        futures = []
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_send_all_for_webhook, wh, msgs) for wh, msgs in outbox.items()]
+            for wh, msgs in outbox.items():
+                futures.append(ex.submit(_send_all_for_webhook, wh, msgs))
             for f in as_completed(futures):
                 try:
-                    f.result()
+                    wh_url, sent_chunks = f.result()
+                    if sent_chunks > 0:
+                        successful_webhooks.add(wh_url)
                 except Exception as e:
-                    _alert(f"[ERROR] send pool: {e}")
+                    _alert(f"send pool: {e}")
+
+    # ==========================
+    # COMMIT after successful notifications
+    # ==========================
+    committed_ops = {"created": 0, "updated": 0}
+    if not _time_budget_exhausted(context):
+        for wh, payloads in pending_by_webhook.items():
+            if wh not in successful_webhooks:
+                _alert(f"Notion upserts skipped for webhook (send failed): {wh}")
+                continue
+            for p in payloads:
+                if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
+                    break
+                notion_queue_entry(
+                    entry_id=p["entry_id"],
+                    user_key=p["user_key"],
+                    user_display=p["user_display"],
+                    project=p["project"],
+                    tags=p["tags"],
+                    start_iso=p["start_iso"],
+                    end_iso=p["end_iso"],
+                    updated_iso=p["updated_iso"],
+                    dur_seconds=p["dur_seconds"],
+                    workspace_id=p["workspace_id"],
+                    description=p["description"],
+                    deleted=p["deleted"]
+                )
+                if len(_notion_queue) >= NOTION_FLUSH_EVERY // 2:
+                    res = notion_flush_queue(context=context)
+                    committed_ops["created"] += res.get("created", 0)
+                    committed_ops["updated"] += res.get("updated", 0)
+
+            if _notion_queue and not _time_budget_exhausted(context):
+                res = notion_flush_queue(context=context)
+                committed_ops["created"] += res.get("created", 0)
+                committed_ops["updated"] += res.get("updated", 0)
+
+    # ==========================
+    # Quiet-run catch-up (notify mode): if zero notifications, create-only in live window
+    # ==========================
+    quiet_add_summary = {}
+    if notified == 0 and not _time_budget_exhausted(context) and _remaining_s(context) > (FINAL_RESERVE_S + 2):
+        created = 0
+        notion_entries_by_id2, _ = _build_notion_state_index(since, now)
+        notion_ids = set(notion_entries_by_id2.keys())
+        toggl_ids  = set(toggl_map.keys())
+        missing_ids = [eid for eid in (toggl_ids - notion_ids)]
+        for eid in missing_ids:
+            t = toggl_map[eid]
+            notion_queue_entry(
+                entry_id=eid,
+                user_key=t["user_key"],
+                user_display=t["user_display"],
+                project=t["project"],
+                tags=t["tags"],
+                start_iso=t["start_iso"],
+                end_iso=t["end_iso"],
+                updated_iso=t["updated_iso"],
+                dur_seconds=t["dur_seconds"],
+                workspace_id=None,
+                description=t["description"],
+                deleted=False
+            )
+            if len(_notion_queue) >= NOTION_FLUSH_EVERY or (context and _time_budget_exhausted(context)):
+                res = notion_flush_queue(context=context)
+                created += res["created"]
+            if _remaining_s(context) <= FINAL_RESERVE_S:
+                break
+        if _notion_queue and _remaining_s(context) > FINAL_RESERVE_S:
+            res = notion_flush_queue(context=context)
+            created += res["created"]
+        quiet_add_summary = {"created": created}
+
+    if _notion_queue and not _time_budget_exhausted(context):
+        res = notion_flush_queue(context=context)
+        committed_ops["created"] += res.get("created", 0)
+        committed_ops["updated"] += res.get("updated", 0)
 
     return {
         "status": "complete",
-        "notified": notified,
-        "dry_run_no_send": DRY_RUN_NO_SEND,
         "send_notifications": SEND_NOTIFICATIONS,
-        "notify_enabled": NOTIFY_ENABLED,
-        "state_backend": "notion" if _notion_ok() else "none",
         "notion": {
             "budget_used": _notion_ops_done,
-            "budget_cap": NOTION_MAX_UPSERTS_PER_RUN,
-            "create_budget_used": _notion_creates_done,
-            "create_budget_cap": NOTION_MAX_CREATES_PER_RUN,
             "queue_left": len(_notion_queue),
+            "committed_created": committed_ops["created"],
+            "committed_updated": committed_ops["updated"],
         },
+        "quiet_add": quiet_add_summary,
         "runtime": {
             "elapsed_s": round(_elapsed_s(), 3),
+            "remaining_s": round(_remaining_s(context), 3),
             "max_runtime_s": MAX_RUNTIME_S,
             "scanned_rows": scanned_rows,
             "acted_rows": acted_rows,
