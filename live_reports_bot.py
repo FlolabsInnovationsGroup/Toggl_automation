@@ -1079,10 +1079,43 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int,
     """
     if api_token in _EXHAUSTED_TOKENS:
         return
-    # Skip early if Reports are not enabled for this workspace
-    if not _workspace_allows_reports(api_token, workspace_id):
-        return
+    # Decide method per workspace: prefer Reports; fallback to v9 time_entries
+    use_reports = _workspace_allows_reports(api_token, workspace_id)
     headers = _headers_for_token(api_token)
+    if not use_reports:
+        # v9 fallback without pagination (limit window by TIME_WINDOW_DAYS and row soft-cap outside)
+        base = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/time_entries"
+        params = {"start_date": _iso(since_dt), "end_date": _iso(until_dt)}
+        try:
+            if context and _should_stop_scanning(context):
+                return
+            resp = SESSION.get(base, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 402:
+                _EXHAUSTED_TOKENS.add(api_token)
+                _alert(f"time_entries v9 402 for workspace {workspace_id}; skipping this token for the run.")
+                return
+            if resp.status_code in (404, 405, 400):
+                # Try alternate param names
+                alt = {"since": _iso(since_dt), "until": _iso(until_dt)}
+                resp2 = SESSION.get(base, headers=headers, params=alt, timeout=HTTP_TIMEOUT)
+                if resp2.status_code != 200:
+                    _alert(f"v9 time_entries failed: {resp.status_code}/{resp2.status_code} - {resp2.text}")
+                    return
+                data = resp2.json() or []
+                if data:
+                    yield data
+                return
+            if resp.status_code != 200:
+                _alert(f"v9 time_entries failed: {resp.status_code} - {resp.text}")
+                return
+            data = resp.json() or []
+            if data:
+                yield data
+            return
+        except Exception as e:
+            _alert(f"time_entries v9 exception: {e}")
+            return
+    # Reports path
     url = "https://api.track.toggl.com/reports/api/v2/details"
 
     page = 1
@@ -1362,7 +1395,10 @@ def _normalize_toggl_entry(e: dict, now: datetime) -> dict:
 # DRY-FILL mode (no notifications): oldest-first create-only backfill
 # ==========================
 def _collect_all_workspaces(workspace_set: list[dict], context):
-    """Return unique list of tuples (api_token, workspace_id). Avoid scanning the same workspace twice."""
+    """Return unique list of tuples (api_token, workspace_id).
+    Avoid scanning the same workspace twice. Do not gate by Reports feature here;
+    per-workspace method is decided later with a Reports→v9 fallback.
+    """
     pairs = []
     seen_wids = set()
     for token_entry in workspace_set:
@@ -1371,16 +1407,13 @@ def _collect_all_workspaces(workspace_set: list[dict], context):
         api_token = token_entry["api_token"]
         if api_token in _EXHAUSTED_TOKENS:
             continue
-        # Preload features once per token to gate Reports calls later
+        # Prime features cache (best-effort) to help downstream decisions
         _get_enabled_features_by_workspace(api_token)
         for ws in get_workspaces_for_token(api_token):
             wid = ws.get("id")
             if not wid or wid in seen_wids:
                 continue
-            if _workspace_allows_reports(api_token, wid):
-                pairs.append((api_token, wid))
-            else:
-                print(f"[INFO] Skipping workspace {wid}: Reports API not enabled")
+            pairs.append((api_token, wid))
             seen_wids.add(wid)
     return pairs
 
@@ -1616,16 +1649,17 @@ def lambda_handler(event, context):
         if api_token in _EXHAUSTED_TOKENS:
             continue
 
-        # Hydrate maps so we can label notifications properly
-        if TOGGL_USE_REPORTS_ONLY:
-            # Reports details include 'user' and 'project' strings; avoid extra calls
+        # Hydrate maps so we can label notifications properly, only when needed
+        if _workspace_allows_reports(api_token, wid):
+            # Reports entries contain user/project strings
             user_name_map = {}
             project_name_map = {}
         else:
+            # v9 fallback needs enrichment
             user_name_map = get_workspace_users_map(api_token, wid)
             project_name_map = get_workspace_projects_map(api_token, wid)
 
-        print(f"[DEBUG] Streaming reports entries from workspace {wid}")
+        print(f"[DEBUG] Streaming entries from workspace {wid}")
         for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=200, context=context):
             if _should_stop_scanning(context) or _must_leave_for_send_and_commit(context):
                 early_send_triggered = True
