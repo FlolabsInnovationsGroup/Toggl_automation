@@ -581,7 +581,9 @@ def lambda_handler(event, context):
     user_runtime={}  # state_key -> {current_ids,set; user_name; webhook; state; notion_user_key}
     outbox={}
     warned=set()
-    notion_tasks = []  # queued Notion upserts (existing, notion_user_key, entry_dict, wid)
+    # Group upserts by webhook so we can send first, then write those entries
+    notion_tasks_by_webhook: dict[str, list[tuple]] = {}
+    notion_tasks_no_webhook: list[tuple] = []
     delete_tasks = []  # queued page_id for Deleted=true
     scheduled_upserts = set()  # (notion_user_key, eid)
 
@@ -635,26 +637,6 @@ def lambda_handler(event, context):
                 if eid not in seen_ids: state["seen_entries"].append(eid)
                 snaps[eid] = {"dur": dur_ms, "desc": desc, "project": proj, "tags": list(tags), "start": start_s, "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(), "updated": upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
-                existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
-                notion_entry={
-                    "id": eid,
-                    "user": user,
-                    "project": proj,
-                    "tags": tags,
-                    "dur": dur_ms,
-                    "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "description": desc,
-                }
-                key = (notion_user_key, eid)
-                if key in scheduled_upserts:
-                    # avoid duplicate upsert (prevents 409 conflicts from concurrent creates)
-                    pass
-                else:
-                    scheduled_upserts.add(key)
-                    notion_tasks.append((existing, notion_user_key, notion_entry, wid))
-
                 if NOTIFY_ENABLED and not wh:
                     if first_seen and user not in warned:
                         _alert(f"[INFO] No webhook configured for '{user}' (uid: {uid}); persisting state and skipping notifications."); warned.add(user)
@@ -681,32 +663,70 @@ def lambda_handler(event, context):
                             if rem: bits.append("-"+", ".join(rem))
                             dif.append("Tags "+" ".join(bits) if bits else "Tags changed")
                         if changed_start: dif.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
-                if not should_notify: continue
-                if not NOTIFY_ENABLED: skipped_notifies+=1; continue
-                lines=[f"## {label}", f"👤 **User**: {user}"]
-                lines.append(f"📁 **Project:** {'~~'+prev_proj+'~~ '+proj if label.startswith('✍️') and changed_proj else proj}")
-                if label.startswith("✍️") and changed_tags:
-                    lines.append(f"🏷️ **Tags:** ~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(new_set)) or 'No tags'}")
+                if not should_notify:
+                    continue
+                if NOTIFY_ENABLED:
+                    lines=[f"## {label}", f"👤 **User**: {user}"]
+                    lines.append(f"📁 **Project:** {'~~'+prev_proj+'~~ '+proj if label.startswith('✍️') and changed_proj else proj}")
+                    if label.startswith("✍️") and changed_tags:
+                        lines.append(f"🏷️ **Tags:** ~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(new_set)) or 'No tags'}")
+                    else:
+                        lines.append(f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}")
+                    if label.startswith("✍️") and changed_desc:
+                        lines.append(f"📝 **Task:** ~~{_truncate(prev_desc)}~~ {_truncate(desc)}")
+                    else:
+                        lines.append(f"📝 **Task:** {desc}")
+                    if label.startswith("✍️") and changed_time:
+                        lines.append(f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(dur_ms)}")
+                    else:
+                        lines.append(f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}")
+                    if label.startswith("✍️") and changed_start:
+                        lines.append(f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    else:
+                        lines.append(f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    lines.append(f"🕑 **Updated:** {upd_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    if label.startswith("✍️") and dif:
+                        lines.append("")
+                        lines.append("**changes:** "+"; ".join(dif))
+                    lines.append("—"); msg="\n".join(lines)
+                    if wh:
+                        outbox.setdefault(wh,[]).append(msg)
+                        notified+=1
+                        # prepare a Notion upsert task tied to this webhook
+                        existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
+                        notion_entry={
+                            "id": eid,
+                            "user": user,
+                            "project": proj,
+                            "tags": tags,
+                            "dur": dur_ms,
+                            "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                            "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                            "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                            "description": desc,
+                        }
+                        key = (notion_user_key, eid)
+                        if key not in scheduled_upserts:
+                            scheduled_upserts.add(key)
+                            notion_tasks_by_webhook.setdefault(wh, []).append((existing, notion_user_key, notion_entry, wid))
                 else:
-                    lines.append(f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}")
-                if label.startswith("✍️") and changed_desc:
-                    lines.append(f"📝 **Task:** ~~{_truncate(prev_desc)}~~ {_truncate(desc)}")
-                else:
-                    lines.append(f"📝 **Task:** {desc}")
-                if label.startswith("✍️") and changed_time:
-                    lines.append(f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(dur_ms)}")
-                else:
-                    lines.append(f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}")
-                if label.startswith("✍️") and changed_start:
-                    lines.append(f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                else:
-                    lines.append(f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                lines.append(f"🕑 **Updated:** {upd_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                if label.startswith("✍️") and dif:
-                    lines.append("")
-                    lines.append("**changes:** "+"; ".join(dif))
-                lines.append("—"); msg="\n".join(lines)
-                if wh: outbox.setdefault(wh,[]).append(msg); notified+=1
+                    # notifications disabled: upsert later regardless
+                    existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
+                    notion_entry={
+                        "id": eid,
+                        "user": user,
+                        "project": proj,
+                        "tags": tags,
+                        "dur": dur_ms,
+                        "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "description": desc,
+                    }
+                    key = (notion_user_key, eid)
+                    if key not in scheduled_upserts:
+                        scheduled_upserts.add(key)
+                        notion_tasks_no_webhook.append((existing, notion_user_key, notion_entry, wid))
 
     # Deletions
     for sk,b in user_runtime.items():
@@ -723,14 +743,33 @@ def lambda_handler(event, context):
             if not NOTIFY_ENABLED or not wh: skipped_deletions+=1
             else: outbox.setdefault(wh,[]).append(_format_deleted_message(user,snap)); notified+=1
 
-    # Process Notion upserts first to maximize inserts under time cap
-    if notion_tasks:
-        max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks)))
-        def _run_upsert(task):
+    # Send each webhook batch first, then upsert only those entries that were notified for that webhook
+    if NOTIFY_ENABLED and outbox:
+        for wh, msgs in outbox.items():
+            for payload in _chunk_messages(msgs):
+                send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT)
+            tasks = notion_tasks_by_webhook.get(wh) or []
+            if tasks:
+                max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
+                def _run_upsert(task):
+                    ex, ukey, ent, wid = task
+                    _notion_upsert(ex, ukey, ent, wid)
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futs = [ex.submit(_run_upsert, t) for t in tasks]
+                    for f in as_completed(futs):
+                        try:
+                            f.result()
+                        except Exception as e:
+                            _alert(f"[ERROR] Notion upsert task: {e}")
+
+    # Persist entries when notifications are disabled
+    if not NOTIFY_ENABLED and notion_tasks_no_webhook:
+        max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks_no_webhook)))
+        def _run_upsert2(task):
             ex, ukey, ent, wid = task
             _notion_upsert(ex, ukey, ent, wid)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_run_upsert, t) for t in notion_tasks]
+            futs = [ex.submit(_run_upsert2, t) for t in notion_tasks_no_webhook]
             for f in as_completed(futs):
                 try:
                     f.result()
@@ -747,13 +786,5 @@ def lambda_handler(event, context):
                     f.result()
                 except Exception as e:
                     _alert(f"[ERROR] Notion delete task: {e}")
-
-    # Send queued notifications last (skip if time is tight and prioritizing Notion)
-    if NOTIFY_ENABLED and outbox and (not PRIORITIZE_NOTION or not _should_exit_soon(context)):
-        with ThreadPoolExecutor(max_workers=min(8,len(outbox))) as ex:
-            fut=[ex.submit(_send_all_for_webhook,wh,msgs) for wh,msgs in outbox.items()]
-            for f in as_completed(fut):
-                try: f.result()
-                except Exception as e: _alert(f"[ERROR] send pool: {e}")
 
     return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":skipped_deletions,"dry_run_no_send":DRY_RUN_NO_SEND,"send_notifications":SEND_NOTIFICATIONS,"notify_enabled":NOTIFY_ENABLED}
