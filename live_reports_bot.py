@@ -8,7 +8,6 @@ import random
 import re
 from io import StringIO
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 # In-run caches and guards to reduce duplicate Toggl calls
@@ -16,6 +15,14 @@ _WS_CACHE_BY_TOKEN: dict[str, list[dict]] = {}
 _USERS_CACHE: dict[tuple[str,int], dict[int,str]] = {}
 _PROJECTS_CACHE: dict[tuple[str,int], dict[int,str]] = {}
 _EXHAUSTED_TOKENS: set[str] = set()
+
+# Feature/capability caches for Reports API gating
+_WS_FEATURES_BY_TOKEN: dict[str, dict[int, set[str]]] = {}
+_WS_REPORTS_ENABLED: dict[tuple[str,int], bool] = {}
+_WS_402_LOGGED: set[tuple[str,int]] = set()
+
+# Heuristic keys seen for reporting access in features endpoint
+_REPORT_FEATURE_KEYS = {"reports", "detailed_reports", "reports_api", "reporting_api", "report_export"}
 
 # ==========================
 # Robust HTTP session (shared)
@@ -162,6 +169,44 @@ def _alert(msg: str):
             SESSION.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
         except Exception:
             pass
+
+# ==========================
+# Toggl capabilities helpers (Reports gating)
+# ==========================
+def _get_enabled_features_by_workspace(api_token: str) -> dict[int, set[str]]:
+    """Return {workspace_id: {enabled_feature_names...}} for this token, cached per run."""
+    if api_token in _WS_FEATURES_BY_TOKEN:
+        return _WS_FEATURES_BY_TOKEN[api_token]
+    url = "https://api.track.toggl.com/api/v9/me/features"
+    try:
+        r = SESSION.get(url, headers=_headers_for_token(api_token), timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            out: dict[int, set[str]] = {}
+            for feat in (r.json() or []):
+                wid = feat.get("workspace_id")
+                if wid is None:
+                    continue
+                if feat.get("enabled"):
+                    nm = (feat.get("name") or "").strip().lower()
+                    out.setdefault(int(wid), set()).add(nm)
+            _WS_FEATURES_BY_TOKEN[api_token] = out
+            return out
+        _alert(f"features fetch failed: {r.status_code} - {r.text}")
+    except Exception as e:
+        _alert(f"features exception: {e}")
+    _WS_FEATURES_BY_TOKEN[api_token] = {}
+    return {}
+
+def _workspace_allows_reports(api_token: str, workspace_id: int) -> bool:
+    """True if this workspace appears to have Reports API enabled."""
+    key = (api_token, int(workspace_id))
+    if key in _WS_REPORTS_ENABLED:
+        return _WS_REPORTS_ENABLED[key]
+    feats = _get_enabled_features_by_workspace(api_token)
+    names = feats.get(int(workspace_id), set())
+    ok = any(any(k in name for k in _REPORT_FEATURE_KEYS) for name in names)
+    _WS_REPORTS_ENABLED[key] = ok
+    return ok
 
 # ==========================
 # Google Sheets helpers
@@ -1034,6 +1079,9 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int,
     """
     if api_token in _EXHAUSTED_TOKENS:
         return
+    # Skip early if Reports are not enabled for this workspace
+    if not _workspace_allows_reports(api_token, workspace_id):
+        return
     headers = _headers_for_token(api_token)
     url = "https://api.track.toggl.com/reports/api/v2/details"
 
@@ -1069,7 +1117,10 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int,
             code = resp.status_code
             if code == 402:
                 _EXHAUSTED_TOKENS.add(api_token)
-                _alert(f"details fetch failed: 402 - {resp.text}")
+                key = (api_token, int(workspace_id))
+                if key not in _WS_402_LOGGED:
+                    _alert(f"Workspace {workspace_id}: Reports API not enabled (402). Skipping for this run.")
+                    _WS_402_LOGGED.add(key)
                 break
             if code != 200:
                 _alert(f"details fetch failed: {code} - {resp.text}")
@@ -1320,11 +1371,17 @@ def _collect_all_workspaces(workspace_set: list[dict], context):
         api_token = token_entry["api_token"]
         if api_token in _EXHAUSTED_TOKENS:
             continue
+        # Preload features once per token to gate Reports calls later
+        _get_enabled_features_by_workspace(api_token)
         for ws in get_workspaces_for_token(api_token):
             wid = ws.get("id")
-            if wid and wid not in seen_wids:
+            if not wid or wid in seen_wids:
+                continue
+            if _workspace_allows_reports(api_token, wid):
                 pairs.append((api_token, wid))
-                seen_wids.add(wid)
+            else:
+                print(f"[INFO] Skipping workspace {wid}: Reports API not enabled")
+            seen_wids.add(wid)
     return pairs
 
 def _dry_fill_db_from_oldest(team, workspace_set, context):
