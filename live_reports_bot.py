@@ -9,12 +9,17 @@ import re
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import calendar
 
 # In-run caches and guards to reduce duplicate Toggl calls
 _WS_CACHE_BY_TOKEN: dict[str, list[dict]] = {}
 _USERS_CACHE: dict[tuple[str,int], dict[int,str]] = {}
 _PROJECTS_CACHE: dict[tuple[str,int], dict[int,str]] = {}
 _EXHAUSTED_TOKENS: set[str] = set()
+
+# Cache for v9 /me/time_entries results per token+window
+_ME_TIME_ENTRIES_CACHE: dict[tuple[str, str, str], list[dict]] = {}
+_V9_400_FLOOR_ALERTED: set[str] = set()  # tokens we've already warned about this run
 
 # Feature/capability caches for Reports API gating
 _WS_FEATURES_BY_TOKEN: dict[str, dict[int, set[str]]] = {}
@@ -71,7 +76,7 @@ FINAL_RESERVE_S           = int(os.getenv("FINAL_RESERVE_S", "10"))
 # New: extra conservative scanning stop threshold & page cap to avoid timeouts
 SCAN_STOP_REMAINING_S     = int(os.getenv("SCAN_STOP_REMAINING_S", "120"))  # stop scanning when <= this many seconds remain
 SCAN_ROW_SOFT_CAP         = int(os.getenv("SCAN_ROW_SOFT_CAP", "5000"))     # total rows per invocation
-SCAN_PAGE_SOFT_CAP        = int(os.getenv("SCAN_PAGE_SOFT_CAP", "40"))      # pages per workspace cap (defensive)
+SCAN_PAGE_SOFT_CAP        = int(os.getenv("SCAN_PAGE_SOFT_CAP", "200"))      # pages per workspace cap (defensive)
 
 # General window / HTTP
 TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
@@ -173,6 +178,66 @@ def _alert(msg: str):
 # ==========================
 # Toggl capabilities helpers (Reports gating)
 # ==========================
+def _get_me_time_entries_window(api_token: str,
+                                since_dt: datetime,
+                                until_dt: datetime) -> list[dict]:
+    # Clamp to v9 historical limit
+    start, end = _clamp_v9_window(since_dt, until_dt)
+
+    key = (api_token, _iso(start), _iso(end))
+    if key in _ME_TIME_ENTRIES_CACHE:
+        return _ME_TIME_ENTRIES_CACHE[key]
+
+    url = "https://api.track.toggl.com/api/v9/me/time_entries"
+    params = {"start_date": _iso(start), "end_date": _iso(end)}
+
+    def _do_request(p):
+        return SESSION.get(url, headers=_headers_for_token(api_token),
+                           params=p, timeout=HTTP_TIMEOUT)
+
+    try:
+        r = _do_request(params)
+        if r.status_code == 200:
+            data = r.json() or []
+            _ME_TIME_ENTRIES_CACHE[key] = data
+            return data
+        if r.status_code == 400:
+            # e.g. "start_date must not be earlier than 2025-07-28"
+            try:
+                m = re.search(r"(\d{4}-\d{2}-\d{2})", r.text or "")
+                if m:
+                    floor = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+                    # If floor is past our end, there is nothing to fetch for this window.
+                    if floor > end:
+                        _ME_TIME_ENTRIES_CACHE[key] = []
+                        return []
+                    # Otherwise, bump start to the server-advertised floor and retry once.
+                    adj_start = max(floor, start)
+                    params["start_date"] = _iso(adj_start)
+                    r2 = _do_request(params)
+                    if r2.status_code == 200:
+                        data = r2.json() or []
+                        _ME_TIME_ENTRIES_CACHE[(api_token, _iso(adj_start), _iso(end))] = data
+                        return data
+            except Exception:
+                pass
+
+        if r.status_code == 402:
+            _EXHAUSTED_TOKENS.add(api_token)
+        elif r.status_code == 400:
+            # Log at most once per token to avoid spam
+            if api_token not in _V9_400_FLOOR_ALERTED:
+                _V9_400_FLOOR_ALERTED.add(api_token)
+                _alert(f"me/time_entries floor hit (clamped): {r.text}")
+        else:
+            _alert(f"me/time_entries fetch failed: {r.status_code} - {r.text}")
+
+    except Exception as e:
+        _alert(f"me/time_entries exception: {e}")
+
+    _ME_TIME_ENTRIES_CACHE[key] = []
+    return []
+
 def _get_enabled_features_by_workspace(api_token: str) -> dict[int, set[str]]:
     """Return {workspace_id: {enabled_feature_names...}} for this token, cached per run."""
     if api_token in _WS_FEATURES_BY_TOKEN:
@@ -207,6 +272,30 @@ def _workspace_allows_reports(api_token: str, workspace_id: int) -> bool:
     ok = any(any(k in name for k in _REPORT_FEATURE_KEYS) for name in names)
     _WS_REPORTS_ENABLED[key] = ok
     return ok
+
+def _minus_months_keep_day(dt: datetime, months: int) -> datetime:
+    """Subtract calendar months while keeping day/time (clamped to month length)."""
+    y, m = dt.year, dt.month - months
+    while m <= 0:
+        m += 12
+        y -= 1
+    last_day = calendar.monthrange(y, m)[1]
+    d = min(dt.day, last_day)
+    return dt.replace(year=y, month=m, day=d)
+
+def _clamp_v9_window(since_dt: datetime, until_dt: datetime) -> tuple[datetime, datetime]:
+    """
+    v9 /me/time_entries only allows ~last 3 calendar months from *now*.
+    Clamp start to (now - 3 months), and end to now.
+    """
+    now = datetime.now(timezone.utc)
+    end = min(until_dt, now)
+    floor_now = _minus_months_keep_day(now, 3)
+    start = max(since_dt, floor_now)
+    if start > end:
+        # Window entirely before floor or inverted — collapse to end so caller can no-op.
+        start = end
+    return start, end
 
 # ==========================
 # Google Sheets helpers
@@ -1074,62 +1163,55 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int,
                                  since_dt: datetime, until_dt: datetime,
                                  per_page:int=200, context=None):
     """
-    Use Toggl Reports API (v2 details) to fetch time entries for a workspace.
-    Yields one list of entries per page. Stops on 402 (plan/quota), timeout guard, or page caps.
+    Prefer Reports API when allowed; otherwise fall back to v9 /me/time_entries and
+    filter locally by workspace_id. Yields lists of entries ("pages").
     """
     if api_token in _EXHAUSTED_TOKENS:
         return
-    # Decide method per workspace: prefer Reports; fallback to v9 time_entries
+
     use_reports = _workspace_allows_reports(api_token, workspace_id)
     headers = _headers_for_token(api_token)
+
+    # ---------- v9 fallback via /me/time_entries ----------
     if not use_reports:
-        # v9 fallback without pagination (limit window by TIME_WINDOW_DAYS and row soft-cap outside)
-        base = f"https://api.track.toggl.com/api/v9/workspaces/{workspace_id}/time_entries"
-        params = {"start_date": _iso(since_dt), "end_date": _iso(until_dt)}
         try:
             if context and _should_stop_scanning(context):
                 return
-            resp = SESSION.get(base, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-            if resp.status_code == 402:
-                _EXHAUSTED_TOKENS.add(api_token)
-                _alert(f"time_entries v9 402 for workspace {workspace_id}; skipping this token for the run.")
+            # If the requested window ends before v9's floor, skip the API call entirely.
+            floor_now = _minus_months_keep_day(datetime.now(timezone.utc), 3)
+            if until_dt < floor_now:
                 return
-            if resp.status_code in (404, 405, 400):
-                # Try alternate param names
-                alt = {"since": _iso(since_dt), "until": _iso(until_dt)}
-                resp2 = SESSION.get(base, headers=headers, params=alt, timeout=HTTP_TIMEOUT)
-                if resp2.status_code != 200:
-                    _alert(f"v9 time_entries failed: {resp.status_code}/{resp2.status_code} - {resp2.text}")
-                    return
-                data = resp2.json() or []
-                if data:
-                    yield data
+            all_entries = _get_me_time_entries_window(api_token, since_dt, until_dt)
+            if not all_entries:
                 return
-            if resp.status_code != 200:
-                _alert(f"v9 time_entries failed: {resp.status_code} - {resp.text}")
-                return
-            data = resp.json() or []
-            if data:
-                yield data
+            wid = int(workspace_id)
+            # v9 objects typically expose 'workspace_id' (v9) or 'wid' (v8-ish). Check both.
+            filtered = [e for e in all_entries
+                        if int(e.get("workspace_id") or e.get("wid") or 0) == wid]
+            # Yield in chunks to keep memory/processing bounded
+            pp = max(1, min(200, int(per_page) if isinstance(per_page, int) else 200))
+            for i in range(0, len(filtered), pp):
+                if context and _should_stop_scanning(context):
+                    break
+                yield filtered[i:i+pp]
             return
         except Exception as e:
-            _alert(f"time_entries v9 exception: {e}")
+            _alert(f"v9 me/time_entries fallback exception: {e}")
             return
-    # Reports path
-    url = "https://api.track.toggl.com/reports/api/v2/details"
 
+    # ---------- Reports path (unchanged) ----------
+    url = "https://api.track.toggl.com/reports/api/v2/details"
     page = 1
     total_count = None
     page_count = 0
-    # Clamp per_page to Reports API limits
     try:
         per_page = int(per_page)
     except Exception:
         per_page = 200
     if per_page <= 0 or per_page > 200:
         per_page = 200
+
     while True:
-        # Conservative time guard
         if context and _should_stop_scanning(context):
             break
         if total_count is not None and (page - 1) * per_page >= total_count:
@@ -1165,7 +1247,6 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int,
                 break
             yield entries
             page_count += 1
-            # per_page from response may differ; respect param used
             if len(entries) < per_page:
                 break
             page += 1
