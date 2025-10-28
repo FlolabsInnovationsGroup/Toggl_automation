@@ -116,7 +116,7 @@ NOTION_PROP_DELETED      = os.getenv("NOTION_PROP_DELETED", "Deleted")
 # Backfill window settings (used by dry-fill mode)
 HISTORY_STEP_MONTHS          = int(os.getenv("HISTORY_STEP_MONTHS", "12"))
 HISTORY_MAX_EMPTY_WINDOWS    = int(os.getenv("HISTORY_MAX_EMPTY_WINDOWS", "2"))
-HISTORY_MAX_YEARS            = int(os.getenv("HISTORY_MAX_YEARS", "15"))
+HISTORY_MAX_YEARS            = int(os.getenv("HISTORY_MAX_YEARS", "4"))
 
 # Discord rate limiting
 DISCORD_MIN_INTERVAL_MS        = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
