@@ -55,7 +55,6 @@ P_USER_KEY    = os.getenv("NOTION_PROP_USER_KEY", "User Key")
 P_ENTRY_ID    = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")
 P_PROJECT     = os.getenv("NOTION_PROP_PROJECT", "Project")
 P_TAGS        = os.getenv("NOTION_PROP_TAGS", "Tags")
-P_START       = os.getenv("NOTION_PROP_START", "Start")  # legacy; no longer used for writes
 P_DATE        = os.getenv("NOTION_PROP_DATE", "Date")     # unified range date property
 P_UPDATED     = os.getenv("NOTION_PROP_UPDATED", "Updated")
 P_DURATION    = os.getenv("NOTION_PROP_DURATION", "Duration")
@@ -377,7 +376,7 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
             continue
         if r.status_code in (200, 201):
             return r
-        if r.status_code in (429, 500, 502, 503, 504):
+        if r.status_code in (409, 429, 500, 502, 503, 504):
             wait = 0.5 * (2 ** attempt) + random.uniform(0.05, 0.25)
             time.sleep(min(3.0, wait))
             continue
@@ -584,6 +583,7 @@ def lambda_handler(event, context):
     warned=set()
     notion_tasks = []  # queued Notion upserts (existing, notion_user_key, entry_dict, wid)
     delete_tasks = []  # queued page_id for Deleted=true
+    scheduled_upserts = set()  # (notion_user_key, eid)
 
     for token in workspaces:
         api_token=token["api_token"]; wss=get_workspaces_for_token(api_token)
@@ -647,7 +647,13 @@ def lambda_handler(event, context):
                     "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
                     "description": desc,
                 }
-                notion_tasks.append((existing, notion_user_key, notion_entry, wid))
+                key = (notion_user_key, eid)
+                if key in scheduled_upserts:
+                    # avoid duplicate upsert (prevents 409 conflicts from concurrent creates)
+                    pass
+                else:
+                    scheduled_upserts.add(key)
+                    notion_tasks.append((existing, notion_user_key, notion_entry, wid))
 
                 if NOTIFY_ENABLED and not wh:
                     if first_seen and user not in warned:
