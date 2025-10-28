@@ -12,7 +12,7 @@ TEAM_GID = os.getenv("TEAM_GID", "")
 WORKSPACES_GID = os.getenv("WORKSPACES_GID", "")
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 
-TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "24"))
+TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "5"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 HARD_START_FILTER = os.getenv("HARD_START_FILTER", "1") == "1"
 
@@ -30,9 +30,10 @@ SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", True)
 NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
 
 # Deadline-aware controls and throughput priorities
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "240"))  # soft cap when context missing
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "180"))  # soft cap when context missing
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "12"))   # leave safety margin for shutdown
 PRIORITIZE_NOTION = _env_bool("PRIORITIZE_NOTION", True)  # skip Discord send if time is tight
+NOTIFY_FLUSH_EVERY = int(os.getenv("NOTIFY_FLUSH_EVERY", "25"))  # flush per-webhook after N messages
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
 MAX_TOGGL_CALLS_PER_RUN = int(os.getenv("MAX_TOGGL_CALLS_PER_RUN", "120"))
@@ -68,6 +69,8 @@ NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "").strip()
 NOTION_RPS = float(os.getenv("NOTION_RPS", "3.0"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "4"))  # threads for Notion writes
 NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "4"))
+MAX_USERS_NOTION_INDEX = int(os.getenv("MAX_USERS_NOTION_INDEX", "80"))  # cap user-index Notion queries per run
+NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 
 _NOTION_LAST_CALL = 0.0
 try:
@@ -346,6 +349,30 @@ def _multi_val(tags: list[str]): return {"multi_select": [{"name": str(t)[:99]} 
 def _relation(page_id: str|None):
     return {"relation": ([{"id": page_id}] if page_id else [])}
 
+def _desc_block(text: str) -> dict:
+    txt = (text or "").strip()
+    if not txt:
+        return {}
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [
+                {"type": "text", "text": {"content": txt[:2000]}}
+            ]
+        }
+    }
+
+def _notion_append_blocks(page_id: str, children: list[dict]):
+    if not page_id or not children:
+        return
+    # Filter out empties
+    kids = [c for c in children if c]
+    if not kids:
+        return
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    _notion_request('PATCH', url, json_body={"children": kids})
+
 def _notion_rate_limit():
     if NOTION_RPS <= 0:
         return
@@ -497,7 +524,7 @@ def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
         cursor=js.get("next_cursor")
     return out
 
-def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int):
+def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False):
     eid=str(entry.get("id"))
     props={
         P_USER_KEY: _title_val(user_key),
@@ -517,9 +544,17 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         if tm_pid:
             props[P_TEAM_MEMBER] = _relation(tm_pid)
     if existing and existing.get("page_id"):
-        _notion_request('PATCH', f"https://api.notion.com/v1/pages/{existing['page_id']}", json_body={"properties":props})
+        page_id = existing['page_id']
+        _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
+        if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
+            _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
     else:
         body={"parent":{"database_id":NOTION_DATABASE_ID},"properties":props}
+        # include description as content on create to avoid a second call
+        if NOTION_ADD_DESCRIPTION_BLOCKS and (entry.get("description") or "").strip():
+            blk = _desc_block(entry.get("description") or "")
+            if blk:
+                body["children"] = [blk]
         _notion_request('POST', "https://api.notion.com/v1/pages", json_body=body)
 
 def _notion_mark_deleted(page_id: str):
@@ -586,17 +621,48 @@ def lambda_handler(event, context):
     notion_tasks_no_webhook: list[tuple] = []
     delete_tasks = []  # queued page_id for Deleted=true
     scheduled_upserts = set()  # (notion_user_key, eid)
+    users_indexed = 0
+
+    def _flush_webhook(wh: str):
+        # Send messages (chunked), then run Notion upserts for this webhook
+        msgs = outbox.get(wh) or []
+        if msgs:
+            for payload in _chunk_messages(msgs):
+                if _should_exit_soon(context):
+                    break
+                send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT)
+            outbox[wh] = []
+        tasks = notion_tasks_by_webhook.get(wh) or []
+        if tasks and not _should_exit_soon(context):
+            max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
+            def _run_upsert(task):
+                ex, ukey, ent, wid, add_block = task
+                _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_run_upsert, t) for t in tasks]
+                for f in as_completed(futs):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        _alert(f"[ERROR] Notion upsert task: {e}")
+            notion_tasks_by_webhook[wh] = []
 
     for token in workspaces:
+        if _should_exit_soon(context):
+            break
         api_token=token["api_token"]; wss=get_workspaces_for_token(api_token)
         if not wss:
             _alert(f"⚠️ No workspaces visible for token ending …{api_token[-4:]}"); continue
         for ws in wss:
+            if _should_exit_soon(context):
+                break
             wid=ws.get("id");  
             if not wid: continue
             entries=fetch_workspace_entries(api_token,wid,since,now)
             print(f"[DEBUG] Fetched {len(entries)} entries from workspace {wid}")
             for e in entries:
+                if _should_exit_soon(context):
+                    break
                 eid=str(e.get("id") or ""); user=e.get("user") or ""; desc=e.get("description") or "No description"; proj=e.get("project") or "No project"; tags=e.get("tags") or []
                 dur_ms=int(e.get("dur") or 0); start_s=e.get("start") or ""; end_s=e.get("end") or ""; upd_s=e.get("updated") or e.get("at") or ""; uid=e.get("uid")
                 if not eid or not user: continue
@@ -613,8 +679,11 @@ def lambda_handler(event, context):
                 upd_dt=datetime.strptime(upd_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if upd_s else now
                 state_key=f"uid:{uid}" if uid is not None else f"name:{_norm(user)}"; notion_user_key=f"user:{uid}" if uid is not None else user
                 if state_key not in user_runtime:
-                    idx=_notion_query_user(notion_user_key,since,now)
-                    state={"seen_entries":list(idx.keys()),"seen_updates":{k:idx[k]["snap"].get("updated") or "" for k in idx},"seen_snapshots":{k:{**idx[k]["snap"],"page_id":idx[k]["page_id"]} for k in idx}}
+                    state={"seen_entries":[],"seen_updates":{},"seen_snapshots":{}}
+                    if users_indexed < MAX_USERS_NOTION_INDEX and not _should_exit_soon(context):
+                        idx=_notion_query_user(notion_user_key,since,now)
+                        state={"seen_entries":list(idx.keys()),"seen_updates":{k:idx[k]["snap"].get("updated") or "" for k in idx},"seen_snapshots":{k:{**idx[k]["snap"],"page_id":idx[k]["page_id"]} for k in idx}}
+                        users_indexed += 1
                     user_runtime[state_key]={"current_ids":set(),"user_name":user,"webhook":wh,"state":state,"notion_user_key":notion_user_key}
                 bucket=user_runtime[state_key]; state=bucket["state"]
                 seen_ids=set(state["seen_entries"]); seen_updates=state["seen_updates"]; snaps=state["seen_snapshots"]
@@ -690,7 +759,8 @@ def lambda_handler(event, context):
                         lines.append("**changes:** "+"; ".join(dif))
                     lines.append("—"); msg="\n".join(lines)
                     if wh:
-                        outbox.setdefault(wh,[]).append(msg)
+                        arr = outbox.setdefault(wh,[])
+                        arr.append(msg)
                         notified+=1
                         # prepare a Notion upsert task tied to this webhook
                         existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
@@ -708,7 +778,11 @@ def lambda_handler(event, context):
                         key = (notion_user_key, eid)
                         if key not in scheduled_upserts:
                             scheduled_upserts.add(key)
-                            notion_tasks_by_webhook.setdefault(wh, []).append((existing, notion_user_key, notion_entry, wid))
+                            # add description block on create or when description changed
+                            add_block = (first_seen or changed_desc)
+                            notion_tasks_by_webhook.setdefault(wh, []).append((existing, notion_user_key, notion_entry, wid, add_block))
+                        if len(arr) >= NOTIFY_FLUSH_EVERY or _should_exit_soon(context):
+                            _flush_webhook(wh)
                 else:
                     # notifications disabled: upsert later regardless
                     existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
@@ -726,7 +800,8 @@ def lambda_handler(event, context):
                     key = (notion_user_key, eid)
                     if key not in scheduled_upserts:
                         scheduled_upserts.add(key)
-                        notion_tasks_no_webhook.append((existing, notion_user_key, notion_entry, wid))
+                        add_block = (first_seen or changed_desc)
+                        notion_tasks_no_webhook.append((existing, notion_user_key, notion_entry, wid, add_block))
 
     # Deletions
     for sk,b in user_runtime.items():
@@ -746,14 +821,18 @@ def lambda_handler(event, context):
     # Send each webhook batch first, then upsert only those entries that were notified for that webhook
     if NOTIFY_ENABLED and outbox:
         for wh, msgs in outbox.items():
+            if _should_exit_soon(context):
+                break
             for payload in _chunk_messages(msgs):
+                if _should_exit_soon(context):
+                    break
                 send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT)
             tasks = notion_tasks_by_webhook.get(wh) or []
-            if tasks:
+            if tasks and not _should_exit_soon(context):
                 max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
                 def _run_upsert(task):
-                    ex, ukey, ent, wid = task
-                    _notion_upsert(ex, ukey, ent, wid)
+                    ex, ukey, ent, wid, add_block = task
+                    _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futs = [ex.submit(_run_upsert, t) for t in tasks]
                     for f in as_completed(futs):
@@ -766,8 +845,8 @@ def lambda_handler(event, context):
     if not NOTIFY_ENABLED and notion_tasks_no_webhook:
         max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks_no_webhook)))
         def _run_upsert2(task):
-            ex, ukey, ent, wid = task
-            _notion_upsert(ex, ukey, ent, wid)
+            ex, ukey, ent, wid, add_block = task
+            _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(_run_upsert2, t) for t in notion_tasks_no_webhook]
             for f in as_completed(futs):
@@ -777,7 +856,7 @@ def lambda_handler(event, context):
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
     # Then process deletion marks (if any)
-    if delete_tasks:
+    if delete_tasks and not _should_exit_soon(context):
         max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(_notion_mark_deleted, pid) for pid in delete_tasks]
