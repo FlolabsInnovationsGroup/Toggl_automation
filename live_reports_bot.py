@@ -9,6 +9,7 @@ import re
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 # In-run caches and guards to reduce duplicate Toggl calls
 _WS_CACHE_BY_TOKEN: dict[str, list[dict]] = {}
@@ -54,12 +55,16 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "")
 # --- Runtime safety caps & stage reserves ---
 MAX_RUNTIME_S             = int(os.getenv("MAX_RUNTIME_S", "240"))  # soft cap when context missing
 MAX_TOGGL_ROWS_PER_RUN    = int(os.getenv("MAX_TOGGL_ROWS_PER_RUN", "1000000"))
-TIGHT_EXIT_SAFETY_MARGIN  = int(os.getenv("TIGHT_EXIT_SAFETY_MARGIN", "20"))
+TIGHT_EXIT_SAFETY_MARGIN  = int(os.getenv("TIGHT_EXIT_SAFETY_MARGIN", "10"))
 SEND_RESERVE_S            = int(os.getenv("SEND_RESERVE_S", "60"))   # only used in notify mode
 COMMIT_RESERVE_S          = int(os.getenv("COMMIT_RESERVE_S", "45")) # only used in notify mode
 QUIET_CREATE_RESERVE_S    = int(os.getenv("QUIET_CREATE_RESERVE_S", "25"))
 FINAL_RESERVE_S           = int(os.getenv("FINAL_RESERVE_S", "10"))
-SCAN_ROW_SOFT_CAP         = int(os.getenv("SCAN_ROW_SOFT_CAP", "5000"))
+
+# New: extra conservative scanning stop threshold & page cap to avoid timeouts
+SCAN_STOP_REMAINING_S     = int(os.getenv("SCAN_STOP_REMAINING_S", "120"))  # stop scanning when <= this many seconds remain
+SCAN_ROW_SOFT_CAP         = int(os.getenv("SCAN_ROW_SOFT_CAP", "5000"))     # total rows per invocation
+SCAN_PAGE_SOFT_CAP        = int(os.getenv("SCAN_PAGE_SOFT_CAP", "40"))      # pages per workspace cap (defensive)
 
 # General window / HTTP
 TIME_WINDOW_DAYS    = int(os.getenv("TIME_WINDOW_DAYS", "24"))
@@ -84,9 +89,9 @@ NOTION_TOKEN        = os.getenv("NOTION_TOKEN", "").strip()
 NOTION_DATABASE_ID  = os.getenv("NOTION_DATABASE_ID", "").strip()
 NOTION_TEAM_DB_ID   = os.getenv("NOTION_TEAM_DB_ID", "").strip()
 # Default to slightly higher throughput while respecting Notion limits
-NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "100"))  # larger default for faster backfill
+NOTION_BATCH_SIZE   = int(os.getenv("NOTION_BATCH_SIZE", "50"))  # larger default for faster backfill
 NOTION_RPS          = float(os.getenv("NOTION_RPS", "3.0"))      # Notion soft limit ~3 rps
-NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "150"))
+NOTION_FLUSH_EVERY  = int(os.getenv("NOTION_FLUSH_EVERY", "100"))
 
 # (Instrumentation only; no gating)
 NOTION_MAX_UPSERTS_PER_RUN  = int(os.getenv("NOTION_MAX_UPSERTS_PER_RUN", "100000000"))
@@ -142,6 +147,10 @@ def _must_leave_for_send_and_commit(context) -> bool:
 
 def _must_leave_for_quiet_create(context) -> bool:
     return _remaining_s(context) <= (QUIET_CREATE_RESERVE_S + TIGHT_EXIT_SAFETY_MARGIN)
+
+def _should_stop_scanning(context) -> bool:
+    """More conservative stop to avoid timeouts even if we never notify."""
+    return _remaining_s(context) <= SCAN_STOP_REMAINING_S or _time_budget_exhausted(context)
 
 # ==========================
 # Alerts
@@ -665,11 +674,11 @@ def _build_notion_state_index(since_dt: datetime, until_dt: datetime):
     return entries_by_id, user_current_ids
 
 # ---------- Query existing by Entry IDs (targeted batch) ----------
-def _notion_query_existing_by_entry_ids(entry_ids: list[str], with_snapshots: bool = False) -> dict[str, any]:
+def _notion_query_existing_by_entry_ids(entry_ids: list[str], with_snapshots: bool = False) -> dict[str, Any]:
     """Query Notion for a set of Entry IDs. If with_snapshots, returns eid -> {page_id, snapshot, user_key}.
     Otherwise returns eid -> page_id.
     """
-    found: dict[str, any] = {}
+    found: dict[str, Any] = {}
     if not entry_ids:
         return found
     chunk = 25
@@ -1016,10 +1025,12 @@ def get_workspace_projects_map(api_token: str, workspace_id: int) -> dict[int, s
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
-def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, per_page:int=200):
+def iter_workspace_entries_pages(api_token: str, workspace_id: int,
+                                 since_dt: datetime, until_dt: datetime,
+                                 per_page:int=200, context=None):
     """
     Use Toggl Reports API (v2 details) to fetch time entries for a workspace.
-    Yields one list of entries per page. Stops on 402 (plan/quota) and caches exhausted token.
+    Yields one list of entries per page. Stops on 402 (plan/quota), timeout guard, or page caps.
     """
     if api_token in _EXHAUSTED_TOKENS:
         return
@@ -1028,6 +1039,7 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: da
 
     page = 1
     total_count = None
+    page_count = 0
     # Clamp per_page to Reports API limits
     try:
         per_page = int(per_page)
@@ -1036,8 +1048,14 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: da
     if per_page <= 0 or per_page > 200:
         per_page = 200
     while True:
+        # Conservative time guard
+        if context and _should_stop_scanning(context):
+            break
         if total_count is not None and (page - 1) * per_page >= total_count:
             break
+        if page_count >= SCAN_PAGE_SOFT_CAP:
+            break
+
         params = {
             "workspace_id": int(workspace_id),
             "since": since_dt.strftime("%Y-%m-%d"),
@@ -1062,6 +1080,7 @@ def iter_workspace_entries_pages(api_token: str, workspace_id: int, since_dt: da
             if not entries:
                 break
             yield entries
+            page_count += 1
             # per_page from response may differ; respect param used
             if len(entries) < per_page:
                 break
@@ -1354,7 +1373,7 @@ def _dry_fill_db_from_oldest(team, workspace_set, context):
                 break
 
             # For dry-fill we only need entries; no need to hydrate user/project names here
-            for page in iter_workspace_entries_pages(api_token, wid, win_start, win_end, per_page=2000):
+            for page in iter_workspace_entries_pages(api_token, wid, win_start, win_end, per_page=200, context=context):
                 if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
                     break
                 for e in page:
@@ -1394,10 +1413,10 @@ def _dry_fill_db_from_oldest(team, workspace_set, context):
                         created_this_window += res.get("created", 0)
                         total_created += res.get("created", 0)
 
-                if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN:
+                if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN or _should_stop_scanning(context):
                     break
 
-            if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN:
+            if scanned_this_window >= MAX_TOGGL_ROWS_PER_RUN or _should_stop_scanning(context):
                 break
 
         # Final flush for the window
@@ -1518,10 +1537,8 @@ def lambda_handler(event, context):
     webhook_by_user_key = {} # "uid:123" or "name:john doe" -> webhook
     display_by_user_key = {} # user_key -> user_display (for deletions)
 
-    # Build Notion-based state snapshot (window) and seed eid->pid only from window
     # Defer expensive Notion window scan; we will look up only EIDs we see from Toggl
     notion_entries_by_id = {}
-    notion_user_ids = {}
 
     # Counters
     scanned_rows   = 0
@@ -1536,7 +1553,7 @@ def lambda_handler(event, context):
     ws_pairs = _collect_all_workspaces(workspace_set, context)
 
     for (api_token, wid) in ws_pairs:
-        if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+        if _should_stop_scanning(context) or _must_leave_for_send_and_commit(context):
             early_send_triggered = True
             break
         if api_token in _EXHAUSTED_TOKENS:
@@ -1552,13 +1569,16 @@ def lambda_handler(event, context):
             project_name_map = get_workspace_projects_map(api_token, wid)
 
         print(f"[DEBUG] Streaming reports entries from workspace {wid}")
-        for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=200):
-            if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+        for page in iter_workspace_entries_pages(api_token, wid, since, now, per_page=200, context=context):
+            if _should_stop_scanning(context) or _must_leave_for_send_and_commit(context):
                 early_send_triggered = True
                 break
             print(f"[DEBUG] Page fetched with {len(page)} entries from workspace {wid}")
             # Preload Notion state for EIDs in this page only (fast path)
             eids_in_page = [str((e.get("id") or "")) for e in page if (e.get("id") or "")]
+            # If time is getting tight, limit the unknown lookup size to keep queries bounded
+            if _remaining_s(context) <= SCAN_STOP_REMAINING_S + 15:
+                eids_in_page = eids_in_page[:100]
             unknown = [eid for eid in eids_in_page if eid not in _existing_eid_to_pid and eid not in notion_entries_by_id]
             if unknown:
                 lookup = _notion_query_existing_by_entry_ids(unknown, with_snapshots=True)
@@ -1568,7 +1588,7 @@ def lambda_handler(event, context):
                         _existing_eid_to_pid[eid] = pid
                         notion_entries_by_id[eid] = {"page_id": pid, "snapshot": info.get("snapshot"), "user_key": info.get("user_key")}
             for entry in page:
-                if _time_budget_exhausted(context) or _must_leave_for_send_and_commit(context):
+                if _should_stop_scanning(context) or _must_leave_for_send_and_commit(context):
                     early_send_triggered = True
                     break
                 scanned_rows += 1
@@ -1589,7 +1609,6 @@ def lambda_handler(event, context):
                         e["pid"] = pid
                         e["project"] = project_name_map.get(int(pid), "No project")
                 if "updated" not in e and "at" in e:
-                    e["updated"] = e.get("at")
                     e["updated"] = e.get("at")
                 if "dur" not in e and "duration" in e:
                     e["dur"] = max(0, int(e.get("duration") or 0)) * 1000
@@ -1643,24 +1662,24 @@ def lambda_handler(event, context):
                 if not needs_upsert:
                     continue  # no DB change & no notification
 
-                # --- Build message & decide notification ---
+                # --- Build message & decide notification (with emojis) ---
                 webhook_url = wh
                 should_notify = False
                 diff_lines = []
                 updated_dt = parse_iso(norm["updated_iso"], now) if norm["updated_iso"] else now
-                label = "New Time Entry Added"
+                label = "🆕 New Time Entry Added"
 
                 if first_seen:
                     should_notify = True
                     if updated_dt < since:
-                        label = "Backfill Time Entry Added"
+                        label = "🆕 Backfill Time Entry Added"
                 else:
                     if (prev_updated and updated_dt > prev_updated) and (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
                         should_notify = True
-                        label = "Time Entry Edited"
+                        label = "✍️ Time Entry Edited"
                         if changed_time:
                             prev_dur_ms = int(prev_snap.get("dur_ms", 0))
-                            diff_lines.append(f"? Time {_format_delta_ms(norm['dur_seconds']*1000 - prev_dur_ms)}")
+                            diff_lines.append(f"Δ Time {_format_delta_ms(norm['dur_seconds']*1000 - prev_dur_ms)}")
                         if changed_proj:
                             diff_lines.append("Project changed")
                         if changed_desc:
@@ -1676,7 +1695,7 @@ def lambda_handler(event, context):
                             diff_lines.append("Tags " + " ".join(bits) if bits else "Tags changed")
                         if changed_start:
                             prev_start_dt = parse_iso(prev_snap.get("start_iso") or "", now) if prev_snap.get("start_iso") else start_dt
-                            diff_lines.append(f"? Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
+                            diff_lines.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
 
                 if not webhook_url or not should_notify:
                     continue
@@ -1687,36 +1706,37 @@ def lambda_handler(event, context):
                 prev_proj = prev_snap.get("project") if prev_snap else norm["project"]
                 old_set = set(prev_snap.get("tags") or []) if prev_snap else set(norm["tags"] or [])
 
-                changed_proj_flag = (label.startswith("Time Entry Edited") and changed_proj)
-                changed_tags_flag = (label.startswith("Time Entry Edited") and changed_tags)
-                changed_desc_flag = (label.startswith("Time Entry Edited") and changed_desc)
-                changed_time_flag = (label.startswith("Time Entry Edited") and changed_time)
-                changed_start_flag= (label.startswith("Time Entry Edited") and changed_start)
+                is_edit = label.startswith("✍️")
+                changed_proj_flag = (is_edit and changed_proj)
+                changed_tags_flag = (is_edit and changed_tags)
+                changed_desc_flag = (is_edit and changed_desc)
+                changed_time_flag = (is_edit and changed_time)
+                changed_start_flag= (is_edit and changed_start)
 
                 lines = [
                     f"## {label}",
-                    f"?? **User**: {user_name}",
-                    f"?? **Project:** {norm['project'] if not changed_proj_flag else f'~~{prev_proj}~~ {norm['project']}'}",
-                    "??? **Tags:** " + (
+                    f"👤 **User**: {user_name}",
+                    f"📁 **Project:** {norm['project'] if not changed_proj_flag else f'~~{prev_proj}~~ {norm['project']}'}",
+                    "🏷️ **Tags:** " + (
                         (", ".join(norm["tags"]) if norm["tags"] else "No tags") if not changed_tags_flag
                         else f"~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(norm['tags'])) or 'No tags'}"
                     ),
-                    "?? **Task:** " + (
+                    "📝 **Task:** " + (
                         f"~~{_truncate(prev_desc)}~~ {_truncate(norm['description'])}" if changed_desc_flag
                         else _truncate(norm["description"])
                     ),
-                    "?? **Time Tracked:** " + (
+                    "⏱️ **Time Tracked:** " + (
                         f"~~{convert_ms_to_hms(prev_dur_ms)}~~ {convert_ms_to_hms(norm['dur_seconds']*1000)}" if changed_time_flag
                         else convert_ms_to_hms(norm["dur_seconds"]*1000)
                     ),
-                    "??? **Start:** " + (
+                    "🗓️ **Start:** " + (
                         f"~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}" if changed_start_flag
                         else start_dt.strftime('%Y-%m-%d %H:%M:%S')
                     ),
-                    f"?? **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                    "�"
+                    f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+                    "—"
                 ]
-                if label.startswith("Time Entry Edited") and diff_lines:
+                if is_edit and diff_lines:
                     lines.insert(-1, "**changes:** " + "; ".join(diff_lines))
 
                 outbox.setdefault(wh, []).append("\n".join(lines))
@@ -1797,7 +1817,7 @@ def lambda_handler(event, context):
         }
 
     # ==========================
-    # Deletion detection (notify mode only)
+    # Deletion detection (notify mode only) — best-effort if time allows
     # ==========================
     if not _time_budget_exhausted(context) and _remaining_s(context) > (SEND_RESERVE_S // 2):
         for eid, info in notion_entries_by_id.items():
@@ -1837,33 +1857,22 @@ def lambda_handler(event, context):
     # ==========================
     # Send Discord messages (top priority)
     # ==========================
-    successful_webhooks = set()
-    if NOTIFY_ENABLED and outbox and not _time_budget_exhausted(context):
-        max_workers = min(8, len(outbox))
-        futures = []
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for wh, msgs in outbox.items():
-                futures.append(ex.submit(_send_all_for_webhook, wh, msgs))
-            for f in as_completed(futures):
-                try:
-                    wh_url, sent_chunks = f.result()
-                    if sent_chunks > 0:
-                        successful_webhooks.add(wh_url)
-                except Exception as e:
-                    _alert(f"send pool: {e}")
-
     # ==========================
-    # COMMIT after successful notifications
+    # Send + Commit inline (per message)
     # ==========================
     committed_ops = {"created": 0, "updated": 0}
-    if not _time_budget_exhausted(context):
-        for wh, payloads in pending_by_webhook.items():
-            if wh not in successful_webhooks:
-                _alert(f"Notion upserts skipped for webhook (send failed): {wh}")
-                continue
-            for p in payloads:
+    if NOTIFY_ENABLED and not _time_budget_exhausted(context):
+        for wh, msgs in outbox.items():
+            payloads = pending_by_webhook.get(wh, [])
+            count = min(len(msgs), len(payloads))
+            for i in range(count):
                 if _time_budget_exhausted(context) or _remaining_s(context) <= FINAL_RESERVE_S:
                     break
+                msg = msgs[i]
+                p = payloads[i]
+                sent = send_discord_with_backoff(wh, msg, timeout=HTTP_TIMEOUT)
+                if not sent:
+                    continue
                 notion_queue_entry(
                     entry_id=p["entry_id"],
                     user_key=p["user_key"],
@@ -1878,16 +1887,9 @@ def lambda_handler(event, context):
                     description=p["description"],
                     deleted=p["deleted"]
                 )
-                if len(_notion_queue) >= NOTION_FLUSH_EVERY // 2:
-                    res = notion_flush_queue(context=context)
-                    committed_ops["created"] += res.get("created", 0)
-                    committed_ops["updated"] += res.get("updated", 0)
-
-            if _notion_queue and not _time_budget_exhausted(context):
                 res = notion_flush_queue(context=context)
                 committed_ops["created"] += res.get("created", 0)
                 committed_ops["updated"] += res.get("updated", 0)
-
     # ==========================
     # Quiet-run catch-up (notify mode): if zero notifications, create-only in live window
     # ==========================
