@@ -386,6 +386,84 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
     _alert(f"[WARN] Notion {method} exhausted retries: {url}")
     return None
 
+# ---- Team Members index + fuzzy match ----
+_TEAM_MEM_INDEX: list[tuple[str, str, str]] = []  # (norm_name, orig_name, page_id)
+_TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
+
+def _norm_for_match(s: str) -> str:
+    s = (s or "").lower()
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace():
+            out.append(ch)
+        else:
+            out.append(" ")
+    s2 = "".join(out)
+    return " ".join(s2.split())
+
+def _tokenize(s: str) -> set[str]:
+    return set(_norm_for_match(s).split())
+
+def notion_build_team_members_index():
+    if not NOTION_TEAM_DB_ID or _TEAM_MEM_INDEX:
+        return
+    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query"
+    payload = {"page_size": 100}
+    cursor = None
+    while True:
+        body = dict(payload)
+        if cursor:
+            body["start_cursor"] = cursor
+        r = _notion_request('POST', url, json_body=body)
+        if not r or r.status_code != 200:
+            break
+        data = r.json() or {}
+        for pg in data.get("results") or []:
+            pid = pg.get("id")
+            props = pg.get("properties", {})
+            # assume title prop named "Name"
+            name = ""
+            t = props.get("Name", {})
+            if t.get("type") == "title":
+                for part in (t.get("title") or []):
+                    name += part.get("plain_text", "")
+            name = (name or "").strip()
+            if pid and name:
+                _TEAM_MEM_INDEX.append((_norm_for_match(name), name, pid))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+
+def _best_team_member_page_id(user_display: str) -> str | None:
+    if not NOTION_TEAM_DB_ID or not user_display:
+        return None
+    key = _norm_for_match(user_display)
+    if key in _TEAM_MEM_BEST_CACHE:
+        return _TEAM_MEM_BEST_CACHE[key]
+    if not _TEAM_MEM_INDEX:
+        notion_build_team_members_index()
+    best_pid = None
+    best_score = 0.0
+    in_tokens = _tokenize(user_display)
+    in_norm = _norm_for_match(user_display)
+    for cand_norm, _orig, cand_pid in _TEAM_MEM_INDEX:
+        cand_tokens = set(cand_norm.split())
+        inter = len(in_tokens & cand_tokens)
+        union = len(in_tokens | cand_tokens)
+        jacc = (inter / union) if union else 0.0
+        bonus = 0.0
+        if cand_norm.startswith(in_norm) or in_norm.startswith(cand_norm):
+            bonus += 0.15
+        if in_norm and cand_norm and (in_norm in cand_norm or cand_norm in in_norm):
+            bonus += 0.10
+        score = jacc + bonus
+        if score > best_score:
+            best_score = score
+            best_pid = cand_pid
+    pid = best_pid if best_score >= 0.25 else None
+    _TEAM_MEM_BEST_CACHE[key] = pid
+    return pid
+
 def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
     out = {}; url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     payload = {"page_size":100, "filter": {"and":[
@@ -495,6 +573,9 @@ def lambda_handler(event, context):
         user_map_norm={_norm(k):v for k,v in user_map.items()}
     else:
         user_map={}; user_map_norm={}
+    # Load Team Members index (for relation mapping) if configured
+    if NOTION_TEAM_DB_ID:
+        notion_build_team_members_index()
 
     now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
     notified=0; skipped_notifies=0; skipped_deletions=0
@@ -515,11 +596,18 @@ def lambda_handler(event, context):
             print(f"[DEBUG] Fetched {len(entries)} entries from workspace {wid}")
             for e in entries:
                 eid=str(e.get("id") or ""); user=e.get("user") or ""; desc=e.get("description") or "No description"; proj=e.get("project") or "No project"; tags=e.get("tags") or []
-                dur_ms=int(e.get("dur") or 0); start_s=e.get("start") or ""; upd_s=e.get("updated") or e.get("at") or ""; uid=e.get("uid")
+                dur_ms=int(e.get("dur") or 0); start_s=e.get("start") or ""; end_s=e.get("end") or ""; upd_s=e.get("updated") or e.get("at") or ""; uid=e.get("uid")
                 if not eid or not user: continue
                 wh=None
                 if NOTIFY_ENABLED: wh=user_map.get(user) or user_map_norm.get(_norm(user))
                 start_dt=datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if start_s else now
+                if end_s:
+                    try:
+                        end_dt = datetime.strptime(end_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z")
+                    except Exception:
+                        end_dt = start_dt + timedelta(milliseconds=max(0,dur_ms))
+                else:
+                    end_dt = start_dt + timedelta(milliseconds=max(0,dur_ms))
                 upd_dt=datetime.strptime(upd_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if upd_s else now
                 state_key=f"uid:{uid}" if uid is not None else f"name:{_norm(user)}"; notion_user_key=f"user:{uid}" if uid is not None else user
                 if state_key not in user_runtime:
@@ -545,7 +633,7 @@ def lambda_handler(event, context):
                 bucket["current_ids"].add(eid)
                 seen_updates[eid] = upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                 if eid not in seen_ids: state["seen_entries"].append(eid)
-                snaps[eid] = {"dur": dur_ms, "desc": desc, "project": proj, "tags": list(tags), "start": start_s, "updated": upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")}
+                snaps[eid] = {"dur": dur_ms, "desc": desc, "project": proj, "tags": list(tags), "start": start_s, "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(), "updated": upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
                 existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
                 notion_entry={
@@ -555,6 +643,7 @@ def lambda_handler(event, context):
                     "tags": tags,
                     "dur": dur_ms,
                     "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                    "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
                     "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
                     "description": desc,
                 }
