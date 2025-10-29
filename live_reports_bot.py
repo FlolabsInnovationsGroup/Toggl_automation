@@ -30,7 +30,7 @@ SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", True)
 NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
 
 # Deadline-aware controls and throughput priorities
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "180"))  # soft cap when context missing
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "12"))   # leave safety margin for shutdown
 PRIORITIZE_NOTION = _env_bool("PRIORITIZE_NOTION", True)  # skip Discord send if time is tight
 NOTIFY_FLUSH_EVERY = int(os.getenv("NOTIFY_FLUSH_EVERY", "25"))  # flush per-webhook after N messages
@@ -71,6 +71,9 @@ NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "4"))  # threads for No
 NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "4"))
 MAX_USERS_NOTION_INDEX = int(os.getenv("MAX_USERS_NOTION_INDEX", "80"))  # cap user-index Notion queries per run
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
+MAX_TARGETED_LOOKUPS_PER_RUN = int(os.getenv("MAX_TARGETED_LOOKUPS_PER_RUN", "0"))
+MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "80"))
+MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 
 _NOTION_LAST_CALL = 0.0
 try:
@@ -490,6 +493,196 @@ def _best_team_member_page_id(user_display: str) -> str | None:
     _TEAM_MEM_BEST_CACHE[key] = pid
     return pid
 
+# ---- Targeted Notion lookup by Entry ID (to avoid duplicates/false-new) ----
+_EID_LOOKUP_CACHE: dict[str, dict] = {}
+_TARGETED_LOOKUPS_USED = 0
+
+def _notion_find_entry_by_eid(eid: str) -> dict | None:
+    global _TARGETED_LOOKUPS_USED
+    if not eid:
+    return None
+
+def _notion_find_all_by_eid(eid: str) -> list[dict]:
+    """Return all exact-match pages for this Entry ID with snapshots."""
+    if not eid:
+        return []
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+
+    def _query_filter(flt: dict):
+        body = {"page_size": 50, "filter": flt}
+        r = _notion_request('POST', url, json_body=body)
+        if not r or r.status_code != 200:
+            return []
+        data = r.json() or {}
+        return data.get("results") or []
+
+    results = []
+    if eid.isdigit():
+        results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
+        if not results:
+            results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
+    else:
+        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
+
+    out = []
+    for pg in results:
+        pid = pg.get("id")
+        props = pg.get("properties", {})
+        p = props.get(P_ENTRY_ID, {})
+        exact = False
+        if p.get("type") == "number" and eid.isdigit():
+            exact = (p.get("number") is not None and int(p.get("number")) == int(eid))
+        elif p.get("type") == "rich_text":
+            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
+            exact = (txt == eid)
+        if not exact:
+            continue
+        def _get_date(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or ""
+        def _get_range(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or "", d.get("end") or ""
+        def _get_num(n):
+            q = props.get(n, {})
+            return q.get("number") if q.get("type") == "number" else 0
+        def _get_text(n):
+            q = props.get(n, {})
+            return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
+        def _get_sel(n):
+            q = props.get(n, {})
+            return (q.get("select") or {}).get("name") or "No project"
+        def _get_tags(n):
+            q = props.get(n, {})
+            return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
+        start_s, end_s = _get_range(P_DATE)
+        snap = {
+            "dur": int(_get_num(P_DURATION) or 0) * 1000,
+            "desc": _get_text(P_DESCRIPTION),
+            "project": _get_sel(P_PROJECT),
+            "tags": _get_tags(P_TAGS),
+            "start": start_s,
+            "end": end_s,
+            "updated": _get_date(P_UPDATED),
+        }
+        out.append({"page_id": pid, "snap": snap})
+    return out
+
+def notion_cleanup_duplicates_for_ids(eids: set[str], context) -> dict:
+    """For each Entry ID, keep the latest-updated page; mark other duplicates Deleted."""
+    cleaned = 0
+    examined = 0
+    for eid in list(eids)[:MAX_DEDUPE_IDS_PER_RUN]:
+        if _should_exit_soon(context):
+            break
+        candidates = _notion_find_all_by_eid(eid)
+        exact = candidates
+        if len(exact) <= 1:
+            continue
+        examined += 1
+        # Choose canonical: most recent Updated
+        def _ts(c):
+            s = (c.get("snap", {}).get("updated") or "")
+            try:
+                return datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+            except Exception:
+                return datetime.min.replace(tzinfo=timezone.utc)
+        exact.sort(key=_ts, reverse=True)
+        keep = exact[0]
+        losers = exact[1:MAX_DEDUPE_MARKS_PER_ID+1]
+        for loser in losers:
+            if _should_exit_soon(context):
+                break
+            pid = loser.get("page_id")
+            if pid:
+                _notion_mark_deleted(pid)
+                cleaned += 1
+    return {"examined": examined, "cleaned": cleaned}
+    if eid in _EID_LOOKUP_CACHE:
+        return _EID_LOOKUP_CACHE[eid]
+    # if limit <= 0, treat as unlimited
+    if MAX_TARGETED_LOOKUPS_PER_RUN > 0 and _TARGETED_LOOKUPS_USED >= MAX_TARGETED_LOOKUPS_PER_RUN:
+        return None
+    _TARGETED_LOOKUPS_USED += 1
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+
+    def _query_filter(flt: dict):
+        body = {"page_size": 25, "filter": flt}
+        r = _notion_request('POST', url, json_body=body)
+        if not r or r.status_code != 200:
+            return []
+        data = r.json() or {}
+        return data.get("results") or []
+
+    # Try number equals first for digit-only ids; then fallback to rich_text contains
+    results = []
+    if eid.isdigit():
+        results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
+        if not results:
+            results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
+    else:
+        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
+
+    candidates = []
+    for pg in results:
+        pid = pg.get("id")
+        props = pg.get("properties", {})
+        # Verify exact match on Entry ID
+        p = props.get(P_ENTRY_ID, {})
+        exact = False
+        if p.get("type") == "number" and eid.isdigit():
+            exact = (p.get("number") is not None and int(p.get("number")) == int(eid))
+        elif p.get("type") == "rich_text":
+            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
+            exact = (txt == eid)
+        if not exact:
+            continue
+        # Build snapshot similar to _notion_query_user
+        def _get_date(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or ""
+        def _get_range(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or "", d.get("end") or ""
+        def _get_num(n):
+            q = props.get(n, {})
+            return q.get("number") if q.get("type") == "number" else 0
+        def _get_text(n):
+            q = props.get(n, {})
+            return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
+        def _get_sel(n):
+            q = props.get(n, {})
+            return (q.get("select") or {}).get("name") or "No project"
+        def _get_tags(n):
+            q = props.get(n, {})
+            return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
+        start_s, end_s = _get_range(P_DATE)
+        updated_s = _get_date(P_UPDATED)
+        snap = {
+            "dur": int(_get_num(P_DURATION) or 0) * 1000,
+            "desc": _get_text(P_DESCRIPTION),
+            "project": _get_sel(P_PROJECT),
+            "tags": _get_tags(P_TAGS),
+            "start": start_s,
+            "end": end_s,
+            "updated": updated_s,
+        }
+        candidates.append({"page_id": pid, "snap": snap})
+
+    if not candidates:
+        _EID_LOOKUP_CACHE[eid] = None
+        return None
+
+    # Prefer the most recently updated candidate
+    def _ts(s):
+        try:
+            return datetime.strptime((s or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    best = max(candidates, key=lambda c: _ts(c["snap"].get("updated")))
+    _EID_LOOKUP_CACHE[eid] = best
+    return best
+
 def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
     out = {}; url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     payload = {"page_size":100, "filter": {"and":[
@@ -526,6 +719,11 @@ def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
 
 def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False):
     eid=str(entry.get("id"))
+    # Guard against duplicates: if we think it doesn't exist, double-check by Entry ID
+    if not existing or not existing.get("page_id"):
+        found = _notion_find_entry_by_eid(eid)
+        if found:
+            existing = found
     props={
         P_USER_KEY: _title_val(user_key),
         P_ENTRY_ID: {"number": int(eid)} if eid.isdigit() else _rt_val(eid),
@@ -622,6 +820,7 @@ def lambda_handler(event, context):
     delete_tasks = []  # queued page_id for Deleted=true
     scheduled_upserts = set()  # (notion_user_key, eid)
     users_indexed = 0
+    processed_eids: set[str] = set()
 
     def _flush_webhook(wh: str):
         # Send messages (chunked), then run Notion upserts for this webhook
@@ -666,6 +865,7 @@ def lambda_handler(event, context):
                 eid=str(e.get("id") or ""); user=e.get("user") or ""; desc=e.get("description") or "No description"; proj=e.get("project") or "No project"; tags=e.get("tags") or []
                 dur_ms=int(e.get("dur") or 0); start_s=e.get("start") or ""; end_s=e.get("end") or ""; upd_s=e.get("updated") or e.get("at") or ""; uid=e.get("uid")
                 if not eid or not user: continue
+                processed_eids.add(eid)
                 wh=None
                 if NOTIFY_ENABLED: wh=user_map.get(user) or user_map_norm.get(_norm(user))
                 start_dt=datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if start_s else now
@@ -693,6 +893,19 @@ def lambda_handler(event, context):
                     except Exception: prev_upd=None
                 first_seen = prev_upd is None
                 prev_snap = snaps.get(eid, {})
+                # Systematic verification: if we don't have a snapshot for this EID, look it up in Notion now
+                if not prev_snap:
+                    found = _notion_find_entry_by_eid(eid)
+                    if found:
+                        fs = found.get("snap") or {}
+                        snaps[eid] = {**fs, "page_id": found.get("page_id")}
+                        seen_updates[eid] = fs.get("updated") or ""
+                        try:
+                            prev_upd = datetime.strptime((fs.get("updated") or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+                        except Exception:
+                            prev_upd = None
+                        first_seen = prev_upd is None
+                        prev_snap = snaps.get(eid, {})
                 prev_dur  = int(prev_snap.get("dur", dur_ms))
                 prev_desc = prev_snap.get("desc", desc)
                 prev_proj = prev_snap.get("project", proj)
@@ -721,17 +934,17 @@ def lambda_handler(event, context):
                     if HARD_START_FILTER and start_dt < since: continue
                     if upd_dt >= since: should_notify=True; label="🆕 New Time Entry Added"
                 else:
-                    if prev_upd and upd_dt > prev_upd and upd_dt >= since:
+                    if changed_time: dif.append(f"Δ Time {_format_delta_ms(dur_ms - prev_dur)}")
+                    if changed_proj: dif.append("Project changed")
+                    if changed_desc: dif.append("Description changed")
+                    if changed_tags:
+                        add=sorted(list(new_set-old_set)); rem=sorted(list(old_set-new_set)); bits=[]
+                        if add: bits.append("+"+", ".join(add))
+                        if rem: bits.append("-"+", ".join(rem))
+                        dif.append("Tags "+" ".join(bits) if bits else "Tags changed")
+                    if changed_start: dif.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
+                    if dif:
                         should_notify=True; label="✍️ Time Entry Edited"
-                        if changed_time: dif.append(f"Δ Time {_format_delta_ms(dur_ms - prev_dur)}")
-                        if changed_proj: dif.append("Project changed")
-                        if changed_desc: dif.append("Description changed")
-                        if changed_tags:
-                            add=sorted(list(new_set-old_set)); rem=sorted(list(old_set-new_set)); bits=[]
-                            if add: bits.append("+"+", ".join(add))
-                            if rem: bits.append("-"+", ".join(rem))
-                            dif.append("Tags "+" ".join(bits) if bits else "Tags changed")
-                        if changed_start: dif.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
                 if not should_notify:
                     continue
                 if NOTIFY_ENABLED:
@@ -865,5 +1078,14 @@ def lambda_handler(event, context):
                     f.result()
                 except Exception as e:
                     _alert(f"[ERROR] Notion delete task: {e}")
+
+    # Cleanup duplicates for processed Entry IDs (keep latest updated; mark others Deleted)
+    if processed_eids and not _should_exit_soon(context):
+        try:
+            stats = notion_cleanup_duplicates_for_ids(processed_eids, context)
+            if stats.get("cleaned"):
+                _alert(f"[INFO] Dedupe: examined={stats.get('examined')} cleaned={stats.get('cleaned')}")
+        except Exception as e:
+            _alert(f"[ERROR] Dedupe failed: {e}")
 
     return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":skipped_deletions,"dry_run_no_send":DRY_RUN_NO_SEND,"send_notifications":SEND_NOTIFICATIONS,"notify_enabled":NOTIFY_ENABLED}
