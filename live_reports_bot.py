@@ -2,6 +2,7 @@ import os, json, base64, requests, csv, time, random
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import boto3
 
 SESSION = requests.Session()
 _START_TS = time.monotonic()
@@ -29,6 +30,7 @@ SEND_ALERT = _env_bool("SEND_ALERT", False)
 DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
 SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", True)
 NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
+SEND_ALERT = _env_bool("SEND_ALERT", True)
 
 # Deadline-aware controls and throughput priorities
 MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
@@ -62,12 +64,12 @@ P_UPDATED     = os.getenv("NOTION_PROP_UPDATED", "Updated")
 P_DURATION    = os.getenv("NOTION_PROP_DURATION", "Duration")
 P_WORKSPACE   = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")
 P_DESCRIPTION = os.getenv("NOTION_PROP_DESCRIPTION", "Description")
-P_DELETED     = os.getenv("NOTION_PROP_DELETED", "Deleted")
 P_TEAM_MEMBER = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "").strip()
+DYNAMODB_TABLE = os.getenv("DYNAMODB_TABLE", "").strip()
 
 # Notion throughput knobs
-NOTION_RPS = float(os.getenv("NOTION_RPS", "3.0"))            # target rps (global per integration)
+NOTION_RPS = float(os.getenv("NOTION_RPS", "2"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "4"))  # threads for Notion writes
 NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "2"))
 MAX_USERS_NOTION_INDEX = int(os.getenv("MAX_USERS_NOTION_INDEX", "80"))  # cap user-index Notion queries per run
@@ -172,6 +174,41 @@ def _eid_lock(eid: str):
             return lk
     except Exception:
         return _NOTION_LOCK
+
+# ------------------ DynamoDB (deletion-only state) ------------------
+_dynamodb = None
+_ddb_table = None
+try:
+    if DYNAMODB_TABLE:
+        _dynamodb = boto3.resource("dynamodb")
+        _ddb_table = _dynamodb.Table(DYNAMODB_TABLE)
+except Exception:
+    _ddb_table = None
+
+def _ddb_get_last_seen_map(user_key: str) -> dict:
+    if not (_ddb_table and user_key):
+        return {}
+    try:
+        resp = _ddb_table.get_item(Key={"user_name": user_key})
+        item = resp.get("Item") or {}
+        m = item.get("last_seen", {}) or {}
+        # normalize keys to str
+        return {str(k): str(v) for k, v in m.items()}
+    except Exception:
+        return {}
+
+def _ddb_put_last_seen_map(user_key: str, last_seen: dict):
+    if not (_ddb_table and user_key):
+        return
+    try:
+        _ddb_table.update_item(
+            Key={"user_name": user_key},
+            UpdateExpression="SET last_seen = :ls",
+            ExpressionAttributeValues={":ls": last_seen},
+        )
+    except Exception:
+        # soft-fail
+        pass
 
 def _alert(msg: str):
     print(f"[ALERT] {msg}")
@@ -783,7 +820,7 @@ def notion_cleanup_duplicates_for_ids(eids: set[str], context, keep_ids: set[str
                 break
             pid = loser.get("page_id")
             if pid:
-                _notion_mark_deleted(pid)
+                _notion_archive_page(pid)
                 cleaned += 1
     return {"examined": examined, "cleaned": cleaned}
 
@@ -837,12 +874,6 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         P_WORKSPACE:_num_val(int(workspace_id or 0)),
         P_DESCRIPTION: _rt_val(entry.get("description") or ""),
     }
-    # Only include Deleted if it's a checkbox in DB
-    try:
-        if _notion_prop_type(P_DELETED) == "checkbox":
-            props[P_DELETED] = {"checkbox": False}
-    except Exception:
-        pass
     # Team Member relation if available
     if NOTION_TEAM_DB_ID and P_TEAM_MEMBER:
         tm_pid = _best_team_member_page_id(entry.get("user") or "")
@@ -891,9 +922,11 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
                     return page_id
         return None
 
-def _notion_mark_deleted(page_id: str):
-    if not page_id: return
-    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":{P_DELETED:{"checkbox":True}}})
+def _notion_archive_page(page_id: str):
+    if not page_id:
+        return
+    # Archive the page (removes it from the database view)
+    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"archived": True})
 
 # Deleted msg
 def _strike(s:str)->str: return f"~~{s}~~"
@@ -1029,7 +1062,17 @@ def lambda_handler(event, context):
                         idx=_notion_query_user(notion_user_key,since,now)
                         state={"seen_entries":list(idx.keys()),"seen_updates":{k:idx[k]["snap"].get("updated") or "" for k in idx},"seen_snapshots":{k:{**idx[k]["snap"],"page_id":idx[k]["page_id"]} for k in idx}}
                         users_indexed += 1
-                    user_runtime[state_key]={"current_ids":set(),"user_name":user,"webhook":wh,"state":state,"notion_user_key":notion_user_key}
+                    # Attach DynamoDB last_seen state
+                    ddb_last_seen = _ddb_get_last_seen_map(state_key)
+                    user_runtime[state_key]={
+                        "current_ids":set(),
+                        "user_name":user,
+                        "webhook":wh,
+                        "state":state,
+                        "notion_user_key":notion_user_key,
+                        "ddb_last_seen": ddb_last_seen,
+                        "ddb_dirty": False,
+                    }
                 bucket=user_runtime[state_key]; state=bucket["state"]
                 seen_ids=set(state["seen_entries"]); seen_updates=state["seen_updates"]; snaps=state["seen_snapshots"]
                 prev_upd_s=seen_updates.get(eid); prev_upd=None
@@ -1068,6 +1111,14 @@ def lambda_handler(event, context):
                 seen_updates[eid] = upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                 if eid not in seen_ids: state["seen_entries"].append(eid)
                 snaps[eid] = {"dur": dur_ms, "desc": desc, "project": proj, "tags": list(tags), "start": start_s, "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(), "updated": upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")}
+                # Touch DynamoDB last_seen for deletion confirmation
+                try:
+                    dmap = bucket.get("ddb_last_seen")
+                    if isinstance(dmap, dict):
+                        dmap[eid] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+                        bucket["ddb_dirty"] = True
+                except Exception:
+                    pass
 
                 if NOTIFY_ENABLED and not wh:
                     if first_seen and user not in warned:
@@ -1169,6 +1220,7 @@ def lambda_handler(event, context):
     # Deletions
     for sk,b in user_runtime.items():
         cur=b["current_ids"]; user=b["user_name"]; wh=b["webhook"]; st=b["state"]; snaps=st.get("seen_snapshots",{});
+        ddb_map = b.get("ddb_last_seen", {}) if isinstance(b.get("ddb_last_seen"), dict) else {}
         for eid in list(st.get("seen_entries",[])):
             if eid in cur: continue
             snap=snaps.get(eid);  
@@ -1177,9 +1229,27 @@ def lambda_handler(event, context):
                 s=snap.get("start") or ""; sdt=datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if s else None
             except Exception: sdt=None
             if not (sdt and sdt>=since): continue
+            # Confirm via DynamoDB last_seen grace
+            ls_iso = ddb_map.get(eid)
+            ls_dt = None
+            try:
+                if ls_iso:
+                    ls_dt = datetime.strptime(ls_iso.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+            except Exception:
+                ls_dt = None
+            if ls_dt is not None and (datetime.now(timezone.utc) - ls_dt) < timedelta(minutes=int(os.getenv("DELETION_GRACE_MINUTES","60"))):
+                continue
             if snap.get("page_id"): delete_tasks.append(snap.get("page_id"))
             if not NOTIFY_ENABLED or not wh: skipped_deletions+=1
             else: outbox.setdefault(wh,[]).append(_format_deleted_message(user,snap)); notified+=1
+
+    # Persist DynamoDB last_seen maps
+    for sk, b in user_runtime.items():
+        try:
+            if b.get("ddb_dirty") and isinstance(b.get("ddb_last_seen"), dict):
+                _ddb_put_last_seen_map(sk, b.get("ddb_last_seen"))
+        except Exception:
+            pass
 
     # Send each webhook batch first, then upsert only those entries that were notified for that webhook
     if NOTIFY_ENABLED and outbox:
@@ -1224,12 +1294,12 @@ def lambda_handler(event, context):
     if delete_tasks and not _should_exit_soon(context):
         max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_notion_mark_deleted, pid) for pid in delete_tasks]
+            futs = [ex.submit(_notion_archive_page, pid) for pid in delete_tasks]
             for f in as_completed(futs):
                 try:
                     f.result()
                 except Exception as e:
-                    _alert(f"[ERROR] Notion delete task: {e}")
+                    _alert(f"[ERROR] Notion archive task: {e}")
 
     # Cleanup duplicates for processed Entry IDs (keep latest updated; mark others Deleted)
     if processed_eids and not _should_exit_soon(context):
