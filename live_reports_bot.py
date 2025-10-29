@@ -75,15 +75,59 @@ MAX_TARGETED_LOOKUPS_PER_RUN = int(os.getenv("MAX_TARGETED_LOOKUPS_PER_RUN", "0"
 MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "80"))
 MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 
+# Cached Notion schema (property name -> type)
+_NOTION_SCHEMA: dict[str, str] = {}
+
+def _notion_prop_type(prop_name: str) -> str | None:
+    """Return Notion property type for the Time Entries database (cached)."""
+    try:
+        if prop_name in _NOTION_SCHEMA:
+            return _NOTION_SCHEMA.get(prop_name)
+        # Load schema once
+        url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}"
+        r = _notion_request('GET', url)
+        if not r or r.status_code != 200:
+            return None
+        js = r.json() or {}
+        props = js.get("properties") or {}
+        for name, meta in props.items():
+            t = (meta or {}).get("type")
+            if t:
+                _NOTION_SCHEMA[name] = t
+        return _NOTION_SCHEMA.get(prop_name)
+    except Exception:
+        return None
+
 _NOTION_LAST_CALL = 0.0
 try:
     from threading import Lock
     _NOTION_LOCK = Lock()
+    _EID_LOCKS_GUARD = Lock()
+    _EID_LOCKS: dict[str, Lock] = {}
 except Exception:
     class _Noop:
         def __enter__(self): pass
         def __exit__(self, *a): pass
     _NOTION_LOCK = _Noop()
+    _EID_LOCKS_GUARD = _Noop()
+    _EID_LOCKS = {}
+
+def _eid_lock(eid: str):
+    try:
+        if not eid:
+            return _NOTION_LOCK
+        with _EID_LOCKS_GUARD:
+            lk = _EID_LOCKS.get(eid)
+            if lk is None:
+                # If Lock is not available (fallback _Noop), return that
+                try:
+                    lk = Lock()  # type: ignore[name-defined]
+                except Exception:
+                    lk = _NOTION_LOCK
+                _EID_LOCKS[eid] = lk
+            return lk
+    except Exception:
+        return _NOTION_LOCK
 
 def _alert(msg: str):
     print(f"[ALERT] {msg}")
@@ -500,7 +544,97 @@ _TARGETED_LOOKUPS_USED = 0
 def _notion_find_entry_by_eid(eid: str) -> dict | None:
     global _TARGETED_LOOKUPS_USED
     if not eid:
-    return None
+        return None
+    if eid in _EID_LOOKUP_CACHE:
+        return _EID_LOOKUP_CACHE[eid]
+    # if limit <= 0, treat as unlimited
+    if MAX_TARGETED_LOOKUPS_PER_RUN > 0 and _TARGETED_LOOKUPS_USED >= MAX_TARGETED_LOOKUPS_PER_RUN:
+        return None
+    _TARGETED_LOOKUPS_USED += 1
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+
+    def _query_filter(flt: dict):
+        body = {"page_size": 100, "filter": flt}
+        r = _notion_request('POST', url, json_body=body)
+        if not r or r.status_code != 200:
+            return []
+        data = r.json() or {}
+        return data.get("results") or []
+
+    # Choose filter type based on actual Notion schema
+    prop_type = _notion_prop_type(P_ENTRY_ID)
+    results = []
+    if prop_type == "number":
+        if not eid.isdigit():
+            return None
+        results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
+    elif prop_type == "rich_text":
+        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
+    else:
+        # Fallback (unknown schema): prefer exact rich_text equals, then number equals if digits
+        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
+        if not results and eid.isdigit():
+            results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
+
+    candidates = []
+    for pg in results:
+        pid = pg.get("id")
+        props = pg.get("properties", {})
+        # Verify exact match on Entry ID
+        p = props.get(P_ENTRY_ID, {})
+        exact = False
+        if p.get("type") == "number" and eid.isdigit():
+            exact = (p.get("number") is not None and int(p.get("number")) == int(eid))
+        elif p.get("type") == "rich_text":
+            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
+            exact = (txt == eid)
+        if not exact:
+            continue
+        # Build snapshot similar to _notion_query_user
+        def _get_date(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or ""
+        def _get_range(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or "", d.get("end") or ""
+        def _get_num(n):
+            q = props.get(n, {})
+            return q.get("number") if q.get("type") == "number" else 0
+        def _get_text(n):
+            q = props.get(n, {})
+            return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
+        def _get_sel(n):
+            q = props.get(n, {})
+            return (q.get("select") or {}).get("name") or "No project"
+        def _get_tags(n):
+            q = props.get(n, {})
+            return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
+        start_s, end_s = _get_range(P_DATE)
+        updated_s = _get_date(P_UPDATED)
+        snap = {
+            "dur": int(_get_num(P_DURATION) or 0) * 1000,
+            "desc": _get_text(P_DESCRIPTION),
+            "project": _get_sel(P_PROJECT),
+            "tags": _get_tags(P_TAGS),
+            "start": start_s,
+            "end": end_s,
+            "updated": updated_s,
+        }
+        candidates.append({"page_id": pid, "snap": snap})
+
+    if not candidates:
+        _EID_LOOKUP_CACHE[eid] = None
+        return None
+
+    # Prefer the most recently updated candidate
+    def _ts(s):
+        try:
+            return datetime.strptime((s or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    best = max(candidates, key=lambda c: _ts(c["snap"].get("updated")))
+    _EID_LOOKUP_CACHE[eid] = best
+    return best
 
 def _notion_find_all_by_eid(eid: str) -> list[dict]:
     """Return all exact-match pages for this Entry ID with snapshots."""
@@ -509,7 +643,7 @@ def _notion_find_all_by_eid(eid: str) -> list[dict]:
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
 
     def _query_filter(flt: dict):
-        body = {"page_size": 50, "filter": flt}
+        body = {"page_size": 100, "filter": flt}
         r = _notion_request('POST', url, json_body=body)
         if not r or r.status_code != 200:
             return []
@@ -517,12 +651,18 @@ def _notion_find_all_by_eid(eid: str) -> list[dict]:
         return data.get("results") or []
 
     results = []
-    if eid.isdigit():
+    prop_type = _notion_prop_type(P_ENTRY_ID)
+    if prop_type == "number":
+        if not eid.isdigit():
+            return []
         results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
-        if not results:
-            results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
+    elif prop_type == "rich_text":
+        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
     else:
-        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
+        # Fallback only if schema unknown; try text equals then number equals
+        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
+        if not results and eid.isdigit():
+            results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
 
     out = []
     for pg in results:
@@ -598,90 +738,6 @@ def notion_cleanup_duplicates_for_ids(eids: set[str], context) -> dict:
                 _notion_mark_deleted(pid)
                 cleaned += 1
     return {"examined": examined, "cleaned": cleaned}
-    if eid in _EID_LOOKUP_CACHE:
-        return _EID_LOOKUP_CACHE[eid]
-    # if limit <= 0, treat as unlimited
-    if MAX_TARGETED_LOOKUPS_PER_RUN > 0 and _TARGETED_LOOKUPS_USED >= MAX_TARGETED_LOOKUPS_PER_RUN:
-        return None
-    _TARGETED_LOOKUPS_USED += 1
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-
-    def _query_filter(flt: dict):
-        body = {"page_size": 25, "filter": flt}
-        r = _notion_request('POST', url, json_body=body)
-        if not r or r.status_code != 200:
-            return []
-        data = r.json() or {}
-        return data.get("results") or []
-
-    # Try number equals first for digit-only ids; then fallback to rich_text contains
-    results = []
-    if eid.isdigit():
-        results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
-        if not results:
-            results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
-    else:
-        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"contains": str(eid)}})
-
-    candidates = []
-    for pg in results:
-        pid = pg.get("id")
-        props = pg.get("properties", {})
-        # Verify exact match on Entry ID
-        p = props.get(P_ENTRY_ID, {})
-        exact = False
-        if p.get("type") == "number" and eid.isdigit():
-            exact = (p.get("number") is not None and int(p.get("number")) == int(eid))
-        elif p.get("type") == "rich_text":
-            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
-            exact = (txt == eid)
-        if not exact:
-            continue
-        # Build snapshot similar to _notion_query_user
-        def _get_date(n):
-            d = (props.get(n, {}).get("date") or {})
-            return d.get("start") or ""
-        def _get_range(n):
-            d = (props.get(n, {}).get("date") or {})
-            return d.get("start") or "", d.get("end") or ""
-        def _get_num(n):
-            q = props.get(n, {})
-            return q.get("number") if q.get("type") == "number" else 0
-        def _get_text(n):
-            q = props.get(n, {})
-            return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
-        def _get_sel(n):
-            q = props.get(n, {})
-            return (q.get("select") or {}).get("name") or "No project"
-        def _get_tags(n):
-            q = props.get(n, {})
-            return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
-        start_s, end_s = _get_range(P_DATE)
-        updated_s = _get_date(P_UPDATED)
-        snap = {
-            "dur": int(_get_num(P_DURATION) or 0) * 1000,
-            "desc": _get_text(P_DESCRIPTION),
-            "project": _get_sel(P_PROJECT),
-            "tags": _get_tags(P_TAGS),
-            "start": start_s,
-            "end": end_s,
-            "updated": updated_s,
-        }
-        candidates.append({"page_id": pid, "snap": snap})
-
-    if not candidates:
-        _EID_LOOKUP_CACHE[eid] = None
-        return None
-
-    # Prefer the most recently updated candidate
-    def _ts(s):
-        try:
-            return datetime.strptime((s or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-        except Exception:
-            return datetime.min.replace(tzinfo=timezone.utc)
-    best = max(candidates, key=lambda c: _ts(c["snap"].get("updated")))
-    _EID_LOOKUP_CACHE[eid] = best
-    return best
 
 def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
     out = {}; url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
@@ -719,11 +775,9 @@ def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
 
 def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False):
     eid=str(entry.get("id"))
-    # Guard against duplicates: if we think it doesn't exist, double-check by Entry ID
-    if not existing or not existing.get("page_id"):
-        found = _notion_find_entry_by_eid(eid)
-        if found:
-            existing = found
+    # Guard against duplicates: do lookup under an EID lock before create
+    lk = _eid_lock(eid)
+    # We intentionally keep the lock small in scope; we don't hold it across network requests
     props={
         P_USER_KEY: _title_val(user_key),
         P_ENTRY_ID: {"number": int(eid)} if eid.isdigit() else _rt_val(eid),
@@ -747,13 +801,32 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
             _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
     else:
-        body={"parent":{"database_id":NOTION_DATABASE_ID},"properties":props}
-        # include description as content on create to avoid a second call
-        if NOTION_ADD_DESCRIPTION_BLOCKS and (entry.get("description") or "").strip():
-            blk = _desc_block(entry.get("description") or "")
-            if blk:
-                body["children"] = [blk]
-        _notion_request('POST', "https://api.notion.com/v1/pages", json_body=body)
+        # Try to create idempotently: lock eid, lookup, then create, then on conflict lookup and patch
+        # 1) pre-create lookup under lock
+        with lk:
+            found = _notion_find_entry_by_eid(eid)
+            if found:
+                page_id = found.get("page_id")
+                if page_id:
+                    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
+                    if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
+                        _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
+                    return
+            # 2) attempt create
+            body={"parent":{"database_id":NOTION_DATABASE_ID},"properties":props}
+            if NOTION_ADD_DESCRIPTION_BLOCKS and (entry.get("description") or "").strip():
+                blk = _desc_block(entry.get("description") or "")
+                if blk:
+                    body["children"] = [blk]
+            r = _notion_request('POST', "https://api.notion.com/v1/pages", json_body=body)
+            if not r or r.status_code not in (200,201):
+                # 3) if failed (e.g., 409), lookup again and patch
+                found2 = _notion_find_entry_by_eid(eid)
+                if found2 and found2.get("page_id"):
+                    page_id = found2.get("page_id")
+                    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
+                    if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
+                        _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
 
 def _notion_mark_deleted(page_id: str):
     if not page_id: return
@@ -904,8 +977,13 @@ def lambda_handler(event, context):
                             prev_upd = datetime.strptime((fs.get("updated") or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
                         except Exception:
                             prev_upd = None
-                        first_seen = prev_upd is None
+                        # Notion page exists => not first seen, even if its 'Updated' is empty
+                        first_seen = False
                         prev_snap = snaps.get(eid, {})
+
+                # If we already have a Notion snapshot, treat as not first seen
+                if prev_snap:
+                    first_seen = False
                 prev_dur  = int(prev_snap.get("dur", dur_ms))
                 prev_desc = prev_snap.get("desc", desc)
                 prev_proj = prev_snap.get("project", proj)
