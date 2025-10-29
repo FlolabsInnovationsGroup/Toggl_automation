@@ -25,6 +25,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v == "" and default: return True
     return (v or "").strip().lower() in ("1","true","yes","y","on")
 
+SEND_ALERT = _env_bool("SEND_ALERT", False)
 DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
 SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", True)
 NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
@@ -68,7 +69,7 @@ NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "").strip()
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "3.0"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "4"))  # threads for Notion writes
-NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "4"))
+NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "2"))
 MAX_USERS_NOTION_INDEX = int(os.getenv("MAX_USERS_NOTION_INDEX", "80"))  # cap user-index Notion queries per run
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 MAX_TARGETED_LOOKUPS_PER_RUN = int(os.getenv("MAX_TARGETED_LOOKUPS_PER_RUN", "0"))
@@ -174,7 +175,7 @@ def _eid_lock(eid: str):
 
 def _alert(msg: str):
     print(f"[ALERT] {msg}")
-    if SYSTEM_ALERT_WEBHOOK:
+    if SYSTEM_ALERT_WEBHOOK and SEND_ALERT:
         try: SESSION.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
         except Exception: pass
 
@@ -653,7 +654,7 @@ def _notion_find_entry_by_eid(eid: str) -> dict | None:
             q = props.get(n, {})
             return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
         start_s, end_s = _get_range(P_DATE)
-        updated_s = _get_date(P_UPDATED)
+        updated_s = _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time")
         snap = {
             "dur": int(_get_num(P_DURATION) or 0) * 1000,
             "desc": _get_text(P_DESCRIPTION),
@@ -746,12 +747,12 @@ def _notion_find_all_by_eid(eid: str) -> list[dict]:
             "tags": _get_tags(P_TAGS),
             "start": start_s,
             "end": end_s,
-            "updated": _get_date(P_UPDATED),
+            "updated": _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time"),
         }
         out.append({"page_id": pid, "snap": snap})
     return out
 
-def notion_cleanup_duplicates_for_ids(eids: set[str], context) -> dict:
+def notion_cleanup_duplicates_for_ids(eids: set[str], context, keep_ids: set[str] | None = None) -> dict:
     """For each Entry ID, keep the latest-updated page; mark other duplicates Deleted."""
     cleaned = 0
     examined = 0
@@ -770,9 +771,13 @@ def notion_cleanup_duplicates_for_ids(eids: set[str], context) -> dict:
                 return datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
             except Exception:
                 return datetime.min.replace(tzinfo=timezone.utc)
-        exact.sort(key=_ts, reverse=True)
+        # Prefer known freshly upserted page if provided
+        if keep_ids:
+            exact.sort(key=lambda c: (c.get("page_id") in keep_ids, _ts(c)), reverse=True)
+        else:
+            exact.sort(key=_ts, reverse=True)
         keep = exact[0]
-        losers = exact[1:MAX_DEDUPE_MARKS_PER_ID+1]
+        losers = [c for c in exact[1:MAX_DEDUPE_MARKS_PER_ID+1] if not (keep_ids and c.get("page_id") in keep_ids)]
         for loser in losers:
             if _should_exit_soon(context):
                 break
@@ -816,7 +821,7 @@ def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
         cursor=js.get("next_cursor")
     return out
 
-def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False):
+def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False) -> str | None:
     eid=str(entry.get("id"))
     # Guard against duplicates: do lookup under an EID lock before create
     lk = _eid_lock(eid)
@@ -831,8 +836,13 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         P_DURATION: _num_val(int(int(entry.get("dur",0))/1000)),
         P_WORKSPACE:_num_val(int(workspace_id or 0)),
         P_DESCRIPTION: _rt_val(entry.get("description") or ""),
-        P_DELETED: {"checkbox": False},
     }
+    # Only include Deleted if it's a checkbox in DB
+    try:
+        if _notion_prop_type(P_DELETED) == "checkbox":
+            props[P_DELETED] = {"checkbox": False}
+    except Exception:
+        pass
     # Team Member relation if available
     if NOTION_TEAM_DB_ID and P_TEAM_MEMBER:
         tm_pid = _best_team_member_page_id(entry.get("user") or "")
@@ -843,6 +853,7 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
         if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
             _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
+        return page_id
     else:
         # Try to create idempotently: lock eid, lookup, then create, then on conflict lookup and patch
         # 1) pre-create lookup under lock
@@ -862,7 +873,14 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
                 if blk:
                     body["children"] = [blk]
             r = _notion_request('POST', "https://api.notion.com/v1/pages", json_body=body)
-            if not r or r.status_code not in (200,201):
+            if r and r.status_code in (200,201):
+                try:
+                    created = r.json() or {}
+                    pid = created.get("id")
+                    return pid
+                except Exception:
+                    return None
+            else:
                 # 3) if failed (e.g., 409), lookup again and patch
                 found2 = _notion_find_entry_by_eid(eid)
                 if found2 and found2.get("page_id"):
@@ -870,6 +888,8 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
                     _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
                     if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
                         _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
+                    return page_id
+        return None
 
 def _notion_mark_deleted(page_id: str):
     if not page_id: return
@@ -937,6 +957,7 @@ def lambda_handler(event, context):
     scheduled_upserts = set()  # (notion_user_key, eid)
     users_indexed = 0
     processed_eids: set[str] = set()
+    keep_upserted_ids: set[str] = set()
 
     def _flush_webhook(wh: str):
         # Send messages (chunked), then run Notion upserts for this webhook
@@ -950,17 +971,22 @@ def lambda_handler(event, context):
         tasks = notion_tasks_by_webhook.get(wh) or []
         if tasks and not _should_exit_soon(context):
             max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
+            collected_ids: set[str] = set()
             def _run_upsert(task):
                 ex, ukey, ent, wid, add_block = task
-                _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
+                return _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futs = [ex.submit(_run_upsert, t) for t in tasks]
                 for f in as_completed(futs):
                     try:
-                        f.result()
+                        pid = f.result()
+                        if pid:
+                            collected_ids.add(pid)
                     except Exception as e:
                         _alert(f"[ERROR] Notion upsert task: {e}")
             notion_tasks_by_webhook[wh] = []
+            # Merge collected ids into global processed set so dedupe keeps them
+            keep_upserted_ids.update(collected_ids)
 
     for token in workspaces:
         if _should_exit_soon(context):
@@ -1183,12 +1209,14 @@ def lambda_handler(event, context):
         max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks_no_webhook)))
         def _run_upsert2(task):
             ex, ukey, ent, wid, add_block = task
-            _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
+            return _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(_run_upsert2, t) for t in notion_tasks_no_webhook]
             for f in as_completed(futs):
                 try:
-                    f.result()
+                    pid = f.result()
+                    if pid:
+                        keep_upserted_ids.add(pid)
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
@@ -1206,7 +1234,7 @@ def lambda_handler(event, context):
     # Cleanup duplicates for processed Entry IDs (keep latest updated; mark others Deleted)
     if processed_eids and not _should_exit_soon(context):
         try:
-            stats = notion_cleanup_duplicates_for_ids(processed_eids, context)
+            stats = notion_cleanup_duplicates_for_ids(processed_eids, context, keep_ids=keep_upserted_ids)
             if stats.get("cleaned"):
                 _alert(f"[INFO] Dedupe: examined={stats.get('examined')} cleaned={stats.get('cleaned')}")
         except Exception as e:
