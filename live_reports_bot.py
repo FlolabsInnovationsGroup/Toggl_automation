@@ -77,26 +77,69 @@ MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 
 # Cached Notion schema (property name -> type)
 _NOTION_SCHEMA: dict[str, str] = {}
+_NOTION_OPTIONS: dict[str, dict[str, str]] = {}  # prop_name -> {lower_name: canonical_name}
 
-def _notion_prop_type(prop_name: str) -> str | None:
-    """Return Notion property type for the Time Entries database (cached)."""
+def _load_notion_schema_and_options():
     try:
-        if prop_name in _NOTION_SCHEMA:
-            return _NOTION_SCHEMA.get(prop_name)
-        # Load schema once
         url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}"
         r = _notion_request('GET', url)
         if not r or r.status_code != 200:
-            return None
+            return
         js = r.json() or {}
         props = js.get("properties") or {}
         for name, meta in props.items():
             t = (meta or {}).get("type")
             if t:
                 _NOTION_SCHEMA[name] = t
+            # Capture canonical option casing for select/multi_select
+            if t == "select":
+                opts = ((meta or {}).get("select") or {}).get("options") or []
+                mapping = {str(o.get("name") or "").strip().lower(): (o.get("name") or "") for o in opts if o.get("name")}
+                _NOTION_OPTIONS[name] = mapping
+            elif t == "multi_select":
+                opts = ((meta or {}).get("multi_select") or {}).get("options") or []
+                mapping = {str(o.get("name") or "").strip().lower(): (o.get("name") or "") for o in opts if o.get("name")}
+                _NOTION_OPTIONS[name] = mapping
+    except Exception:
+        pass
+
+def _notion_prop_type(prop_name: str) -> str | None:
+    """Return Notion property type for the Time Entries database (cached)."""
+    try:
+        if not _NOTION_SCHEMA:
+            _load_notion_schema_and_options()
         return _NOTION_SCHEMA.get(prop_name)
     except Exception:
         return None
+
+def _canon_select(prop_name: str, name: str | None) -> str:
+    s = (name or "").strip()
+    if not s:
+        return s
+    try:
+        if not _NOTION_SCHEMA:
+            _load_notion_schema_and_options()
+        mapping = _NOTION_OPTIONS.get(prop_name) or {}
+        return mapping.get(s.lower(), s)
+    except Exception:
+        return s
+
+def _canon_tags(prop_name: str, tags: list[str] | None) -> list[str]:
+    if not tags:
+        return []
+    try:
+        if not _NOTION_SCHEMA:
+            _load_notion_schema_and_options()
+        mapping = _NOTION_OPTIONS.get(prop_name) or {}
+        out = []
+        for t in tags:
+            st = str(t or "").strip()
+            if not st:
+                continue
+            out.append(mapping.get(st.lower(), st))
+        return out
+    except Exception:
+        return [str(t).strip() for t in (tags or []) if str(t).strip()]
 
 _NOTION_LAST_CALL = 0.0
 try:
@@ -936,6 +979,9 @@ def lambda_handler(event, context):
                 if _should_exit_soon(context):
                     break
                 eid=str(e.get("id") or ""); user=e.get("user") or ""; desc=e.get("description") or "No description"; proj=e.get("project") or "No project"; tags=e.get("tags") or []
+                # Canonicalize case to Notion options to avoid false diffs on casing
+                proj = _canon_select(P_PROJECT, proj)
+                tags = _canon_tags(P_TAGS, tags)
                 dur_ms=int(e.get("dur") or 0); start_s=e.get("start") or ""; end_s=e.get("end") or ""; upd_s=e.get("updated") or e.get("at") or ""; uid=e.get("uid")
                 if not eid or not user: continue
                 processed_eids.add(eid)
