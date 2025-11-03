@@ -5,6 +5,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 
 SESSION = requests.Session()
+
+# Reuse TCP connections aggressively to reduce latency and costs
+def _init_http_session():
+    try:
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=0)
+        SESSION.mount("https://", adapter)
+        SESSION.mount("http://", adapter)
+    except Exception:
+        pass
+
+_init_http_session()
 _START_TS = time.monotonic()
 
 # ENV
@@ -974,6 +986,13 @@ def lambda_handler(event, context):
         user_map_norm={_norm(k):v for k,v in user_map.items()}
     else:
         user_map={}; user_map_norm={}
+    # Preload Notion schema/options once for canonical casing and filters
+    try:
+        if not _NOTION_SCHEMA:
+            _load_notion_schema_and_options()
+    except Exception:
+        pass
+
     # Load Team Members index (for relation mapping) if configured
     if NOTION_TEAM_DB_ID:
         notion_build_team_members_index()
@@ -1115,7 +1134,7 @@ def lambda_handler(event, context):
                 try:
                     dmap = bucket.get("ddb_last_seen")
                     if isinstance(dmap, dict):
-                        dmap[eid] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+                        dmap[eid] = now.strftime("%Y-%m-%dT%H:%M:%S%z")
                         bucket["ddb_dirty"] = True
                 except Exception:
                     pass
