@@ -1236,31 +1236,71 @@ def lambda_handler(event, context):
                         add_block = (first_seen or changed_desc)
                         notion_tasks_no_webhook.append((existing, notion_user_key, notion_entry, wid, add_block))
 
-    # Deletions
-    for sk,b in user_runtime.items():
-        cur=b["current_ids"]; user=b["user_name"]; wh=b["webhook"]; st=b["state"]; snaps=st.get("seen_snapshots",{});
+    # Deletions (use DynamoDB last_seen as primary to improve reliability)
+    for sk, b in user_runtime.items():
+        cur = b["current_ids"]
+        user = b["user_name"]
+        wh = b["webhook"]
+        st = b["state"]
+        snaps = st.get("seen_snapshots", {})
         ddb_map = b.get("ddb_last_seen", {}) if isinstance(b.get("ddb_last_seen"), dict) else {}
-        for eid in list(st.get("seen_entries",[])):
-            if eid in cur: continue
-            snap=snaps.get(eid);  
-            if not snap: continue
+
+        # Prefer DynamoDB set; fallback to Notion-indexed set if DDB missing
+        ddb_eids = set(ddb_map.keys())
+        notion_eids = set(st.get("seen_entries", []))
+        candidate_eids = ddb_eids if ddb_eids else notion_eids
+
+        for eid in list(candidate_eids):
+            if eid in cur:
+                continue  # still present this run
+
+            snap = snaps.get(eid)
+            if not snap:
+                # Try targeted Notion lookup to get page_id + snapshot (bounded by MAX_TARGETED_LOOKUPS_PER_RUN)
+                found = _notion_find_entry_by_eid(eid)
+                if found:
+                    fs = found.get("snap") or {}
+                    snaps[eid] = {**fs, "page_id": found.get("page_id")}
+                    snap = snaps.get(eid)
+            if not snap:
+                continue  # cannot build notification or archive without context
+
+            # Only consider deletions within the active window
             try:
-                s=snap.get("start") or ""; sdt=datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if s else None
-            except Exception: sdt=None
-            if not (sdt and sdt>=since): continue
-            # Confirm via DynamoDB last_seen grace
+                s = snap.get("start") or ""
+                sdt = datetime.strptime(s.replace("Z", "+0000").replace("+00:00", "+0000"), "%Y-%m-%dT%H:%M:%S%z") if s else None
+            except Exception:
+                sdt = None
+            if not (sdt and sdt >= since):
+                continue
+
+            # Confirm via DynamoDB last_seen grace (if available)
             ls_iso = ddb_map.get(eid)
             ls_dt = None
             try:
                 if ls_iso:
-                    ls_dt = datetime.strptime(ls_iso.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+                    ls_dt = datetime.strptime(ls_iso.replace("Z", "+0000").replace("+00:00", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
             except Exception:
                 ls_dt = None
-            if ls_dt is not None and (datetime.now(timezone.utc) - ls_dt) < timedelta(minutes=int(os.getenv("DELETION_GRACE_MINUTES","60"))):
+            grace_min = int(os.getenv("DELETION_GRACE_MINUTES", "60"))
+            if ls_dt is not None and (datetime.now(timezone.utc) - ls_dt) < timedelta(minutes=grace_min):
                 continue
-            if snap.get("page_id"): delete_tasks.append(snap.get("page_id"))
-            if not NOTIFY_ENABLED or not wh: skipped_deletions+=1
-            else: outbox.setdefault(wh,[]).append(_format_deleted_message(user,snap)); notified+=1
+
+            # Queue archive and (optional) notification
+            if snap.get("page_id"):
+                delete_tasks.append(snap.get("page_id"))
+                # Prune from DynamoDB map so we don't re-notify next run
+                try:
+                    if eid in ddb_map:
+                        del ddb_map[eid]
+                        b["ddb_dirty"] = True
+                except Exception:
+                    pass
+            if not NOTIFY_ENABLED or not wh:
+                skipped_deletions += 1
+            else:
+                outbox.setdefault(wh, []).append(_format_deleted_message(user, snap))
+                notified += 1
 
     # Persist DynamoDB last_seen maps
     for sk, b in user_runtime.items():
