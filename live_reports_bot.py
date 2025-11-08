@@ -27,7 +27,6 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/ap
 
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
-HARD_START_FILTER = os.getenv("HARD_START_FILTER", "1") == "1"
 
 DISCORD_MIN_INTERVAL_MS = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
 DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))
@@ -46,14 +45,11 @@ NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
 # Deadline-aware controls and throughput priorities
 MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "12"))   # leave safety margin for shutdown
-PRIORITIZE_NOTION = _env_bool("PRIORITIZE_NOTION", True)  # skip Discord send if time is tight
-NOTIFY_FLUSH_EVERY = int(os.getenv("NOTIFY_FLUSH_EVERY", "25"))  # flush per-webhook after N messages
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
 MAX_TOGGL_CALLS_PER_RUN = int(os.getenv("MAX_TOGGL_CALLS_PER_RUN", "120"))
 MAX_TOGGL_ERRORS_PER_TOKEN = int(os.getenv("MAX_TOGGL_ERRORS_PER_TOKEN", "3"))
 TOGGL_PAGE_SIZE = int(os.getenv("TOGGL_PAGE_SIZE", "200"))
-TOKENS_MAX_CONCURRENT = int(os.getenv("TOKENS_MAX_CONCURRENT", "1"))  # default 1 to be gentle
 
 # In-run Toggl state
 _TOGGL_CALLS_USED = 0
@@ -96,17 +92,14 @@ NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "4"))
 MAX_INDEX_EIDS_PER_RUN = int(os.getenv("MAX_INDEX_EIDS_PER_RUN", "300"))
 MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "60"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "40"))
-MAX_USERS_NOTION_INDEX = int(os.getenv("MAX_USERS_NOTION_INDEX", "80"))  # cap user-index Notion queries per run
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 MAX_TARGETED_LOOKUPS_PER_RUN = int(os.getenv("MAX_TARGETED_LOOKUPS_PER_RUN", "0"))
 MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "80"))
 MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 NOTION_INDEX_MODE = (os.getenv("NOTION_INDEX_MODE", "eids") or "").strip().lower()  # 'eids' or 'window'
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
-NOTIFY_MAX_AGE_DAYS = int(os.getenv("NOTIFY_MAX_AGE_DAYS", "7"))  # do not notify entries older than this on first-seen
 INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "100"))  # number of new entries to insert per run
 NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "100"))  # number of processed entries to notify per run
-NOTIFY_DURING_INSERT = _env_bool("NOTIFY_DURING_INSERT", False)  # keep old behavior off by default
 
 # Cached Notion schema (property name -> type)
 _NOTION_SCHEMA: dict[str, str] = {}
@@ -468,6 +461,24 @@ def _format_delta_datetimes(new_dt: datetime, old_dt: datetime) -> str:
 def _truncate(s: str, limit: int = 140) -> str:
     if not isinstance(s, str): return ""
     s = s.strip();  return s if len(s) <= limit else (s[:limit-1] + "…")
+
+# Robust ISO8601 parser (handles Z, timezone, fractional seconds)
+def _parse_iso8601(s: str | None, default: datetime | None = None) -> datetime:
+    try:
+        if not s:
+            return default or datetime.now(timezone.utc)
+        ss = str(s).strip()
+        if ss.endswith("Z"):
+            ss = ss[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(ss)
+        except Exception:
+            pass
+        # Fallback to strptime without fractional seconds
+        ss2 = ss.replace("+00:00", "+0000")
+        return datetime.strptime(ss2, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return default or datetime.now(timezone.utc)
 
 # Description comparison (case sensitive, ignore surrounding whitespace and CRLF differences)
 def _desc_equal(a: str | None, b: str | None) -> bool:
@@ -974,40 +985,7 @@ def notion_cleanup_duplicates_for_ids(eids: set[str], context, keep_ids: set[str
                 cleaned += 1
     return {"examined": examined, "cleaned": cleaned}
 
-def _notion_query_user(user_key: str, since: datetime, until: datetime) -> dict:
-    out = {}; url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    payload = {"page_size":100, "filter": {"and":[
-        {"property": P_USER_KEY, "title": {"equals": user_key}},
-        {"property": P_DATE, "date": {"on_or_after": since.astimezone(timezone.utc).replace(microsecond=0).isoformat()}},
-        {"property": P_DATE, "date": {"on_or_before": until.astimezone(timezone.utc).replace(microsecond=0).isoformat()}},
-    ]}}
-    cursor=None
-    while True:
-        body=dict(payload)
-        if cursor: body["start_cursor"]=cursor
-        r=_notion_request('POST', url, json_body=body)
-        if not r or r.status_code!=200:
-            break
-        js=r.json() or {}
-        for pg in js.get("results") or []:
-            pid=pg.get("id"); props=pg.get("properties",{})
-            eid=None; p=props.get(P_ENTRY_ID,{})
-            if p.get("type")=="number" and p.get("number") is not None: eid=str(int(p.get("number")))
-            elif p.get("type")=="rich_text": eid="".join([x.get("plain_text","") for x in (p.get("rich_text") or [])]).strip()
-            if not eid: continue
-            def _get_date(n): d=(props.get(n,{}).get("date") or {}); return d.get("start") or ""
-            def _get_range(n): d=(props.get(n,{}).get("date") or {}); return d.get("start") or "", d.get("end") or ""
-            def _get_num(n):  q=props.get(n,{}); return q.get("number") if q.get("type")=="number" else 0
-            def _get_text(n): q=props.get(n,{}); return "".join([x.get("plain_text","") for x in (q.get("rich_text") or [])]).strip() if q.get("type")=="rich_text" else ""
-            def _get_sel(n):  q=props.get(n,{}); return (q.get("select") or {}).get("name") or "No project"
-            def _get_status(n): q=props.get(n,{}); return (q.get("status") or {}).get("name") or ""
-            def _get_tags(n): q=props.get(n,{}); return [t.get("name","") for t in (q.get("multi_select") or []) if t.get("name")]
-            start_s, end_s = _get_range(P_DATE)
-            snap={"dur": int(_get_num(P_DURATION) or 0)*1000, "desc": _get_text(P_DESCRIPTION), "project": _get_sel(P_PROJECT), "status": _get_status(P_STATUS), "tags": _get_tags(P_TAGS), "start": start_s, "end": end_s, "updated": _get_date(P_UPDATED)}
-            out[str(eid)]={"page_id":pid,"snap":snap}
-        if not js.get("has_more"): break
-        cursor=js.get("next_cursor")
-    return out
+# (legacy _notion_query_user removed)
 
 def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False) -> str | None:
     if not NOTION_ENABLED:
@@ -1089,395 +1067,12 @@ def _notion_archive_page(page_id: str):
     _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"archived": True})
 
 # Deleted msg
-def _strike(s:str)->str: return f"~~{s}~~"
-def _format_deleted_message(user_name: str, snap: dict) -> str:
-    project=snap.get("project","No project"); tags=snap.get("tags") or []; desc=snap.get("desc","No description"); dur_ms=int(snap.get("dur",0)); start_s=snap.get("start") or ""
-    try:
-        start_dt=datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z"); start_str=start_dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception: start_str=start_s or "unknown"
-    now_str=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    old_tags=", ".join(sorted(tags)) if tags else "No tags"
-    return "\n".join([
-        "## 🗑️ Time Entry Deleted",
-        f"👤 **User**: {_strike(user_name)}",
-        f"📁 **Project:** {_strike(project)}",
-        f"🏷️ **Tags:** {_strike(old_tags)}",
-        f"📝 **Task:** {_strike(_truncate(desc))}",
-        f"⏱️ **Time Tracked:** {_strike(convert_ms_to_hms(dur_ms))}",
-        f"🗓️ **Start:** {_strike(start_str)}",
-        f"🕑 **Deleted detected:** {now_str}",
-        "—",
-    ])
+# (legacy deleted-message helpers removed)
 
 # Batch
-def _chunk_messages(msgs, limit=1900, sep="\n\n"):
-    chunk, size = [], 0
-    for m in msgs:
-        if chunk and size + len(sep) + len(m) > limit:
-            yield sep.join(chunk); chunk, size = [m], len(m)
-        else:
-            chunk.append(m); size = len(sep.join(chunk))
-    if chunk: yield sep.join(chunk)
-def _send_all_for_webhook(wh_url, msgs):
-    sent=0
-    for payload in _chunk_messages(msgs):
-        if send_discord_with_backoff(wh_url, payload, timeout=HTTP_TIMEOUT): sent+=1
-    return wh_url, sent
+# (legacy batching helpers removed; staging path batches internally)
 
-def run(context):
-    team=load_team_sheet(); workspaces=load_workspace_tokens()
-    if not team: _alert("TEAM sheet empty or unreachable."); return {"status":"no_team"}
-    if not workspaces: _alert("WORKSPACES sheet empty or unreachable."); return {"status":"no_workspaces"}
-    if NOTIFY_ENABLED:
-        user_map={t["name"]:t.get("discord_webhook_url","" ).strip() for t in team if t.get("discord_webhook_url")}
-        user_map_norm={_norm(k):v for k,v in user_map.items()}
-    else:
-        user_map={}; user_map_norm={}
-    # Preload Notion schema/options once for canonical casing and filters
-    try:
-        if not _NOTION_SCHEMA:
-            _load_notion_schema_and_options()
-    except Exception:
-        pass
-
-    # Load Team Members index (for relation mapping) if configured
-    if NOTION_TEAM_DB_ID:
-        notion_build_team_members_index()
-
-    now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
-    notified=0; skipped_notifies=0; skipped_deletions=0
-    user_runtime={}  # state_key -> {current_ids,set; user_name; webhook; state; notion_user_key}
-    outbox={}
-    warned=set()
-    # Group upserts by webhook so we can send first, then write those entries
-    notion_tasks_by_webhook: dict[str, list[tuple]] = {}
-    notion_tasks_no_webhook: list[tuple] = []
-    delete_tasks = []  # queued page_id for Deleted=true
-    scheduled_upserts = set()  # (notion_user_key, eid)
-    users_indexed = 0
-    processed_eids: set[str] = set()
-    keep_upserted_ids: set[str] = set()
-
-    def _flush_webhook(wh: str):
-        # Send messages (chunked), then run Notion upserts for this webhook
-        msgs = outbox.get(wh) or []
-        if msgs:
-            for payload in _chunk_messages(msgs):
-                if _should_exit_soon(context):
-                    break
-                send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT)
-            outbox[wh] = []
-        tasks = notion_tasks_by_webhook.get(wh) or []
-        if tasks and not _should_exit_soon(context):
-            max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
-            collected_ids: set[str] = set()
-            def _run_upsert(task):
-                ex, ukey, ent, wid, add_block = task
-                return _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [ex.submit(_run_upsert, t) for t in tasks]
-                for f in as_completed(futs):
-                    try:
-                        pid = f.result()
-                        if pid:
-                            collected_ids.add(pid)
-                    except Exception as e:
-                        _alert(f"[ERROR] Notion upsert task: {e}")
-            notion_tasks_by_webhook[wh] = []
-            # Merge collected ids into global processed set so dedupe keeps them
-            keep_upserted_ids.update(collected_ids)
-
-    for token in workspaces:
-        if _should_exit_soon(context):
-            break
-        api_token=token["api_token"]; wss=get_workspaces_for_token(api_token)
-        if not wss:
-            _alert(f"⚠️ No workspaces visible for token ending …{api_token[-4:]}"); continue
-        for ws in wss:
-            if _should_exit_soon(context):
-                break
-            wid=ws.get("id");  
-            if not wid: continue
-            entries=fetch_workspace_entries(api_token,wid,since,now)
-            print(f"[DEBUG] Fetched {len(entries)} entries from workspace {wid}")
-            for e in entries:
-                if _should_exit_soon(context):
-                    break
-                eid=str(e.get("id") or ""); user=e.get("user") or ""; desc=e.get("description") or "No description"; proj=e.get("project") or "No project"; tags=e.get("tags") or []
-                # Canonicalize case to Notion options to avoid false diffs on casing
-                proj = _canon_select(P_PROJECT, proj)
-                tags = _canon_tags(P_TAGS, tags)
-                dur_ms=int(e.get("dur") or 0); start_s=e.get("start") or ""; end_s=e.get("end") or ""; upd_s=e.get("updated") or e.get("at") or ""; uid=e.get("uid")
-                if not eid or not user: continue
-                processed_eids.add(eid)
-                wh=None
-                if NOTIFY_ENABLED: wh=user_map.get(user) or user_map_norm.get(_norm(user))
-                start_dt=datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if start_s else now
-                if end_s:
-                    try:
-                        end_dt = datetime.strptime(end_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z")
-                    except Exception:
-                        end_dt = start_dt + timedelta(milliseconds=max(0,dur_ms))
-                else:
-                    end_dt = start_dt + timedelta(milliseconds=max(0,dur_ms))
-                upd_dt=datetime.strptime(upd_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if upd_s else now
-                state_key=f"uid:{uid}" if uid is not None else f"name:{_norm(user)}"; notion_user_key=f"user:{uid}" if uid is not None else user
-                if state_key not in user_runtime:
-                    state={"seen_entries":[],"seen_updates":{},"seen_snapshots":{}}
-                    if users_indexed < MAX_USERS_NOTION_INDEX and not _should_exit_soon(context):
-                        idx=_notion_query_user(notion_user_key,since,now)
-                        state={"seen_entries":list(idx.keys()),"seen_updates":{k:idx[k]["snap"].get("updated") or "" for k in idx},"seen_snapshots":{k:{**idx[k]["snap"],"page_id":idx[k]["page_id"]} for k in idx}}
-                        users_indexed += 1
-                    # Attach DynamoDB last_seen state
-                    user_runtime[state_key]={
-                        "current_ids":set(),
-                        "user_name":user,
-                        "webhook":wh,
-                        "state":state,
-                        "notion_user_key":notion_user_key,
-                    }
-                bucket=user_runtime[state_key]; state=bucket["state"]
-                seen_ids=set(state["seen_entries"]); seen_updates=state["seen_updates"]; snaps=state["seen_snapshots"]
-                prev_upd_s=seen_updates.get(eid); prev_upd=None
-                if prev_upd_s: 
-                    try: prev_upd=datetime.strptime(prev_upd_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z")
-                    except Exception: prev_upd=None
-                first_seen = prev_upd is None
-                prev_snap = snaps.get(eid, {})
-                # Systematic verification: if we don't have a snapshot for this EID, look it up in Notion now
-                if not prev_snap:
-                    found = _notion_find_entry_by_eid(eid)
-                    if found:
-                        fs = found.get("snap") or {}
-                        snaps[eid] = {**fs, "page_id": found.get("page_id")}
-                        seen_updates[eid] = fs.get("updated") or ""
-                        try:
-                            prev_upd = datetime.strptime((fs.get("updated") or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-                        except Exception:
-                            prev_upd = None
-                        # Notion page exists => not first seen, even if its 'Updated' is empty
-                        first_seen = False
-                        prev_snap = snaps.get(eid, {})
-
-                # If we already have a Notion snapshot, treat as not first seen
-                if prev_snap:
-                    first_seen = False
-                prev_dur  = int(prev_snap.get("dur", dur_ms))
-                prev_desc = prev_snap.get("desc", desc)
-                prev_proj = prev_snap.get("project", proj)
-                prev_tags = prev_snap.get("tags", list(tags))
-                prev_start_s = prev_snap.get("start", start_s)
-                try: prev_start_dt = datetime.strptime(prev_start_s.replace("Z","+0000").replace("+00:00","+0000"),"%Y-%m-%dT%H:%M:%S%z") if prev_start_s else start_dt
-                except Exception: prev_start_dt = start_dt
-
-                bucket["current_ids"].add(eid)
-                seen_updates[eid] = upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-                if eid not in seen_ids: state["seen_entries"].append(eid)
-                snaps[eid] = {"dur": dur_ms, "desc": desc, "project": proj, "tags": list(tags), "start": start_s, "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(), "updated": upd_dt.strftime("%Y-%m-%dT%H:%M:%S%z")}
-                # (DynamoDB removed)
-
-                if NOTIFY_ENABLED and not wh:
-                    if first_seen and user not in warned:
-                        _alert(f"[INFO] No webhook configured for '{user}' (uid: {uid}); persisting state and skipping notifications."); warned.add(user)
-                    continue
-
-                should_notify=False; label="🆕 New Time Entry Added"; dif=[]
-                changed_time = dur_ms != prev_dur
-                changed_proj = proj != prev_proj
-                changed_desc = not _desc_equal(desc, prev_desc)
-                old_set=set(prev_tags) if isinstance(prev_tags,list) else set(); new_set=set(tags) if isinstance(tags,list) else set(); changed_tags = old_set != new_set
-                changed_start = (start_dt != prev_start_dt)
-                if first_seen:
-                    if HARD_START_FILTER and start_dt < since: continue
-                    if upd_dt >= since: should_notify=True; label="🆕 New Time Entry Added"
-                else:
-                    if changed_time: dif.append(f"Δ Time {_format_delta_ms(dur_ms - prev_dur)}")
-                    if changed_proj: dif.append("Project changed")
-                    if changed_desc: dif.append("Description changed")
-                    if changed_tags:
-                        add=sorted(list(new_set-old_set)); rem=sorted(list(old_set-new_set)); bits=[]
-                        if add: bits.append("+"+", ".join(add))
-                        if rem: bits.append("-"+", ".join(rem))
-                        dif.append("Tags "+" ".join(bits) if bits else "Tags changed")
-                    if changed_start: dif.append(f"Δ Start {_format_delta_datetimes(start_dt, prev_start_dt)}")
-                    if dif:
-                        should_notify=True; label="✍️ Time Entry Edited"
-                if not should_notify:
-                    continue
-                if NOTIFY_ENABLED:
-                    lines=[f"## {label}", f"👤 **User**: {user}"]
-                    lines.append(f"📁 **Project:** {'~~'+prev_proj+'~~ '+proj if label.startswith('✍️') and changed_proj else proj}")
-                    if label.startswith("✍️") and changed_tags:
-                        lines.append(f"🏷️ **Tags:** ~~{', '.join(sorted(old_set)) or 'No tags'}~~ {', '.join(sorted(new_set)) or 'No tags'}")
-                    else:
-                        lines.append(f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}")
-                    if label.startswith("✍️") and changed_desc:
-                        lines.append(f"📝 **Task:** ~~{_truncate(prev_desc)}~~ {_truncate(desc)}")
-                    else:
-                        lines.append(f"📝 **Task:** {desc}")
-                    if label.startswith("✍️") and changed_time:
-                        lines.append(f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(dur_ms)}")
-                    else:
-                        lines.append(f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}")
-                    if label.startswith("✍️") and changed_start:
-                        lines.append(f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                    else:
-                        lines.append(f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                    lines.append(f"🕑 **Updated:** {upd_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                    if label.startswith("✍️") and dif:
-                        lines.append("")
-                        lines.append("**changes:** "+"; ".join(dif))
-                    lines.append("—"); msg="\n".join(lines)
-                    if wh:
-                        arr = outbox.setdefault(wh,[])
-                        arr.append(msg)
-                        notified+=1
-                        # prepare a Notion upsert task tied to this webhook
-                        existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
-                        notion_entry={
-                            "id": eid,
-                            "user": user,
-                            "project": proj,
-                            "tags": tags,
-                            "dur": dur_ms,
-                            "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                            "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                            "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                            "description": desc,
-                        }
-                        key = (notion_user_key, eid)
-                        if key not in scheduled_upserts:
-                            scheduled_upserts.add(key)
-                            # add description block on create or when description changed
-                            add_block = (first_seen or changed_desc)
-                            notion_tasks_by_webhook.setdefault(wh, []).append((existing, notion_user_key, notion_entry, wid, add_block))
-                        if len(arr) >= NOTIFY_FLUSH_EVERY or _should_exit_soon(context):
-                            _flush_webhook(wh)
-                else:
-                    # notifications disabled: upsert later regardless
-                    existing={"page_id": prev_snap.get("page_id")} if prev_snap.get("page_id") else None
-                    notion_entry={
-                        "id": eid,
-                        "user": user,
-                        "project": proj,
-                        "tags": tags,
-                        "dur": dur_ms,
-                        "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                        "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                        "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                        "description": desc,
-                    }
-                    key = (notion_user_key, eid)
-                    if key not in scheduled_upserts:
-                        scheduled_upserts.add(key)
-                        add_block = (first_seen or changed_desc)
-                        notion_tasks_no_webhook.append((existing, notion_user_key, notion_entry, wid, add_block))
-
-    # Deletions (DynamoDB removed; derive from Notion-indexed state only)
-    for sk, b in user_runtime.items():
-        cur = b["current_ids"]
-        user = b["user_name"]
-        wh = b["webhook"]
-        st = b["state"]
-        snaps = st.get("seen_snapshots", {})
-        notion_eids = set(st.get("seen_entries", []))
-        candidate_eids = notion_eids
-
-        for eid in list(candidate_eids):
-            if eid in cur:
-                continue  # still present this run
-
-            snap = snaps.get(eid)
-            if not snap:
-                # Try targeted Notion lookup to get page_id + snapshot (bounded by MAX_TARGETED_LOOKUPS_PER_RUN)
-                found = _notion_find_entry_by_eid(eid)
-                if found:
-                    fs = found.get("snap") or {}
-                    snaps[eid] = {**fs, "page_id": found.get("page_id")}
-                    snap = snaps.get(eid)
-            if not snap:
-                continue  # cannot build notification or archive without context
-
-            # Only consider deletions within the active window
-            try:
-                s = snap.get("start") or ""
-                sdt = datetime.strptime(s.replace("Z", "+0000").replace("+00:00", "+0000"), "%Y-%m-%dT%H:%M:%S%z") if s else None
-            except Exception:
-                sdt = None
-            if not (sdt and sdt >= since):
-                continue
-
-            # Queue archive and (optional) notification
-            if snap.get("page_id"):
-                delete_tasks.append(snap.get("page_id"))
-            if not NOTIFY_ENABLED or not wh:
-                skipped_deletions += 1
-            else:
-                outbox.setdefault(wh, []).append(_format_deleted_message(user, snap))
-                notified += 1
-
-    # (DynamoDB persistence removed)
-
-    # Send each webhook batch first, then upsert only those entries that were notified for that webhook
-    if NOTIFY_ENABLED and outbox:
-        for wh, msgs in outbox.items():
-            if _should_exit_soon(context):
-                break
-            for payload in _chunk_messages(msgs):
-                if _should_exit_soon(context):
-                    break
-                send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT)
-            tasks = notion_tasks_by_webhook.get(wh) or []
-            if tasks and not _should_exit_soon(context):
-                max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
-                def _run_upsert(task):
-                    ex, ukey, ent, wid, add_block = task
-                    _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futs = [ex.submit(_run_upsert, t) for t in tasks]
-                    for f in as_completed(futs):
-                        try:
-                            f.result()
-                        except Exception as e:
-                            _alert(f"[ERROR] Notion upsert task: {e}")
-
-    # Persist entries when notifications are disabled
-    if not NOTIFY_ENABLED and notion_tasks_no_webhook:
-        max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks_no_webhook)))
-        def _run_upsert2(task):
-            ex, ukey, ent, wid, add_block = task
-            return _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_run_upsert2, t) for t in notion_tasks_no_webhook]
-            for f in as_completed(futs):
-                try:
-                    pid = f.result()
-                    if pid:
-                        keep_upserted_ids.add(pid)
-                except Exception as e:
-                    _alert(f"[ERROR] Notion upsert task: {e}")
-
-    # Then process deletion marks (if any)
-    if delete_tasks and not _should_exit_soon(context):
-        max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_notion_archive_page, pid) for pid in delete_tasks]
-            for f in as_completed(futs):
-                try:
-                    f.result()
-                except Exception as e:
-                    _alert(f"[ERROR] Notion archive task: {e}")
-
-    # Cleanup duplicates for processed Entry IDs (keep latest updated; mark others Deleted)
-    if processed_eids and not _should_exit_soon(context):
-        try:
-            stats = notion_cleanup_duplicates_for_ids(processed_eids, context, keep_ids=keep_upserted_ids)
-            if stats.get("cleaned"):
-                _alert(f"[INFO] Dedupe: examined={stats.get('examined')} cleaned={stats.get('cleaned')}")
-        except Exception as e:
-            _alert(f"[ERROR] Dedupe failed: {e}")
-
-    return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":skipped_deletions,"dry_run_no_send":DRY_RUN_NO_SEND,"send_notifications":SEND_NOTIFICATIONS,"notify_enabled":NOTIFY_ENABLED}
+# (legacy run() removed)
 
 # ---- Optimized Notion window indexing and fast sync ----
 def notion_build_window_index(since: datetime, until: datetime) -> tuple[dict, dict]:
@@ -1675,6 +1270,24 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
         "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
     }
     cursor = None
+
+    def _chunk_pairs(pairs, limit_chars=1900, sep="\n\n"):
+        chunk = []
+        size = 0
+        chunk_ids = []
+        for pid, msg in pairs:
+            add = (len(sep) if chunk else 0) + len(msg)
+            if chunk and size + add > limit_chars:
+                yield sep.join(chunk), list(chunk_ids)
+                chunk, chunk_ids = [msg], [pid]
+                size = len(msg)
+            else:
+                chunk.append(msg)
+                chunk_ids.append(pid)
+                size = len(sep.join(chunk))
+        if chunk:
+            yield sep.join(chunk), list(chunk_ids)
+
     while notified < limit:
         if cursor:
             body["start_cursor"] = cursor
@@ -1685,33 +1298,26 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
         results = js.get("results") or []
         if not results:
             break
+
+        outbox_pairs: dict[str, list[tuple[str, str]]] = {}
+
         for pg in results:
             if notified >= limit or _should_exit_soon(context):
                 break
             pid = pg.get("id")
             props = pg.get("properties", {})
-            # Extract fields
             user_key = _get_title_text(props.get(P_USER_KEY, {}))
             desc = _get_title_text(props.get(P_DESCRIPTION, {})) or "No description"
             proj = (props.get(P_PROJECT, {}).get("select") or {}).get("name") or "No project"
             tags = [t.get("name", "") for t in (props.get(P_TAGS, {}).get("multi_select") or []) if t.get("name")]
             dur_s = props.get(P_DURATION, {}).get("number") or 0
             dur_ms = int(float(dur_s)) * 1000
-            # Start: use P_DATE.start, fallback to page created_time if missing
             dt = props.get(P_DATE, {}).get("date") or {}
             start_s = dt.get("start") or (pg.get("created_time") or "")
-            try:
-                start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if start_s else datetime.now(timezone.utc)
-            except Exception:
-                start_dt = datetime.now(timezone.utc)
-            # Updated: prefer P_UPDATED.start, then last_edited_time, then created_time
+            start_dt = _parse_iso8601(start_s, default=datetime.now(timezone.utc))
             upd_prop = props.get(P_UPDATED, {}).get("date") or {}
             updated_s = upd_prop.get("start") or pg.get("last_edited_time") or pg.get("created_time") or ""
-            try:
-                updated_dt = datetime.strptime(updated_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if updated_s else start_dt
-            except Exception:
-                updated_dt = start_dt
-            # Resolve webhook via uid_to_name mapping
+            updated_dt = _parse_iso8601(updated_s, default=start_dt)
             name = uid_to_name.get(user_key) or ""
             wh = user_map.get(name) or user_map_norm.get(_norm(name)) if name else None
             if not (NOTIFY_ENABLED and wh):
@@ -1728,13 +1334,25 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
                 "—",
             ]
             msg = "\n".join(lines)
-            if send_discord_with_backoff(wh, msg, timeout=HTTP_TIMEOUT):
-                # Update status to Notified
-                _notion_request('PATCH', f"https://api.notion.com/v1/pages/{pid}", json_body={"properties": {P_STATUS: {"status": {"name": _canon_select(P_STATUS, STATUS_NOTIFIED)}}}})
-                notified += 1
+            outbox_pairs.setdefault(wh, []).append((pid, msg))
+
+        # Send batched per webhook
+        for wh, pairs in outbox_pairs.items():
+            if _should_exit_soon(context) or notified >= limit:
+                break
+            for payload, pids in _chunk_pairs(pairs):
+                if _should_exit_soon(context) or notified >= limit:
+                    break
+                if send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT):
+                    # Mark all included pages as Notified
+                    for pid in pids:
+                        _notion_request('PATCH', f"https://api.notion.com/v1/pages/{pid}", json_body={"properties": {P_STATUS: {"status": {"name": _canon_select(P_STATUS, STATUS_NOTIFIED)}}}})
+                    notified += len(pids)
+
         if not js.get("has_more"):
             break
         cursor = js.get("next_cursor")
+
     return notified
 
 def fast_sync(context=None):
@@ -1784,9 +1402,7 @@ def fast_sync(context=None):
     if mode == 'window':
         by_eid, by_user = notion_build_window_index(since, now)
 
-    outbox: dict[str, list[str]] = {}
-    notion_tasks_by_webhook: dict[str, list[tuple]] = {}
-    notion_tasks_no_webhook: list[tuple] = []
+    notion_tasks: list[tuple] = []
     scheduled_upserts: set[tuple] = set()
     writes_scheduled = 0
     WRITES_LIMIT = min(INSERT_BATCH_SIZE, int(os.getenv("MAX_NOTION_WRITES_PER_RUN", "300")))
@@ -1795,7 +1411,7 @@ def fast_sync(context=None):
     keep_upserted_ids: set[str] = set()
     uid_to_name: dict[str, str] = {}
 
-    def _queue_upsert(wh, existing, notion_user_key, notion_entry, wid, add_block):
+    def _queue_upsert(existing, notion_user_key, notion_entry, wid, add_block):
         nonlocal writes_scheduled
         if not NOTION_ENABLED:
             return
@@ -1806,34 +1422,7 @@ def fast_sync(context=None):
             return
         scheduled_upserts.add(key)
         writes_scheduled += 1
-        if wh:
-            notion_tasks_by_webhook.setdefault(wh, []).append((existing, notion_user_key, notion_entry, wid, add_block))
-        else:
-            notion_tasks_no_webhook.append((existing, notion_user_key, notion_entry, wid, add_block))
-
-    def _flush_webhook(wh: str):
-        msgs = outbox.get(wh) or []
-        for payload in _chunk_messages(msgs):
-            if _should_exit_soon(context):
-                break
-            send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT)
-        outbox[wh] = []
-        tasks = notion_tasks_by_webhook.get(wh) or []
-        if tasks and not _should_exit_soon(context):
-            max_workers = max(1, min(NOTION_CONCURRENCY, len(tasks)))
-            def _run_upsert(task):
-                ex, ukey, ent, wid2, add_block = task
-                return _notion_upsert(ex, ukey, ent, wid2, add_desc_block=add_block)
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [ex.submit(_run_upsert, t) for t in tasks]
-                for f in as_completed(futs):
-                    try:
-                        pid = f.result()
-                        if pid:
-                            keep_upserted_ids.add(pid)
-                    except Exception as e:
-                        _alert(f"[ERROR] Notion upsert task: {e}")
-            notion_tasks_by_webhook[wh] = []
+        notion_tasks.append((existing, notion_user_key, notion_entry, wid, add_block))
 
     notified = 0
     all_entries = []  # when mode='eids', collect first then index
@@ -1925,8 +1514,6 @@ def fast_sync(context=None):
                 new_set = set(tags) if isinstance(tags, list) else set()
                 changed_tags = old_set != new_set
                 changed_start = (start_dt != prev_start_dt)
-
-                too_old_for_notify = (start_dt < (now - timedelta(days=NOTIFY_MAX_AGE_DAYS))) if NOTIFY_MAX_AGE_DAYS > 0 else False
                 # Insert only first-seen entries here (batch-limited)
                 if first_seen and writes_scheduled < WRITES_LIMIT:
                     notion_entry = {
@@ -1944,45 +1531,7 @@ def fast_sync(context=None):
                     add_block = True
                     # Insert with Processed or Ignored based on SEND_NOTIFICATIONS
                     notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
-                    _queue_upsert(wh, existing, notion_user_key, notion_entry, wid, add_block)
-
-                if NOTIFY_DURING_INSERT and NOTIFY_ENABLED and wh:
-                    if HARD_START_FILTER and first_seen and start_dt < since:
-                        continue
-                    if first_seen and upd_dt >= since and not too_old_for_notify:
-                        label = "🆕 New Time Entry Added"
-                        should_notify = True
-                    else:
-                        should_notify = changed_time or changed_proj or changed_desc or changed_tags or changed_start
-                        label = "✍️ Time Entry Updated" if should_notify else None
-                    if should_notify:
-                        dif = []
-                        if changed_proj: dif.append(f"project: '{prev_proj}' → '{project}'")
-                        if changed_tags: dif.append(f"tags: {', '.join(sorted(old_set)) or 'No tags'} → {', '.join(sorted(new_set)) or 'No tags'}")
-                        if changed_desc: dif.append("description changed")
-                        lines=[
-                            f"## {label}",
-                            f"👤 **User**: {user}",
-                            f"📁 **Project:** {project}",
-                            f"🏷️ **Tags:** {', '.join(sorted(new_set)) if new_set else 'No tags'}",
-                            f"📝 **Task:** {desc}",
-                            f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}",
-                            f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                            f"🕑 **Updated:** {upd_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                        ]
-                        if label.startswith("✍️") and changed_time:
-                            lines[5] = f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(dur_ms)}"
-                        if label.startswith("✍️") and changed_start:
-                            lines[6] = f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}"
-                        if label.startswith("✍️") and dif:
-                            lines.append("")
-                            lines.append("**changes:** "+"; ".join(dif))
-                        lines.append("—")
-                        outbox.setdefault(wh, []).append("\n".join(lines))
-                        notified += 1
-
-                if wh and len(outbox.get(wh, [])) >= NOTIFY_FLUSH_EVERY:
-                    _flush_webhook(wh)
+                    _queue_upsert(existing, notion_user_key, notion_entry, wid, add_block)
 
     # If in EID index mode, build Notion index now and process accumulated entries
     if mode == 'eids':
@@ -2059,7 +1608,6 @@ def fast_sync(context=None):
             changed_tags = old_set != new_set
             changed_start = (start_dt != prev_start_dt)
 
-            too_old_for_notify = (start_dt < (now - timedelta(days=NOTIFY_MAX_AGE_DAYS))) if NOTIFY_MAX_AGE_DAYS > 0 else False
             # Insert only first-seen entries (batch-limited)
             if first_seen and writes_scheduled < WRITES_LIMIT:
                 notion_entry = {
@@ -2076,59 +1624,16 @@ def fast_sync(context=None):
                 existing = None
                 add_block = True
                 notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
-                _queue_upsert(wh, existing, notion_user_key, notion_entry, wid, add_block)
+                _queue_upsert(existing, notion_user_key, notion_entry, wid, add_block)
 
-            if NOTIFY_DURING_INSERT and NOTIFY_ENABLED and wh:
-                if HARD_START_FILTER and first_seen and start_dt < since:
-                    continue
-                if first_seen and upd_dt >= since and not too_old_for_notify:
-                    label = "🆕 New Time Entry Added"
-                    should_notify = True
-                else:
-                    should_notify = changed_time or changed_proj or changed_desc or changed_tags or changed_start
-                    label = "✍️ Time Entry Updated" if should_notify else None
-                if should_notify:
-                    dif = []
-                    if changed_proj: dif.append(f"project: '{prev_proj}' → '{project}'")
-                    if changed_tags: dif.append(f"tags: {', '.join(sorted(old_set)) or 'No tags'} → {', '.join(sorted(new_set)) or 'No tags'}")
-                    if changed_desc: dif.append("description changed")
-                    lines=[
-                        f"## {label}",
-                        f"👤 **User**: {user}",
-                        f"📁 **Project:** {project}",
-                        f"🏷️ **Tags:** {', '.join(sorted(new_set)) if new_set else 'No tags'}",
-                        f"📝 **Task:** {desc}",
-                        f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}",
-                        f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                        f"🕑 **Updated:** {upd_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                    ]
-                    if label.startswith("✍️") and changed_time:
-                        lines[5] = f"⏱️ **Time Tracked:** ~~{convert_ms_to_hms(prev_dur)}~~ {convert_ms_to_hms(dur_ms)}"
-                    if label.startswith("✍️") and changed_start:
-                        lines[6] = f"🗓️ **Start:** ~~{prev_start_dt.strftime('%Y-%m-%d %H:%M:%S')}~~ {start_dt.strftime('%Y-%m-%d %H:%M:%S')}"
-                    if label.startswith("✍️") and dif:
-                        lines.append("")
-                        lines.append("**changes:** "+"; ".join(dif))
-                    lines.append("—")
-                    outbox.setdefault(wh, []).append("\n".join(lines))
-                    notified += 1
-
-            if wh and len(outbox.get(wh, [])) >= NOTIFY_FLUSH_EVERY:
-                _flush_webhook(wh)
-
-    # Send remaining webhook messages and upserts
-    if NOTIFY_ENABLED and outbox:
-        for wh, msgs in outbox.items():
-            _flush_webhook(wh)
-
-    # Upserts for entries without webhooks or when notifications disabled
-    if notion_tasks_no_webhook and not _should_exit_soon(context):
-        max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks_no_webhook)))
+    # Run Notion upserts for all scheduled entries
+    if notion_tasks and not _should_exit_soon(context):
+        max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks)))
         def _run_upsert2(task):
             ex, ukey, ent, wid, add_block = task
             return _notion_upsert(ex, ukey, ent, wid, add_desc_block=add_block)
         with ThreadPoolExecutor(max_workers=max_workers) as ex2:
-            futs = [ex2.submit(_run_upsert2, t) for t in notion_tasks_no_webhook]
+            futs = [ex2.submit(_run_upsert2, t) for t in notion_tasks]
             for f in as_completed(futs):
                 try:
                     pid = f.result()
@@ -2136,16 +1641,6 @@ def fast_sync(context=None):
                         keep_upserted_ids.add(pid)
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
-
-    # Flush any remaining per-webhook upserts even if no messages were sent
-    if notion_tasks_by_webhook and not _should_exit_soon(context):
-        try:
-            for wh in list(notion_tasks_by_webhook.keys()):
-                if _should_exit_soon(context):
-                    break
-                _flush_webhook(wh)
-        except Exception as e:
-            _alert(f"[ERROR] flush webhook upserts failed: {e}")
 
     # Stage-2: notify a batch of Processed items and mark as Notified
     if NOTIFY_ENABLED and not _should_exit_soon(context):
@@ -2203,16 +1698,7 @@ def fast_sync(context=None):
     return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":0,"dry_run_no_send":DRY_RUN_NO_SEND,"send_notifications":SEND_NOTIFICATIONS,"notify_enabled":NOTIFY_ENABLED}
 
 # ---- Local main for testing ----
-def lambda_handler(event=None, context=None):
-    use_fast = os.getenv("USE_FAST_SYNC", "1").strip() not in ("0", "false", "no")
-    if use_fast and 'fast_sync' in globals():
-        return fast_sync(context=context)
-    if 'run' in globals():
-        try:
-            return run(context=context)
-        except TypeError:
-            return run()
-    return {"status": "noop"}
+# (legacy lambda_handler overload removed)
 
 class _LocalContext:
     def __init__(self, ms: int = 5 * 60 * 1000):
@@ -2221,16 +1707,8 @@ class _LocalContext:
         return self._ms
 
 def lambda_handler(event, context):
-    """AWS Lambda entrypoint: prefer optimized fast_sync, return JSON result."""
-    use_fast = os.getenv("USE_FAST_SYNC", "1").strip().lower() not in ("0", "false", "no")
-    if use_fast and 'fast_sync' in globals():
-        return fast_sync(context=context)
-    if 'run' in globals():
-        try:
-            return run(context)
-        except TypeError:
-            return run()
-    return {"status": "noop"}
+    """AWS Lambda entrypoint: run optimized fast_sync only."""
+    return fast_sync(context=context)
 
 if __name__ == "__main__":
     print("Running live_reports_bot locally…")
