@@ -1,4 +1,4 @@
-import os, json, base64, requests, csv, time, random
+﻿import os, json, base64, requests, csv, time, random
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -87,7 +87,7 @@ NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "286a1576955180d6acdec21f7a45
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "2"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "4"))  # threads for Notion writes
-NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "6"))
+NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "3"))
 # Circuit breaker thresholds to fail fast on persistent errors
 NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
@@ -104,7 +104,8 @@ MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 NOTION_INDEX_MODE = (os.getenv("NOTION_INDEX_MODE", "eids") or "").strip().lower()  # 'eids' or 'window'
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
 NOTIFY_MAX_AGE_DAYS = int(os.getenv("NOTIFY_MAX_AGE_DAYS", "7"))  # do not notify entries older than this on first-seen
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "50"))  # number of new entries to insert per run
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "100"))  # number of new entries to insert per run
+NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "100"))  # number of processed entries to notify per run
 NOTIFY_DURING_INSERT = _env_bool("NOTIFY_DURING_INSERT", False)  # keep old behavior off by default
 
 # Cached Notion schema (property name -> type)
@@ -214,6 +215,22 @@ def _eid_lock(eid: str):
         return _NOTION_LOCK
 
 # ---- Notion health-check ----
+def _reset_notion_circuit():
+    """Reset Notion circuit-breaker state at the beginning of an invocation.
+    This lets warm Lambdas re-attempt a health-check instead of staying disabled.
+    """
+    global NOTION_ENABLED, _NOTION_DISABLED_LOGGED
+    global _NOTION_429_COUNT, _NOTION_5XX_COUNT, _NOTION_EXHAUSTED, _NOTION_EXC_COUNT
+    global _NOTION_RESUME_AT, _NOTION_LAST_CALL
+    NOTION_ENABLED = bool(NOTION_TOKEN and NOTION_DATABASE_ID)
+    _NOTION_DISABLED_LOGGED = False
+    _NOTION_429_COUNT = 0
+    _NOTION_5XX_COUNT = 0
+    _NOTION_EXHAUSTED = 0
+    _NOTION_EXC_COUNT = 0
+    _NOTION_RESUME_AT = 0.0
+    _NOTION_LAST_CALL = 0.0
+
 def notion_health_check() -> tuple[bool, str]:
     """Verify Notion credentials and database access before heavy work.
     Returns (ok, reason). If not ok, NOTION calls are disabled for this run.
@@ -222,10 +239,15 @@ def notion_health_check() -> tuple[bool, str]:
         _disable_notion("missing token or database id")
         return False, "missing_config"
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}"
-    r = _notion_request('GET', url)
-    if not r:
+    # Bypass _notion_request gating for health-check so we can recover after
+    # a previous run disabled Notion in a warm container.
+    try:
+        r = SESSION.get(url, headers=NH, timeout=min(HTTP_TIMEOUT, 8))
+    except Exception:
         return False, "request_failed"
     if r.status_code == 200:
+        # Re-enable if a previous run disabled it
+        _reset_notion_circuit()
         return True, "ok"
     if r.status_code in (401, 403):
         _disable_notion(f"{r.status_code} auth failure")
@@ -1675,12 +1697,20 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
             tags = [t.get("name", "") for t in (props.get(P_TAGS, {}).get("multi_select") or []) if t.get("name")]
             dur_s = props.get(P_DURATION, {}).get("number") or 0
             dur_ms = int(float(dur_s)) * 1000
+            # Start: use P_DATE.start, fallback to page created_time if missing
             dt = props.get(P_DATE, {}).get("date") or {}
-            start_s = dt.get("start") or ""
+            start_s = dt.get("start") or (pg.get("created_time") or "")
             try:
                 start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if start_s else datetime.now(timezone.utc)
             except Exception:
                 start_dt = datetime.now(timezone.utc)
+            # Updated: prefer P_UPDATED.start, then last_edited_time, then created_time
+            upd_prop = props.get(P_UPDATED, {}).get("date") or {}
+            updated_s = upd_prop.get("start") or pg.get("last_edited_time") or pg.get("created_time") or ""
+            try:
+                updated_dt = datetime.strptime(updated_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if updated_s else start_dt
+            except Exception:
+                updated_dt = start_dt
             # Resolve webhook via uid_to_name mapping
             name = uid_to_name.get(user_key) or ""
             wh = user_map.get(name) or user_map_norm.get(_norm(name)) if name else None
@@ -1694,6 +1724,7 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
                 f"📝 **Task:** {desc}",
                 f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}",
                 f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
                 "—",
             ]
             msg = "\n".join(lines)
@@ -1707,6 +1738,8 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
     return notified
 
 def fast_sync(context=None):
+    # Reset circuit so warm containers can re-attempt health-checks
+    _reset_notion_circuit()
     # Fail fast if Notion is not available (invalid token/DB permissions)
     ok, reason = notion_health_check()
     if not ok:
@@ -2104,10 +2137,20 @@ def fast_sync(context=None):
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
-    # Stage-2: notify a batch of Processed items and mark as Notified
-    if NOTIFY_ENABLED and writes_scheduled > 0 and not _should_exit_soon(context):
+    # Flush any remaining per-webhook upserts even if no messages were sent
+    if notion_tasks_by_webhook and not _should_exit_soon(context):
         try:
-            to_notify = min(writes_scheduled, INSERT_BATCH_SIZE)
+            for wh in list(notion_tasks_by_webhook.keys()):
+                if _should_exit_soon(context):
+                    break
+                _flush_webhook(wh)
+        except Exception as e:
+            _alert(f"[ERROR] flush webhook upserts failed: {e}")
+
+    # Stage-2: notify a batch of Processed items and mark as Notified
+    if NOTIFY_ENABLED and not _should_exit_soon(context):
+        try:
+            to_notify = int(NOTIFY_BATCH_SIZE)
             n = notion_notify_processed(to_notify, user_map, user_map_norm, uid_to_name, context)
             notified += n
         except Exception as e:
