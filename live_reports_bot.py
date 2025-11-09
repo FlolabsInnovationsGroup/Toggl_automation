@@ -39,8 +39,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 SEND_ALERT = _env_bool("SEND_ALERT", False)
 DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
-SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", True)
-NOTIFY_ENABLED = (not DRY_RUN_NO_SEND) and SEND_NOTIFICATIONS
+SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
+# Only DRY_RUN_NO_SEND controls whether we actually send notifications.
+# SEND_NOTIFICATIONS must only influence the Notion Status property values.
+NOTIFY_ENABLED = (not DRY_RUN_NO_SEND)
 
 # Deadline-aware controls and throughput priorities
 MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
@@ -244,6 +246,31 @@ def notion_health_check() -> tuple[bool, str]:
         return True, "ok"
     if r.status_code in (401, 403):
         _disable_notion(f"{r.status_code} auth failure")
+        return False, "unauthorized"
+    return False, f"http_{r.status_code}"
+
+def team_db_health_check() -> tuple[bool, str]:
+    """Verify Team Members database is accessible (title property 'Name' present).
+    Returns (ok, reason). If not ok, relation resolution cannot proceed this run.
+    """
+    if not NOTION_TEAM_DB_ID:
+        return False, "missing_team_db_id"
+    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}"
+    try:
+        r = SESSION.get(url, headers=NH, timeout=min(HTTP_TIMEOUT, 8))
+    except Exception:
+        return False, "request_failed"
+    if r.status_code == 200:
+        try:
+            js = r.json() or {}
+            props = js.get("properties") or {}
+            name_prop = props.get("Name", {})
+            if isinstance(name_prop, dict) and name_prop.get("type") == "title":
+                return True, "ok"
+            return False, "missing_name_title"
+        except Exception:
+            return False, "parse_failed"
+    if r.status_code in (401, 403):
         return False, "unauthorized"
     return False, f"http_{r.status_code}"
 
@@ -568,6 +595,15 @@ def _status_val(name: str | None):
     canon = _canon_select(P_STATUS, name)
     return {"status": {"name": canon}}
 
+def _resolve_team_member_pid(user_display: str | None) -> str | None:
+    """Resolve Team Member page id for a given display name using the Team Members DB index.
+    Returns None if not configured or no reasonable match is found.
+    """
+    try:
+        return _best_team_member_page_id(user_display or "")
+    except Exception:
+        return None
+
 def _desc_block(text: str) -> dict:
     txt = (text or "").strip()
     if not txt:
@@ -589,6 +625,56 @@ def _notion_append_blocks(page_id: str, children: list[dict]):
     kids = [c for c in children if c]
     if not kids:
         return
+
+    # Prevent duplicate description blocks: fetch existing paragraph texts (best effort)
+    try:
+        def _para_text(b: dict) -> str:
+            try:
+                if not isinstance(b, dict):
+                    return ""
+                if b.get("type") != "paragraph":
+                    return ""
+                rt = ((b.get("paragraph") or {}).get("rich_text") or [])
+                return "".join([x.get("plain_text", "") for x in rt]).strip()
+            except Exception:
+                return ""
+
+        # Gather new paragraph texts we intend to add
+        new_texts = set()
+        for k in list(kids):
+            t = _para_text(k)
+            if t:
+                new_texts.add(t)
+
+        existing_texts = set()
+        if new_texts:
+            base = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+            r = _notion_request('GET', base)
+            if r and r.status_code == 200:
+                data = r.json() or {}
+                for b in (data.get('results') or []):
+                    txt = _para_text(b)
+                    if txt:
+                        existing_texts.add(txt)
+                # Optionally follow one more page for larger pages
+                if data.get('has_more') and data.get('next_cursor'):
+                    r2 = _notion_request('GET', base + f"&start_cursor={data.get('next_cursor')}")
+                    if r2 and r2.status_code == 200:
+                        data2 = r2.json() or {}
+                        for b in (data2.get('results') or []):
+                            txt = _para_text(b)
+                            if txt:
+                                existing_texts.add(txt)
+
+        # Remove any new blocks that already exist text-identical
+        if existing_texts:
+            kids = [k for k in kids if _para_text(k) not in existing_texts]
+            if not kids:
+                return
+    except Exception:
+        # On any failure, fall back to appending (better to risk a duplicate than to skip)
+        pass
+
     url = f"https://api.notion.com/v1/blocks/{page_id}/children"
     _notion_request('PATCH', url, json_body={"children": kids})
 
@@ -700,6 +786,7 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
 # ---- Team Members index + fuzzy match ----
 _TEAM_MEM_INDEX: list[tuple[str, str, str]] = []  # (norm_name, orig_name, page_id)
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
+ 
 
 def _norm_for_match(s: str) -> str:
     s = (s or "").lower()
@@ -732,10 +819,10 @@ def notion_build_team_members_index():
         for pg in data.get("results") or []:
             pid = pg.get("id")
             props = pg.get("properties", {})
-            # assume title prop named "Name"
-            name = ""
+            # Use the fixed title property "Name"
             t = props.get("Name", {})
-            if t.get("type") == "title":
+            name = ""
+            if isinstance(t, dict) and t.get("type") == "title":
                 for part in (t.get("title") or []):
                     name += part.get("plain_text", "")
             name = (name or "").strip()
@@ -744,6 +831,60 @@ def notion_build_team_members_index():
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
+    if not _TEAM_MEM_INDEX:
+        _alert("[WARN] Team Members index is empty; check NOTION_TEAM_DB_ID and that the 'Name' title property exists.")
+
+def _query_team_member_pid_by_title(name: str) -> str | None:
+    """Directly query Team Members DB to resolve a page id by the title.
+    Tries equals first, then contains; also attempts first token contains.
+    """
+    try:
+        if not (NOTION_TEAM_DB_ID and name and NOTION_ENABLED):
+            return None
+        prop = 'Name'
+        url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query"
+        def _run(flt: dict):
+            body = {"page_size": 50, "filter": flt}
+            r = _notion_request('POST', url, json_body=body)
+            if not r or r.status_code != 200:
+                return []
+            data = r.json() or {}
+            return data.get('results') or []
+        # Try exact equals
+        flt_eq = {"property": prop, "title": {"equals": name}}
+        res = _run(flt_eq)
+        # If no exact, try contains full string
+        if not res:
+            flt_contains = {"property": prop, "title": {"contains": name}}
+            res = _run(flt_contains)
+        # If still none, try first token contains
+        if not res:
+            tok = (name or '').strip().split()[0] if (name or '').strip() else ''
+            if tok and tok.lower() != name.strip().lower():
+                flt_tok = {"property": prop, "title": {"contains": tok}}
+                res = _run(flt_tok)
+        if not res:
+            return None
+        # Choose best match: prefer exact title match, else first
+        best_pid = None
+        best_exact = False
+        want = (name or '').strip().lower()
+        for pg in res:
+            pid = pg.get('id')
+            props = pg.get('properties', {})
+            t = props.get(prop, {})
+            title_txt = ""
+            if isinstance(t, dict) and t.get('type') == 'title':
+                for part in (t.get('title') or []):
+                    title_txt += part.get('plain_text', '')
+            title_txt = (title_txt or '').strip()
+            if title_txt and title_txt.lower() == want:
+                return pid
+            if not best_pid:
+                best_pid = pid
+        return best_pid
+    except Exception:
+        return None
 
 def _best_team_member_page_id(user_display: str) -> str | None:
     if not NOTION_TEAM_DB_ID or not user_display:
@@ -772,6 +913,9 @@ def _best_team_member_page_id(user_display: str) -> str | None:
             best_score = score
             best_pid = cand_pid
     pid = best_pid if best_score >= 0.25 else None
+    # Fallback to targeted DB queries if no good fuzzy match or index empty
+    if not pid:
+        pid = _query_team_member_pid_by_title(user_display)
     _TEAM_MEM_BEST_CACHE[key] = pid
     return pid
 
@@ -878,6 +1022,130 @@ def _notion_find_entry_by_eid(eid: str) -> dict | None:
     _EID_LOOKUP_CACHE[eid] = best
     return best
 
+def _notion_find_entry_by_eid_ws(eid: str, workspace_id: int | None, user_key: str | None = None, start_iso: str | None = None) -> dict | None:
+    """Targeted lookup by Entry ID AND Workspace. Returns the most recently updated exact match.
+    This avoids cross-workspace collisions when Entry IDs overlap across workspaces.
+    """
+    if not eid or workspace_id is None:
+        return None
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+
+    def _query_filter(flt: dict):
+        body = {"page_size": 100, "filter": flt}
+        r = _notion_request('POST', url, json_body=body)
+        if not r or r.status_code != 200:
+            return []
+        data = r.json() or {}
+        return data.get("results") or []
+
+    ptype = _notion_prop_type(P_ENTRY_ID)
+    eid_filters = []
+    if ptype == "number":
+        if not str(eid).isdigit():
+            return None
+        eid_filters.append({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
+    elif ptype == "rich_text":
+        eid_filters.append({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
+    else:
+        # Unknown schema: try both
+        if str(eid).isdigit():
+            eid_filters.append({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
+        eid_filters.append({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
+
+    # Combine with workspace filter (number equals)
+    ws_filter = {"property": P_WORKSPACE, "number": {"equals": int(workspace_id or 0)}}
+    results = []
+    for f in eid_filters:
+        and_flt = {"and": [f, ws_filter]}
+        results.extend(_query_filter(and_flt))
+
+    candidates = []
+    for pg in results:
+        pid = pg.get("id")
+        props = pg.get("properties", {})
+        # Verify exact EID match
+        p = props.get(P_ENTRY_ID, {})
+        exact = False
+        if p.get("type") == "number" and str(eid).isdigit():
+            exact = (p.get("number") is not None and int(p.get("number")) == int(eid))
+        elif p.get("type") == "rich_text":
+            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
+            exact = (txt == str(eid))
+        if not exact:
+            continue
+        # Verify workspace exact match
+        pw = props.get(P_WORKSPACE, {})
+        ws_ok = (pw.get("type") == "number" and pw.get("number") is not None and int(pw.get("number")) == int(workspace_id or 0))
+        if not ws_ok:
+            continue
+        # Build snapshot
+        def _get_date(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or ""
+        def _get_range(n):
+            d = (props.get(n, {}).get("date") or {})
+            return d.get("start") or "", d.get("end") or ""
+        def _get_num(n):
+            q = props.get(n, {})
+            return q.get("number") if q.get("type") == "number" else 0
+        def _get_text(n):
+            q = props.get(n, {})
+            return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
+        def _get_title(n):
+            q = props.get(n, {})
+            if q.get("type") == "title":
+                return "".join([x.get("plain_text", "") for x in (q.get("title") or [])]).strip()
+            if q.get("type") == "rich_text":
+                return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip()
+            return ""
+        def _get_sel(n):
+            q = props.get(n, {})
+            return (q.get("select") or {}).get("name") or "No project"
+        def _get_status(n):
+            q = props.get(n, {})
+            return (q.get("status") or {}).get("name") or ""
+        def _get_tags(n):
+            q = props.get(n, {})
+            return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
+        start_s, end_s = _get_range(P_DATE)
+        updated_s = _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time")
+        # Optional strict user key match
+        if user_key:
+            uk = _get_title(P_USER_KEY)
+            if uk.strip() != (user_key or "").strip():
+                continue
+        # Optional strict start match (within 2 seconds tolerance)
+        if start_iso:
+            try:
+                a = _parse_iso8601(start_s, default=None)
+                b = _parse_iso8601(start_iso, default=None)
+                if not (a and b) or abs((a - b).total_seconds()) > 2.0:
+                    continue
+            except Exception:
+                pass
+        snap = {
+            "dur": int(_get_num(P_DURATION) or 0) * 1000,
+            "desc": _get_text(P_DESCRIPTION),
+            "project": _get_sel(P_PROJECT),
+            "status": _get_status(P_STATUS),
+            "tags": _get_tags(P_TAGS),
+            "start": start_s,
+            "end": end_s,
+            "updated": updated_s,
+            "workspace": int(_get_num(P_WORKSPACE) or 0),
+        }
+        candidates.append({"page_id": pid, "snap": snap})
+
+    if not candidates:
+        return None
+
+    def _ts(s):
+        try:
+            return datetime.strptime((s or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    return max(candidates, key=lambda c: _ts(c["snap"].get("updated")))
+
 def _notion_find_all_by_eid(eid: str) -> list[dict]:
     """Return all exact-match pages for this Entry ID with snapshots."""
     if not eid:
@@ -946,6 +1214,7 @@ def _notion_find_all_by_eid(eid: str) -> list[dict]:
             "start": start_s,
             "end": end_s,
             "updated": _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time"),
+            "workspace": int(_get_num(P_WORKSPACE) or 0),
         }
         out.append({"page_id": pid, "snap": snap})
     return out
@@ -958,31 +1227,41 @@ def notion_cleanup_duplicates_for_ids(eids: set[str], context, keep_ids: set[str
         if _should_exit_soon(context):
             break
         candidates = _notion_find_all_by_eid(eid)
-        exact = candidates
-        if len(exact) <= 1:
+        if not candidates:
             continue
-        examined += 1
-        # Choose canonical: most recent Updated
-        def _ts(c):
-            s = (c.get("snap", {}).get("updated") or "")
+        # Group by workspace to avoid cross-workspace dedupe
+        groups: dict[int, list[dict]] = {}
+        for c in candidates:
+            ws = 0
             try:
-                return datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+                ws = int((c.get("snap", {}).get("workspace") or 0))
             except Exception:
-                return datetime.min.replace(tzinfo=timezone.utc)
-        # Prefer known freshly upserted page if provided
-        if keep_ids:
-            exact.sort(key=lambda c: (c.get("page_id") in keep_ids, _ts(c)), reverse=True)
-        else:
-            exact.sort(key=_ts, reverse=True)
-        keep = exact[0]
-        losers = [c for c in exact[1:MAX_DEDUPE_MARKS_PER_ID+1] if not (keep_ids and c.get("page_id") in keep_ids)]
-        for loser in losers:
-            if _should_exit_soon(context):
-                break
-            pid = loser.get("page_id")
-            if pid:
-                _notion_archive_page(pid)
-                cleaned += 1
+                ws = 0
+            groups.setdefault(ws, []).append(c)
+        for ws, exact in groups.items():
+            if len(exact) <= 1:
+                continue
+            examined += 1
+            # Choose canonical: most recent Updated
+            def _ts(c):
+                s = (c.get("snap", {}).get("updated") or "")
+                try:
+                    return datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
+                except Exception:
+                    return datetime.min.replace(tzinfo=timezone.utc)
+            if keep_ids:
+                exact.sort(key=lambda c: (c.get("page_id") in keep_ids, _ts(c)), reverse=True)
+            else:
+                exact.sort(key=_ts, reverse=True)
+            keep = exact[0]
+            losers = [c for c in exact[1:MAX_DEDUPE_MARKS_PER_ID+1] if not (keep_ids and c.get("page_id") in keep_ids)]
+            for loser in losers:
+                if _should_exit_soon(context):
+                    break
+                pid = loser.get("page_id")
+                if pid:
+                    _notion_archive_page(pid)
+                    cleaned += 1
     return {"examined": examined, "cleaned": cleaned}
 
 # (legacy _notion_query_user removed)
@@ -991,6 +1270,11 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
     if not NOTION_ENABLED:
         return existing.get("page_id") if isinstance(existing, dict) else None
     eid=str(entry.get("id"))
+    # Resolve Team Member (mandatory)
+    tm_pid = (entry.get("team_member_pid") if isinstance(entry, dict) else None) or _resolve_team_member_pid(entry.get("user") or "")
+    if not tm_pid:
+        _alert(f"[WARN] Team Member not found for '{entry.get('user')}' (eid {eid}, ws {workspace_id}); skipping upsert.")
+        return existing.get("page_id") if isinstance(existing, dict) else None
     # Guard against duplicates: do lookup under an EID lock before create
     lk = _eid_lock(eid)
     # We intentionally keep the lock small in scope; we don't hold it across network requests
@@ -1004,17 +1288,13 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         P_DURATION: _num_val(int(int(entry.get("dur",0))/1000)),
         P_WORKSPACE:_num_val(int(workspace_id or 0)),
         P_DESCRIPTION: _rt_val(entry.get("description") or ""),
+        P_TEAM_MEMBER: _relation(tm_pid),
     }
     st = entry.get("status")
     if P_STATUS and st:
         sv = _status_val(st)
         if sv:
             props[P_STATUS] = sv
-    # Team Member relation if available
-    if NOTION_TEAM_DB_ID and P_TEAM_MEMBER:
-        tm_pid = _best_team_member_page_id(entry.get("user") or "")
-        if tm_pid:
-            props[P_TEAM_MEMBER] = _relation(tm_pid)
     if existing and existing.get("page_id"):
         page_id = existing['page_id']
         _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
@@ -1025,7 +1305,7 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         # Try to create idempotently: lock eid, lookup, then create, then on conflict lookup and patch
         # 1) pre-create lookup under lock
         with lk:
-            found = _notion_find_entry_by_eid(eid)
+            found = _notion_find_entry_by_eid_ws(eid, workspace_id, user_key=user_key, start_iso=entry.get("start"))
             if found:
                 page_id = found.get("page_id")
                 if page_id:
@@ -1049,7 +1329,7 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
                     return None
             else:
                 # 3) if failed (e.g., 409), lookup again and patch
-                found2 = _notion_find_entry_by_eid(eid)
+                found2 = _notion_find_entry_by_eid_ws(eid, workspace_id, user_key=user_key, start_iso=entry.get("start"))
                 if found2 and found2.get("page_id"):
                     page_id = found2.get("page_id")
                     _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
@@ -1154,6 +1434,7 @@ def notion_build_window_index(since: datetime, until: datetime) -> tuple[dict, d
                 "start": start_s,
                 "end": end_s,
                 "updated": updated_s,
+                "workspace": int(_get_num(P_WORKSPACE) or 0),
             }
             by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
             if user_key:
@@ -1246,6 +1527,7 @@ def notion_build_index_for_eids(eids: list[str]) -> dict:
                 "start": start_s,
                 "end": end_s,
                 "updated": updated_s,
+                "workspace": int(_get_num(P_WORKSPACE) or 0),
             }
             out[str(eid)] = {"page_id": pid, "snap": snap}
     return out
@@ -1363,6 +1645,11 @@ def fast_sync(context=None):
     if not ok:
         _alert(f"[WARN] Notion health-check failed: {reason}. Aborting sync.")
         return {"status": "notion_auth_failed", "reason": reason}
+    # Verify Team Members DB access early to avoid noisy logs
+    t_ok, t_reason = team_db_health_check()
+    if not t_ok:
+        _alert(f"[WARN] Team Members DB health-check failed: {t_reason}. Aborting sync.")
+        return {"status": "team_db_unreachable", "reason": t_reason}
     # Ensure we have enough time left to perform Notion work
     try:
         if context and hasattr(context, 'get_remaining_time_in_millis'):
@@ -1402,27 +1689,33 @@ def fast_sync(context=None):
     if mode == 'window':
         by_eid, by_user = notion_build_window_index(since, now)
 
-    notion_tasks: list[tuple] = []
+    # Stage tasks separately to prioritize NEW inserts over updates
+    staged_new: list[tuple] = []
+    staged_updates: list[tuple] = []
     scheduled_upserts: set[tuple] = set()
-    writes_scheduled = 0
     WRITES_LIMIT = min(INSERT_BATCH_SIZE, int(os.getenv("MAX_NOTION_WRITES_PER_RUN", "300")))
     processed_eids: set[str] = set()
     current_ids_by_user: dict[str, set[str]] = {}
     keep_upserted_ids: set[str] = set()
     uid_to_name: dict[str, str] = {}
 
-    def _queue_upsert(existing, notion_user_key, notion_entry, wid, add_block):
-        nonlocal writes_scheduled
+    def _queue_new(existing, notion_user_key, notion_entry, wid, add_block):
         if not NOTION_ENABLED:
-            return
-        if writes_scheduled >= WRITES_LIMIT:
             return
         key = (notion_user_key, notion_entry.get("id"))
         if key in scheduled_upserts:
             return
         scheduled_upserts.add(key)
-        writes_scheduled += 1
-        notion_tasks.append((existing, notion_user_key, notion_entry, wid, add_block))
+        staged_new.append((existing, notion_user_key, notion_entry, wid, add_block))
+
+    def _queue_update(existing, notion_user_key, notion_entry, wid, add_block):
+        if not NOTION_ENABLED:
+            return
+        key = (notion_user_key, notion_entry.get("id"))
+        if key in scheduled_upserts:
+            return
+        scheduled_upserts.add(key)
+        staged_updates.append((existing, notion_user_key, notion_entry, wid, add_block))
 
     notified = 0
     all_entries = []  # when mode='eids', collect first then index
@@ -1496,6 +1789,19 @@ def fast_sync(context=None):
 
                 prev = by_eid.get(eid)
                 prev_snap = (prev or {}).get("snap") or {}
+                # Guard against cross-workspace collisions: ignore prev if workspace mismatches
+                try:
+                    prev_ws = int(prev_snap.get("workspace") or 0)
+                except Exception:
+                    prev_ws = 0
+                if prev and prev_ws != int(wid or 0):
+                    prev = None
+                    prev_snap = {}
+                # Guard against user mismatch if index provides user_key
+                if prev and isinstance(prev, dict) and prev.get("user_key"):
+                    if prev.get("user_key") != (f"user:{uid}" if uid is not None else user):
+                        prev = None
+                        prev_snap = {}
                 first_seen = prev is None
                 prev_dur = int(prev_snap.get("dur", dur_ms))
                 prev_desc = prev_snap.get("desc", desc)
@@ -1515,10 +1821,16 @@ def fast_sync(context=None):
                 changed_tags = old_set != new_set
                 changed_start = (start_dt != prev_start_dt)
                 # Insert only first-seen entries here (batch-limited)
-                if first_seen and writes_scheduled < WRITES_LIMIT:
+                if first_seen:
+                    # Require Team Member relation on insert
+                    tm_pid = _resolve_team_member_pid(user)
+                    if not tm_pid:
+                        _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
+                        continue
                     notion_entry = {
                         "id": eid,
                         "user": user,
+                        "team_member_pid": tm_pid,
                         "project": project,
                         "tags": tags,
                         "dur": dur_ms,
@@ -1531,7 +1843,26 @@ def fast_sync(context=None):
                     add_block = True
                     # Insert with Processed or Ignored based on SEND_NOTIFICATIONS
                     notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
-                    _queue_upsert(existing, notion_user_key, notion_entry, wid, add_block)
+                    _queue_new(existing, notion_user_key, notion_entry, wid, add_block)
+
+                # For existing entries, upsert when any key field changed
+                elif (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
+                    notion_entry = {
+                        "id": eid,
+                        "user": user,
+                        "project": project,
+                        "tags": tags,
+                        "dur": dur_ms,
+                        "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "description": desc,
+                        # Reset status to Processed so staged notifier can send updates
+                        "status": STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED,
+                    }
+                    existing = {"page_id": (prev or {}).get("page_id")}
+                    add_block = changed_desc
+                    _queue_update(existing, notion_user_key, notion_entry, wid, add_block)
 
     # If in EID index mode, build Notion index now and process accumulated entries
     if mode == 'eids':
@@ -1589,6 +1920,14 @@ def fast_sync(context=None):
 
             prev = by_eid.get(eid)
             prev_snap = (prev or {}).get("snap") or {}
+            # Guard against cross-workspace collisions in EID index mode
+            try:
+                prev_ws = int(prev_snap.get("workspace") or 0)
+            except Exception:
+                prev_ws = 0
+            if prev and prev_ws != int(wid or 0):
+                prev = None
+                prev_snap = {}
             first_seen = prev is None
             prev_dur = int(prev_snap.get("dur", dur_ms))
             prev_desc = prev_snap.get("desc", desc)
@@ -1609,10 +1948,16 @@ def fast_sync(context=None):
             changed_start = (start_dt != prev_start_dt)
 
             # Insert only first-seen entries (batch-limited)
-            if first_seen and writes_scheduled < WRITES_LIMIT:
+            if first_seen:
+                # Require Team Member relation on insert
+                tm_pid = _resolve_team_member_pid(user)
+                if not tm_pid:
+                    _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
+                    continue
                 notion_entry = {
                     "id": eid,
                     "user": user,
+                    "team_member_pid": tm_pid,
                     "project": project,
                     "tags": tags,
                     "dur": dur_ms,
@@ -1624,7 +1969,37 @@ def fast_sync(context=None):
                 existing = None
                 add_block = True
                 notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
-                _queue_upsert(existing, notion_user_key, notion_entry, wid, add_block)
+                _queue_new(existing, notion_user_key, notion_entry, wid, add_block)
+
+            # For existing entries, upsert when any key field changed
+            elif (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
+                notion_entry = {
+                    "id": eid,
+                    "user": user,
+                    "project": project,
+                    "tags": tags,
+                    "dur": dur_ms,
+                    "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                    "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                    "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                    "description": desc,
+                    "status": STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED,
+                }
+                existing = {"page_id": (prev or {}).get("page_id")}
+                add_block = changed_desc
+                _queue_update(existing, notion_user_key, notion_entry, wid, add_block)
+
+    # Build prioritized task list: NEW entries first, then updates
+    notion_tasks: list[tuple] = []
+    for t in staged_new:
+        if len(notion_tasks) >= WRITES_LIMIT:
+            break
+        notion_tasks.append(t)
+    if len(notion_tasks) < WRITES_LIMIT:
+        for t in staged_updates:
+            if len(notion_tasks) >= WRITES_LIMIT:
+                break
+            notion_tasks.append(t)
 
     # Run Notion upserts for all scheduled entries
     if notion_tasks and not _should_exit_soon(context):
