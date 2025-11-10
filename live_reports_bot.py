@@ -37,6 +37,19 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v == "" and default: return True
     return (v or "").strip().lower() in ("1","true","yes","y","on")
 
+# Notion ID helpers
+def _norm_notion_id(s: str | None) -> str:
+    try:
+        return "".join(ch for ch in str(s or "") if ch.isalnum()).lower()
+    except Exception:
+        return str(s or "")
+
+def _dashify_notion_id(s: str | None) -> str:
+    n = _norm_notion_id(s)
+    if len(n) == 32:
+        return f"{n[0:8]}-{n[8:12]}-{n[12:16]}-{n[16:20]}-{n[20:32]}"
+    return s or ""
+
 SEND_ALERT = _env_bool("SEND_ALERT", False)
 DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
 SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
@@ -81,6 +94,8 @@ STATUS_NOTIFIED  = os.getenv("NOTION_STATUS_NOTIFIED", "Notified")
 STATUS_PROCESSED = os.getenv("NOTION_STATUS_PROCESSED", "Processed")
 STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "286a1576955180d6acdec21f7a45dfcc").strip()
+NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
+NOTION_TEAM_DB_ID_DASH = _dashify_notion_id(NOTION_TEAM_DB_ID)
 
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "2"))            # target rps (global per integration)
@@ -255,7 +270,7 @@ def team_db_health_check() -> tuple[bool, str]:
     """
     if not NOTION_TEAM_DB_ID:
         return False, "missing_team_db_id"
-    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}"
+    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}"
     try:
         r = SESSION.get(url, headers=NH, timeout=min(HTTP_TIMEOUT, 8))
     except Exception:
@@ -274,10 +289,43 @@ def team_db_health_check() -> tuple[bool, str]:
         return False, "unauthorized"
     return False, f"http_{r.status_code}"
 
+def verify_team_member_relation_target() -> tuple[bool, str, str | None]:
+    """Verify that the Time Entries DB relation property points to NOTION_TEAM_DB_ID.
+    Returns (ok, reason, found_target_db_id).
+    """
+    try:
+        if not (NOTION_DATABASE_ID and NOTION_TEAM_DB_ID):
+            return False, "missing_config", None
+        url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}"
+        r = _notion_request('GET', url)
+        if not r or r.status_code != 200:
+            return False, "time_entries_db_get_failed", None
+        js = r.json() or {}
+        props = js.get("properties") or {}
+        tm = props.get(P_TEAM_MEMBER, {})
+        if not isinstance(tm, dict) or tm.get("type") != "relation":
+            return False, "team_member_prop_not_relation", None
+        target = ((tm.get("relation") or {}).get("database_id") or "").strip()
+        if not target:
+            return False, "relation_missing_target", None
+        if _norm_notion_id(target) != _norm_notion_id(NOTION_TEAM_DB_ID):
+            return False, "relation_target_mismatch", target
+        return True, "ok", target
+    except Exception:
+        return False, "exception", None
+
 # ------------------ DynamoDB removed ------------------
 
 def _alert(msg: str):
-    print(f"[ALERT] {msg}")
+    try:
+        print(f"[ALERT] {msg}")
+    except Exception:
+        # Fallback for consoles that can't encode certain Unicode chars
+        try:
+            safe = (msg or "").encode('ascii', 'ignore').decode('ascii')
+        except Exception:
+            safe = str(msg)
+        print("[ALERT] " + safe)
     if SYSTEM_ALERT_WEBHOOK and SEND_ALERT:
         try: SESSION.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
         except Exception: pass
@@ -786,6 +834,7 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
 # ---- Team Members index + fuzzy match ----
 _TEAM_MEM_INDEX: list[tuple[str, str, str]] = []  # (norm_name, orig_name, page_id)
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
+_TEAM_SCHEMA_LOGGED = False
  
 
 def _norm_for_match(s: str) -> str:
@@ -805,18 +854,39 @@ def _tokenize(s: str) -> set[str]:
 def notion_build_team_members_index():
     if not NOTION_TEAM_DB_ID or _TEAM_MEM_INDEX:
         return
-    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query"
-    payload = {"page_size": 100}
+    # (schema logging removed)
+    try:
+        global _TEAM_SCHEMA_LOGGED
+        _TEAM_SCHEMA_LOGGED = True
+    except Exception:
+        pass
+    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}/query"
+    try:
+        TM_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "50"))
+    except Exception:
+        TM_PAGE_SIZE = 50
+    payload = {"page_size": max(1, min(100, TM_PAGE_SIZE))}
     cursor = None
+    names_found: list[str] = []
+    def _tm_query(body: dict, max_attempts: int = 3):
+        for attempt in range(1, max_attempts + 1):
+            r = _notion_request('POST', url, json_body=body, timeout=max(HTTP_TIMEOUT, 60))
+            if r and r.status_code == 200:
+                return r
+            # brief backoff on failure; _notion_request already backed off for rate/5xx
+            time.sleep(0.3 * attempt)
+        return None
     while True:
         body = dict(payload)
         if cursor:
             body["start_cursor"] = cursor
-        r = _notion_request('POST', url, json_body=body)
+        r = _tm_query(body)
         if not r or r.status_code != 200:
+            _alert("[WARN] Team Members query failed or timed out; stopping index build early.")
             break
         data = r.json() or {}
-        for pg in data.get("results") or []:
+        page_results = data.get("results") or []
+        for pg in page_results:
             pid = pg.get("id")
             props = pg.get("properties", {})
             # Use the fixed title property "Name"
@@ -828,11 +898,17 @@ def notion_build_team_members_index():
             name = (name or "").strip()
             if pid and name:
                 _TEAM_MEM_INDEX.append((_norm_for_match(name), name, pid))
+                try:
+                    names_found.append(name)
+                except Exception:
+                    pass
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
     if not _TEAM_MEM_INDEX:
         _alert("[WARN] Team Members index is empty; check NOTION_TEAM_DB_ID and that the 'Name' title property exists.")
+    else:
+        pass
 
 def _query_team_member_pid_by_title(name: str) -> str | None:
     """Directly query Team Members DB to resolve a page id by the title.
@@ -842,14 +918,15 @@ def _query_team_member_pid_by_title(name: str) -> str | None:
         if not (NOTION_TEAM_DB_ID and name and NOTION_ENABLED):
             return None
         prop = 'Name'
-        url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query"
+        url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}/query"
         def _run(flt: dict):
             body = {"page_size": 50, "filter": flt}
             r = _notion_request('POST', url, json_body=body)
             if not r or r.status_code != 200:
                 return []
             data = r.json() or {}
-            return data.get('results') or []
+            res = data.get('results') or []
+            return res
         # Try exact equals
         flt_eq = {"property": prop, "title": {"equals": name}}
         res = _run(flt_eq)
@@ -863,6 +940,14 @@ def _query_team_member_pid_by_title(name: str) -> str | None:
             if tok and tok.lower() != name.strip().lower():
                 flt_tok = {"property": prop, "title": {"contains": tok}}
                 res = _run(flt_tok)
+        # If still none, try Notion search API as a last resort
+        if not res:
+            try:
+                pid = _search_team_member_pid_by_title(name)
+                if pid:
+                    return pid
+            except Exception:
+                pass
         if not res:
             return None
         # Choose best match: prefer exact title match, else first
@@ -886,6 +971,51 @@ def _query_team_member_pid_by_title(name: str) -> str | None:
     except Exception:
         return None
 
+def _search_team_member_pid_by_title(name: str) -> str | None:
+    """Use Notion search API to find a Team Member page by title, scoped to the Team Members DB."""
+    try:
+        if not (NOTION_TEAM_DB_ID and name and NOTION_ENABLED):
+            return None
+        url = "https://api.notion.com/v1/search"
+        body = {
+            "query": name,
+            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            "filter": {"property": "object", "value": "page"}
+        }
+        r = _notion_request('POST', url, json_body=body, timeout=max(HTTP_TIMEOUT, 30))
+        if not r or r.status_code != 200:
+            return None
+        data = r.json() or {}
+        want_db = _norm_notion_id(NOTION_TEAM_DB_ID)
+        cand: list[tuple[float, str, str]] = []  # (score, title, pid)
+        for pg in data.get('results') or []:
+            pid = pg.get('id')
+            parent = pg.get('parent') or {}
+            parent_db = _norm_notion_id(parent.get('database_id') or '') if (parent.get('type') == 'database_id') else ''
+            if parent_db != want_db:
+                continue
+            props = pg.get('properties', {})
+            t = props.get('Name', {})
+            title_txt = ''
+            if isinstance(t, dict) and t.get('type') == 'title':
+                for part in (t.get('title') or []):
+                    title_txt += part.get('plain_text', '')
+            title_txt = (title_txt or '').strip()
+            if not title_txt:
+                continue
+            want = (name or '').strip().lower()
+            tt = title_txt.lower()
+            score = 1.0 if tt == want else (0.6 if want in tt or tt in want else 0.0)
+            if score > 0.0:
+                cand.append((score, title_txt, pid))
+        if not cand:
+            return None
+        cand.sort(reverse=True, key=lambda x: x[0])
+        best = cand[0]
+        return best[2]
+    except Exception:
+        return None
+
 def _best_team_member_page_id(user_display: str) -> str | None:
     if not NOTION_TEAM_DB_ID or not user_display:
         return None
@@ -894,8 +1024,11 @@ def _best_team_member_page_id(user_display: str) -> str | None:
         return _TEAM_MEM_BEST_CACHE[key]
     if not _TEAM_MEM_INDEX:
         notion_build_team_members_index()
+    
     best_pid = None
     best_score = 0.0
+    best_name = None
+    top: list[tuple[float, str, str]] = []  # (score, orig_name, pid)
     in_tokens = _tokenize(user_display)
     in_norm = _norm_for_match(user_display)
     for cand_norm, _orig, cand_pid in _TEAM_MEM_INDEX:
@@ -909,13 +1042,28 @@ def _best_team_member_page_id(user_display: str) -> str | None:
         if in_norm and cand_norm and (in_norm in cand_norm or cand_norm in in_norm):
             bonus += 0.10
         score = jacc + bonus
+        # Track top candidates
+        try:
+            if len(top) < 5:
+                top.append((score, _orig, cand_pid))
+            else:
+                low_i = min(range(len(top)), key=lambda i: top[i][0])
+                if score > top[low_i][0]:
+                    top[low_i] = (score, _orig, cand_pid)
+        except Exception:
+            pass
         if score > best_score:
             best_score = score
             best_pid = cand_pid
+            best_name = _orig
+    # Log top candidates
+    
     pid = best_pid if best_score >= 0.25 else None
+    
     # Fallback to targeted DB queries if no good fuzzy match or index empty
     if not pid:
         pid = _query_team_member_pid_by_title(user_display)
+        
     _TEAM_MEM_BEST_CACHE[key] = pid
     return pid
 
@@ -1650,6 +1798,14 @@ def fast_sync(context=None):
     if not t_ok:
         _alert(f"[WARN] Team Members DB health-check failed: {t_reason}. Aborting sync.")
         return {"status": "team_db_unreachable", "reason": t_reason}
+    # Ensure Time Entries relation points to the configured Team Members DB
+    rel_ok, rel_reason, rel_target = verify_team_member_relation_target()
+    if not rel_ok:
+        if rel_reason == "relation_target_mismatch":
+            _alert(f"[WARN] Team Member relation target mismatch. NOTION_TEAM_DB_ID={NOTION_TEAM_DB_ID} actual_target={rel_target}")
+        else:
+            _alert(f"[WARN] Team Member relation verify failed: {rel_reason}")
+        return {"status": "team_db_relation_mismatch", "reason": rel_reason, "found_target": rel_target}
     # Ensure we have enough time left to perform Notion work
     try:
         if context and hasattr(context, 'get_remaining_time_in_millis'):
