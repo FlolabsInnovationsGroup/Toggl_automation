@@ -431,7 +431,8 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
         tok_tail = f"…{api_token[-4:]}"
         _TOKEN_ERROR_COUNTS[api_token] = _TOKEN_ERROR_COUNTS.get(api_token, 0) + 1
         if r.status_code == 402:
-            _alert(f"get_workspaces_for_token: 402 You may be rate/plan limited. Token {tok_tail}. Skipping this token for this run.")
+            # Downgrade plan/feature limitation to DEBUG noise
+            print(f"[DEBUG] get_workspaces_for_token: 402 plan-limited. Token {tok_tail}. Skipping this token for this run.")
             _EXHAUSTED_TOKENS.add(api_token)
         elif 400 <= r.status_code < 500:
             _alert(f"get_workspaces_for_token: {r.status_code} {r.text.strip()} (token {tok_tail})")
@@ -492,7 +493,8 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
         # Non-200
         txt = (resp.text or "").strip()
         if resp.status_code == 402:
-            _alert(f"details fetch failed: 402 (token {tok_tail}, ws {workspace_id}) - {txt}")
+            # Downgrade repeated plan/feature limitations to DEBUG noise
+            print(f"[DEBUG] details fetch 402 (token {tok_tail}, ws {workspace_id}) - {txt}")
             _UNSUPPORTED_REPORTS.add(key)
             break
         if resp.status_code in (429, 500, 502, 503, 504):
@@ -2145,13 +2147,17 @@ def fast_sync(context=None):
                 add_block = changed_desc
                 _queue_update(existing, notion_user_key, notion_entry, wid, add_block)
 
-    # Build prioritized task list: NEW entries first, then updates
+    # Build prioritized task list
+    # Requirement: As long as there are new (not-yet-in-DB) entries,
+    # do NOT run any updates. Only when there are zero new entries
+    # do we schedule updates.
     notion_tasks: list[tuple] = []
-    for t in staged_new:
-        if len(notion_tasks) >= WRITES_LIMIT:
-            break
-        notion_tasks.append(t)
-    if len(notion_tasks) < WRITES_LIMIT:
+    if staged_new:
+        for t in staged_new:
+            if len(notion_tasks) >= WRITES_LIMIT:
+                break
+            notion_tasks.append(t)
+    else:
         for t in staged_updates:
             if len(notion_tasks) >= WRITES_LIMIT:
                 break
