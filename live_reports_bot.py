@@ -115,8 +115,8 @@ MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "80"))
 MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 NOTION_INDEX_MODE = (os.getenv("NOTION_INDEX_MODE", "eids") or "").strip().lower()  # 'eids' or 'window'
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "100"))  # number of new entries to insert per run
-NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "100"))  # number of processed entries to notify per run
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "20"))  # number of new entries to insert per run
+NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "20"))  # number of processed entries to notify per run
 
 # Cached Notion schema (property name -> type)
 _NOTION_SCHEMA: dict[str, str] = {}
