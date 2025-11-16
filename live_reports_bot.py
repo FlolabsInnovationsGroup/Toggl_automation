@@ -26,7 +26,7 @@ TEAM_GID = os.getenv("TEAM_GID", "2144513925")
 WORKSPACES_GID = os.getenv("WORKSPACES_GID", "536270775")
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/api/webhooks/1401155910126272553/xF3EHp8wQlA0mx4tvcUXvvzUmXBoJgfNae21TN6N-a7mZR699QdGLkqPGQjgtKkxj2_I")
 
-TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "60"))
+TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
 # Use a generous default HTTP timeout so Notion/index queries can complete
 # even on slower networks. Can be overridden via HTTP_TIMEOUT_SECONDS env.
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
@@ -58,7 +58,7 @@ SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
 # SEND_NOTIFICATIONS must only influence the Notion Status property values for newly inserted entries.
 
 # Deadline-aware controls and throughput priorities
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "120"))  # soft cap when context missing
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "12"))   # leave safety margin for shutdown
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
@@ -864,7 +864,8 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
     return None
 
 # ---- Team Members index + fuzzy match ----
-_TEAM_MEM_INDEX: list[tuple[str, str, str]] = []  # (norm_name, orig_name, page_id)
+_TEAM_MEM_INDEX: list[tuple[str, str, str, str]] = []  # (norm_name, orig_name, page_id, webhook_url)
+_TEAM_MEM_WEBHOOK_BY_ID: dict[str, str] = {}           # page_id -> webhook_url
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
 # Debug helpers: sample names and log cap so we can inspect fuzzy matches
@@ -877,7 +878,20 @@ except Exception:
 
 
 def _norm_for_match(s: str) -> str:
-    s = (s or "").lower()
+    """Normalize a human name for fuzzy matching.
+    Lowercase, remove accents/diacritics, drop punctuation, and collapse spaces.
+    This makes 'Ángel Caro' and 'Angel Caro' (or 'Filip Łysak' and 'Filip Lysak')
+    comparable.
+    """
+    import unicodedata
+    s = (s or "")
+    try:
+        # Strip accents/diacritics (NFKD + remove combining marks)
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    except Exception:
+        pass
+    s = s.lower()
     out = []
     for ch in s:
         if ch.isalnum() or ch.isspace():
@@ -971,8 +985,19 @@ def notion_build_team_members_index():
                             name += part.get("plain_text", "")
                         break
             name = (name or "").strip()
+            # Extract webhook URL from Team Members DB (single url property "webhook" or "Webhook")
+            w = ""
+            try:
+                wh_prop = props.get("webhook") or props.get("Webhook") or {}
+                if isinstance(wh_prop, dict) and wh_prop.get("type") == "url":
+                    w = (wh_prop.get("url") or "").strip()
+            except Exception:
+                w = ""
             if pid and name:
-                _TEAM_MEM_INDEX.append((_norm_for_match(name), name, pid))
+                norm = _norm_for_match(name)
+                _TEAM_MEM_INDEX.append((norm, name, pid, w))
+                if w:
+                    _TEAM_MEM_WEBHOOK_BY_ID[pid] = w
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
@@ -994,7 +1019,7 @@ def _best_team_member_page_id(user_display: str) -> str | None:
     top: list[tuple[float, str, str]] = []  # (score, orig_name, pid)
     in_tokens = _tokenize(user_display)
     in_norm = _norm_for_match(user_display)
-    for cand_norm, _orig, cand_pid in _TEAM_MEM_INDEX:
+    for cand_norm, _orig, cand_pid, _wh in _TEAM_MEM_INDEX:
         cand_tokens = set(cand_norm.split())
         inter = len(in_tokens & cand_tokens)
         union = len(in_tokens | cand_tokens)
@@ -1581,14 +1606,16 @@ def _get_title_text(prop: dict) -> str:
 
 def _get_webhook_url_from_props(props: dict) -> str:
     """Extract Webhook URL from the Time Entries DB properties.
-    Supports direct url/rich_text/title as well as rollup lookups.
+    Supports direct url/rich_text/title as well as rollup lookups and, if missing,
+    falls back to the Team Members index (using the Team Member relation).
     """
     try:
         if not isinstance(props, dict):
             return ""
+        # Primary: Webhook property on Time Entries
         pw = props.get(P_WEBHOOK, {})
         if not isinstance(pw, dict):
-            return ""
+            pw = {}
         ptype = pw.get("type")
         # Direct url property
         if ptype == "url":
@@ -1625,14 +1652,30 @@ def _get_webhook_url_from_props(props: dict) -> str:
             elif rtype == "date":
                 d = roll.get("date") or {}
                 return (d.get("start") or "").strip()
+        # Fallback: use Team Member relation -> Team Members index (no extra Notion calls)
+        try:
+            tm = props.get(P_TEAM_MEMBER, {})
+            if isinstance(tm, dict) and tm.get("type") == "relation":
+                rel = (tm.get("relation") or [])
+                if rel:
+                    tm_pid = (rel[0].get("id") or "").strip()
+                    if tm_pid and tm_pid in _TEAM_MEM_WEBHOOK_BY_ID:
+                        return (_TEAM_MEM_WEBHOOK_BY_ID.get(tm_pid) or "").strip()
+        except Exception:
+            pass
         return ""
     except Exception:
         return ""
 
-def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid_to_name: dict, context=None) -> int:
+def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid_to_name: dict, context=None) -> tuple[int, int]:
+    """Notify up to `limit` Processed time entries.
+    Returns (notified_count, skipped_count) where skipped_count includes
+    Processed entries that were examined but had no usable webhook.
+    """
     if not NOTION_ENABLED or limit <= 0:
-        return 0
+        return 0, 0
     notified = 0
+    skipped = 0
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     body = {
         "page_size": min(100, int(limit)),
@@ -1663,10 +1706,16 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
             body["start_cursor"] = cursor
         r = _notion_request('POST', url, json_body=body)
         if not r or r.status_code != 200:
+            _alert(f"[WARN] notion_notify_processed query failed: status={getattr(r, 'status_code', None)}")
             break
         js = r.json() or {}
         results = js.get("results") or []
+        try:
+            _alert(f"[DEBUG] notion_notify_processed batch: results={len(results)} notified_so_far={notified}")
+        except Exception:
+            pass
         if not results:
+            # No more Processed items to notify
             break
 
         outbox_pairs: dict[str, list[tuple[str, str]]] = {}
@@ -1691,6 +1740,12 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
             # Webhook URL is stored on the Time Entries DB as a lookup from Team Members.webhook
             wh = _get_webhook_url_from_props(props)
             if not wh:
+                # Helpful debug: show why a Processed item is being skipped
+                skipped += 1
+                try:
+                    _alert(f"[DEBUG] Skipping Processed entry without webhook: user_key={user_key} proj={proj}")
+                except Exception:
+                    pass
                 continue
             # Prefer mapped display name from current run; fall back to stored user_key
             name = uid_to_name.get(user_key) or user_key or ""
@@ -1725,7 +1780,7 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
             break
         cursor = js.get("next_cursor")
 
-    return notified
+    return notified, skipped
 
 def fast_sync(context=None):
     # Track per-invocation runtime so _remaining_s can enforce MAX_RUNTIME_S
@@ -1785,6 +1840,20 @@ def fast_sync(context=None):
     now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
     by_eid, by_user = notion_build_window_index(since, now, context=context)
 
+    # Stage-2 (early): notify a batch of already-Processed items and mark as Notified.
+    # This runs before heavy Toggl/Notion work so notifications are not starved by time budget.
+    notified = 0
+    skipped_notifies = 0
+    uid_to_name: dict[str, str] = {}
+    if NOTION_ENABLED and not _should_exit_soon(context):
+        try:
+            to_notify = int(NOTIFY_BATCH_SIZE)
+            n, skipped = notion_notify_processed(to_notify, user_map, user_map_norm, uid_to_name, context)
+            notified += n
+            skipped_notifies += skipped
+        except Exception as e:
+            _alert(f"[ERROR] notify processed (early) failed: {e}")
+
     # Stage tasks separately to prioritize NEW inserts over updates
     staged_new: list[tuple] = []
     staged_updates: list[tuple] = []
@@ -1793,7 +1862,6 @@ def fast_sync(context=None):
     processed_eids: set[str] = set()
     current_ids_by_user: dict[str, set[str]] = {}
     keep_upserted_ids: set[str] = set()
-    uid_to_name: dict[str, str] = {}
 
     def _queue_new(existing, notion_user_key, notion_entry, wid, add_block):
         if not NOTION_ENABLED:
@@ -1813,7 +1881,6 @@ def fast_sync(context=None):
         scheduled_upserts.add(key)
         staged_updates.append((existing, notion_user_key, notion_entry, wid, add_block))
 
-    notified = 0
     for token in workspaces:
         if _should_exit_soon(context):
             break
@@ -1980,15 +2047,6 @@ def fast_sync(context=None):
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
-    # Stage-2: notify a batch of Processed items and mark as Notified
-    if not _should_exit_soon(context):
-        try:
-            to_notify = int(NOTIFY_BATCH_SIZE)
-            n = notion_notify_processed(to_notify, user_map, user_map_norm, uid_to_name, context)
-            notified += n
-        except Exception as e:
-            _alert(f"[ERROR] notify processed failed: {e}")
-
     # Deletions based on Notion index vs current run (window index always available)
     delete_tasks = []
     if not _should_exit_soon(context) and NOTION_ENABLE_DELETION_SCAN:
@@ -2028,7 +2086,7 @@ def fast_sync(context=None):
         except Exception as e:
             _alert(f"[ERROR] Dedupe failed: {e}")
 
-    return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":0,"send_notifications": SEND_NOTIFICATIONS}
+    return {"status":"complete","notified":notified,"skipped_notifies":skipped_notifies,"skipped_deletions":0,"send_notifications": SEND_NOTIFICATIONS}
 
 # ---- Local main for testing ----
 # (legacy lambda_handler overload removed)
