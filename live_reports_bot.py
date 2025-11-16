@@ -58,7 +58,7 @@ SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
 # SEND_NOTIFICATIONS must only influence the Notion Status property values for newly inserted entries.
 
 # Deadline-aware controls and throughput priorities
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "120"))  # soft cap when context missing
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "12"))   # leave safety margin for shutdown
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
@@ -871,7 +871,7 @@ _TEAM_MEM_NAME_BY_ID: dict[str, str] = {}              # page_id -> original nam
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
 # Debug helpers: sample names and log cap so we can inspect fuzzy matches
-_TEAM_DEBUG_NAMES = {"mariya", "haya al nuwab"}
+_TEAM_DEBUG_NAMES = {"mariya", "haya al nuwab", "filip lysak", "hajni katona"}
 _TEAM_DEBUG_LOG_COUNT = 0
 try:
     _TEAM_DEBUG_MAX_LOGS = int(os.getenv("TEAM_MATCH_DEBUG_MAX", "10"))
@@ -1047,7 +1047,7 @@ def _best_team_member_page_id(user_display: str) -> str | None:
             best_score = score
             best_pid = cand_pid
             best_name = _orig
-    pid = best_pid if best_score >= 0.40 else None
+    pid = best_pid if best_score >= 0.30 else None
 
     # Debug logging for selected sample names (first few runs only)
     global _TEAM_DEBUG_LOG_COUNT
@@ -2128,7 +2128,7 @@ def fast_sync(context=None):
         except Exception as e:
             _alert(f"[ERROR] Dedupe failed: {e}")
 
-    return {"status":"complete","notified":notified,"skipped_notifies":skipped_notifies,"skipped_deletions":0,"send_notifications": SEND_NOTIFICATIONS}
+    return {"status":"complete","notified":notified,"skipped_notifies":skipped_notifies,"send_notifications": SEND_NOTIFICATIONS}
 
 # ---- Local main for testing ----
 # (legacy lambda_handler overload removed)
@@ -2142,6 +2142,58 @@ class _LocalContext:
 def lambda_handler(event, context):
     """AWS Lambda entrypoint: run optimized fast_sync only."""
     return fast_sync(context=context)
+
+def _norm_for_match(s: str) -> str:
+    """Normalize a human name for fuzzy matching.
+    Lowercase, remove accents/diacritics, map Latin letters with strokes/variants
+    (e.g. Ł/ł) to their ASCII base, drop punctuation, and collapse spaces.
+    This makes "Ángel Caro" vs "Angel Caro" and "Filip Łysak" vs "Filip Lysak"
+    comparable.
+    """
+    import unicodedata
+
+    s = (s or "")
+    try:
+        # First apply compatibility decomposition so composed accents are split out.
+        s = unicodedata.normalize("NFKD", s)
+
+        def _latin_base(ch: str) -> str:
+            """Best-effort ASCII base for Latin letters like Ł, Ø, Đ, etc."""
+            # Keep fast path for plain ASCII
+            if ord(ch) < 128:
+                return ch
+            name = unicodedata.name(ch, "")
+            if "LATIN" in name and " LETTER " in name:
+                # E.g. 'LATIN CAPITAL LETTER L WITH STROKE' -> 'L'
+                try:
+                    after = name.split(" LETTER ", 1)[1]
+                    base_word = after.split(" WITH ", 1)[0].strip().split(" ")[0]
+                    if base_word:
+                        # Preserve case of the original character
+                        return base_word[0].lower() if ch.islower() else base_word[0].upper()
+                except Exception:
+                    pass
+            return ch
+
+        # Strip combining marks, then map remaining Latin letters with diacritics/strokes
+        # to their ASCII base characters.
+        s = "".join(_latin_base(ch) for ch in s if not unicodedata.combining(ch))
+    except Exception:
+        # On any failure, fall back to simple lowercasing and spacing rules below.
+        s = (s or "")
+
+    s = s.lower()
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace():
+            out.append(ch)
+        else:
+            out.append(" ")
+    s2 = "".join(out)
+    return " ".join(s2.split())
+
+def _tokenize(s: str) -> set[str]:
+    return set(_norm_for_match(s).split())
 
 if __name__ == "__main__":
     print("Running live_reports_bot locally…")
