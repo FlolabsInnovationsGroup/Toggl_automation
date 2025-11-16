@@ -80,6 +80,7 @@ NH = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28",
 NOTION_ENABLED = bool(NOTION_TOKEN and NOTION_DATABASE_ID)
 _NOTION_DISABLED_LOGGED = False
 P_USER_KEY    = os.getenv("NOTION_PROP_USER_KEY", "User Key")
+P_USER_ID     = os.getenv("NOTION_PROP_USER_ID", "ID")
 P_ENTRY_ID    = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")
 P_PROJECT     = os.getenv("NOTION_PROP_PROJECT", "Project")
 P_TAGS        = os.getenv("NOTION_PROP_TAGS", "Tags")
@@ -866,6 +867,7 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
 # ---- Team Members index + fuzzy match ----
 _TEAM_MEM_INDEX: list[tuple[str, str, str, str]] = []  # (norm_name, orig_name, page_id, webhook_url)
 _TEAM_MEM_WEBHOOK_BY_ID: dict[str, str] = {}           # page_id -> webhook_url
+_TEAM_MEM_NAME_BY_ID: dict[str, str] = {}              # page_id -> original name
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
 # Debug helpers: sample names and log cap so we can inspect fuzzy matches
@@ -996,6 +998,7 @@ def notion_build_team_members_index():
             if pid and name:
                 norm = _norm_for_match(name)
                 _TEAM_MEM_INDEX.append((norm, name, pid, w))
+                _TEAM_MEM_NAME_BY_ID[pid] = name
                 if w:
                     _TEAM_MEM_WEBHOOK_BY_ID[pid] = w
         if not data.get("has_more"):
@@ -1421,7 +1424,9 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
     lk = _eid_lock(eid)
     # We intentionally keep the lock small in scope; we don't hold it across network requests
     props={
+        # User Key now stores the Toggl display name
         P_USER_KEY: _title_val(user_key),
+        # Entry ID remains the Toggl time entry id
         P_ENTRY_ID: {"number": int(eid)} if eid.isdigit() else _rt_val(eid),
         P_PROJECT:  _select_val(entry.get("project")),
         P_TAGS:     _multi_val(entry.get("tags") or []),
@@ -1432,6 +1437,28 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         P_DESCRIPTION: _rt_val(entry.get("description") or ""),
         P_TEAM_MEMBER: _relation(tm_pid),
     }
+    # Optional: store Toggl user id in a separate "ID" property
+    try:
+        user_id = entry.get("user_id")
+        if P_USER_ID and user_id is not None:
+            # Match the actual Notion property type for ID
+            try:
+                id_prop_type = _notion_prop_type(P_USER_ID)
+            except Exception:
+                id_prop_type = None
+            if id_prop_type == "number":
+                try:
+                    num = int(user_id)
+                except Exception:
+                    num = None
+                props[P_USER_ID] = _num_val(num)
+            elif id_prop_type == "rich_text":
+                props[P_USER_ID] = _rt_val(str(user_id))
+            else:
+                # Fallback: treat as rich_text to avoid validation errors on unknown schema
+                props[P_USER_ID] = _rt_val(str(user_id))
+    except Exception:
+        pass
     st = entry.get("status")
     if P_STATUS and st:
         sv = _status_val(st)
@@ -1747,8 +1774,20 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
                 except Exception:
                     pass
                 continue
-            # Prefer mapped display name from current run; fall back to stored user_key
-            name = uid_to_name.get(user_key) or user_key or ""
+            # Prefer Team Member name from relation, then fall back to User Key
+            name = user_key or ""
+            try:
+                tm = props.get(P_TEAM_MEMBER, {})
+                if isinstance(tm, dict) and tm.get("type") == "relation":
+                    rel = (tm.get("relation") or [])
+                    if rel:
+                        tm_pid = (rel[0].get("id") or "").strip()
+                        if tm_pid:
+                            tm_name = _TEAM_MEM_NAME_BY_ID.get(tm_pid) or ""
+                            if tm_name:
+                                name = tm_name
+            except Exception:
+                pass
             lines = [
                 f"## 🆕 Time Entry",
                 f"👤 **User**: {name or user_key}",
@@ -1914,7 +1953,8 @@ def fast_sync(context=None):
                 uid = e.get("uid")
 
                 processed_eids.add(eid)
-                notion_user_key = f"user:{uid}" if uid is not None else user
+                # Use the Toggl display name as the Notion User Key value
+                notion_user_key = user
                 current_ids_by_user.setdefault(notion_user_key, set()).add(eid)
                 # Map Notion user_key to display name for notifications
                 if notion_user_key and user:
@@ -1980,6 +2020,7 @@ def fast_sync(context=None):
                     notion_entry = {
                         "id": eid,
                         "user": user,
+                        "user_id": uid,
                         "team_member_pid": tm_pid,
                         "project": project,
                         "tags": tags,
@@ -2001,6 +2042,7 @@ def fast_sync(context=None):
                     notion_entry = {
                         "id": eid,
                         "user": user,
+                        "user_id": uid,
                         "project": project,
                         "tags": tags,
                         "dur": dur_ms,
