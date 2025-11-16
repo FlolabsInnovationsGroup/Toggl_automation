@@ -17,7 +17,8 @@ def _init_http_session():
         pass
 
 _init_http_session()
-_START_TS = time.monotonic()
+_START_TS = time.monotonic()  # module import time (kept for compatibility)
+_RUN_START_TS = 0.0           # set at the beginning of each invocation
 
 # ENV
 GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "https://docs.google.com/spreadsheets/d/1nBwSZ_uk2l1dcQcRXrNLXyBUevZABVHNK3FE71toWl4/edit?gid=536270775#gid=536270775")
@@ -25,8 +26,10 @@ TEAM_GID = os.getenv("TEAM_GID", "2144513925")
 WORKSPACES_GID = os.getenv("WORKSPACES_GID", "536270775")
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/api/webhooks/1401155910126272553/xF3EHp8wQlA0mx4tvcUXvvzUmXBoJgfNae21TN6N-a7mZR699QdGLkqPGQjgtKkxj2_I")
 
-TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "60"))
+# Use a generous default HTTP timeout so Notion/index queries can complete
+# even on slower networks. Can be overridden via HTTP_TIMEOUT_SECONDS env.
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
 
 DISCORD_MIN_INTERVAL_MS = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
 DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))
@@ -51,14 +54,11 @@ def _dashify_notion_id(s: str | None) -> str:
     return s or ""
 
 SEND_ALERT = _env_bool("SEND_ALERT", False)
-DRY_RUN_NO_SEND = _env_bool("DRY_RUN_NO_SEND", False)
 SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
-# Only DRY_RUN_NO_SEND controls whether we actually send notifications.
-# SEND_NOTIFICATIONS must only influence the Notion Status property values.
-NOTIFY_ENABLED = (not DRY_RUN_NO_SEND)
+# SEND_NOTIFICATIONS must only influence the Notion Status property values for newly inserted entries.
 
 # Deadline-aware controls and throughput priorities
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "300"))  # soft cap when context missing
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "120"))  # soft cap when context missing
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "12"))   # leave safety margin for shutdown
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
@@ -90,6 +90,7 @@ P_WORKSPACE   = os.getenv("NOTION_PROP_WORKSPACE", "Workspace")
 P_DESCRIPTION = os.getenv("NOTION_PROP_DESCRIPTION", "Description")
 P_TEAM_MEMBER = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")
 P_STATUS      = os.getenv("NOTION_PROP_STATUS", "Status")
+P_WEBHOOK     = "Webhook"  # Time Entries lookup from Team Members.webhook
 STATUS_NOTIFIED  = os.getenv("NOTION_STATUS_NOTIFIED", "Notified")
 STATUS_PROCESSED = os.getenv("NOTION_STATUS_PROCESSED", "Processed")
 STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
@@ -111,9 +112,9 @@ MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "60"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "40"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 MAX_TARGETED_LOOKUPS_PER_RUN = int(os.getenv("MAX_TARGETED_LOOKUPS_PER_RUN", "0"))
-MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "80"))
+MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "40"))
 MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
-NOTION_INDEX_MODE = (os.getenv("NOTION_INDEX_MODE", "eids") or "").strip().lower()  # 'eids' or 'window'
+NOTION_INDEX_MODE = "window"  # Fixed optimal index mode
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
 INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "20"))  # number of new entries to insert per run
 NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "20"))  # number of processed entries to notify per run
@@ -396,13 +397,41 @@ def _headers_for_token(api_token: str) -> dict:
     return {"Authorization": "Basic " + base64.b64encode(f"{api_token}:api_token".encode()).decode()}
 
 def _remaining_s(context) -> float:
+    """Best-effort remaining seconds for this invocation.
+    Prefer the AWS Lambda context timer when available; fall back to wall-clock
+    from the per-run _RUN_START_TS so we still enforce MAX_RUNTIME_S even if
+    context is absent or non-decreasing (e.g., local tests).
+    """
+    now = time.monotonic()
+    # Wall-clock remaining based on per-run start timestamp
     try:
-        return max(0.0, context.get_remaining_time_in_millis() / 1000.0)
+        if _RUN_START_TS:
+            elapsed = max(0.0, now - _RUN_START_TS)
+            wall_remaining = max(0.0, MAX_RUNTIME_S - elapsed)
+        else:
+            wall_remaining = MAX_RUNTIME_S
     except Exception:
-        # best-effort runtime if no context is present
-        return MAX_RUNTIME_S
+        wall_remaining = MAX_RUNTIME_S
+
+    ctx_remaining = None
+    try:
+        if context and hasattr(context, "get_remaining_time_in_millis"):
+            ctx_remaining = max(0.0, context.get_remaining_time_in_millis() / 1000.0)
+    except Exception:
+        ctx_remaining = None
+
+    if ctx_remaining is None:
+        return wall_remaining
+    # Be conservative and respect the tighter of the two budgets
+    return min(ctx_remaining, wall_remaining)
 
 def _should_exit_soon(context) -> bool:
+    """Return True when this run should stop scheduling work.
+    If Notion is disabled, the script's main purpose (updating Notion)
+    cannot be fulfilled, so we abort quickly instead of doing extra Toggl work.
+    """
+    if not NOTION_ENABLED:
+        return True
     return _remaining_s(context) <= EXIT_MARGIN_S
 
 def _budget_take(n: int = 1) -> bool:
@@ -585,7 +614,8 @@ def _respect_global_interval():
         if elapsed_ms < DISCORD_GLOBAL_MIN_INTERVAL_MS: _sleep_ms(DISCORD_GLOBAL_MIN_INTERVAL_MS - elapsed_ms)
     _last_send_ts_global = time.monotonic()
 def send_discord_with_backoff(webhook_url: str, content: str, timeout: int = 20) -> bool:
-    if not NOTIFY_ENABLED: return True
+    if not webhook_url:
+        return False
     _respect_global_interval(); _respect_min_interval(webhook_url)
     payload = {"content": content}; attempt = 0; base = 1.0
     while attempt < DISCORD_MAX_RETRIES:
@@ -837,7 +867,14 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
 _TEAM_MEM_INDEX: list[tuple[str, str, str]] = []  # (norm_name, orig_name, page_id)
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
- 
+# Debug helpers: sample names and log cap so we can inspect fuzzy matches
+_TEAM_DEBUG_NAMES = {"mariya", "haya al nuwab"}
+_TEAM_DEBUG_LOG_COUNT = 0
+try:
+    _TEAM_DEBUG_MAX_LOGS = int(os.getenv("TEAM_MATCH_DEBUG_MAX", "10"))
+except Exception:
+    _TEAM_DEBUG_MAX_LOGS = 10
+
 
 def _norm_for_match(s: str) -> str:
     s = (s or "").lower()
@@ -854,169 +891,93 @@ def _tokenize(s: str) -> set[str]:
     return set(_norm_for_match(s).split())
 
 def notion_build_team_members_index():
+    """Build an in-memory index of Team Members pages.
+
+    Design goals:
+    - Exactly one Notion query loop per warm container (guarded by existing index).
+    - No use of the global Notion circuit breaker; failures here never disable Notion globally.
+    - Robust name extraction: prefer TEAM_TITLE_PROP/"Name", fall back to first title property.
+    """
     if not NOTION_TEAM_DB_ID or _TEAM_MEM_INDEX:
         return
-    # (schema logging removed)
+    # Fast-fail when basic Notion config is missing
+    if not (NOTION_TOKEN and NOTION_TEAM_DB_ID_DASH):
+        return
     try:
         global _TEAM_SCHEMA_LOGGED
         _TEAM_SCHEMA_LOGGED = True
     except Exception:
         pass
+
     url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}/query"
     try:
-        TM_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "50"))
+        # Smaller default page size to keep each Team Members query fast
+        TM_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "25"))
     except Exception:
-        TM_PAGE_SIZE = 50
+        TM_PAGE_SIZE = 25
     payload = {"page_size": max(1, min(100, TM_PAGE_SIZE))}
     cursor = None
-    names_found: list[str] = []
-    def _tm_query(body: dict, max_attempts: int = 3):
-        for attempt in range(1, max_attempts + 1):
-            r = _notion_request('POST', url, json_body=body, timeout=max(HTTP_TIMEOUT, 60))
-            if r and r.status_code == 200:
-                return r
-            # brief backoff on failure; _notion_request already backed off for rate/5xx
+
+    def _tm_request(body: dict) -> dict | None:
+        """Dedicated lightweight request for Team Members DB.
+        Does not use the global _notion_request circuit breaker.
+        Uses a generous timeout because this runs once per 5 minutes."""
+        timeout_s = max(HTTP_TIMEOUT, 60)
+        for attempt in range(1, 3):
+            try:
+                r = SESSION.post(url, headers=NH, json=body, timeout=timeout_s)
+            except Exception as e:
+                if attempt >= 2:
+                    _alert(f"[WARN] Team Members query exception: {e}")
+                    return None
+                time.sleep(0.3 * attempt)
+                continue
+            if r.status_code == 200:
+                try:
+                    return r.json() or {}
+                except Exception:
+                    return None
+            # For auth/config errors, log once and stop.
+            if r.status_code in (400, 401, 403, 404):
+                _alert(f"[WARN] Team Members query failed {r.status_code}: {r.text}")
+                return None
+            # For transient 5xx/429, brief backoff then retry.
             time.sleep(0.3 * attempt)
         return None
+
     while True:
         body = dict(payload)
         if cursor:
             body["start_cursor"] = cursor
-        r = _tm_query(body)
-        if not r or r.status_code != 200:
+        data = _tm_request(body)
+        if not data:
             _alert("[WARN] Team Members query failed or timed out; stopping index build early.")
             break
-        data = r.json() or {}
         page_results = data.get("results") or []
         for pg in page_results:
             pid = pg.get("id")
             props = pg.get("properties", {})
-            # Use the fixed title property "Name"
-            t = props.get("Name", {})
+            # Prefer TEAM_TITLE_PROP/"Name", fall back to first title property
+            t = props.get(os.getenv("TEAM_TITLE_PROP", "Name"), {})
             name = ""
             if isinstance(t, dict) and t.get("type") == "title":
                 for part in (t.get("title") or []):
                     name += part.get("plain_text", "")
+            if not name:
+                # Fallback: first title property in the page
+                for v in props.values():
+                    if isinstance(v, dict) and v.get("type") == "title":
+                        for part in (v.get("title") or []):
+                            name += part.get("plain_text", "")
+                        break
             name = (name or "").strip()
             if pid and name:
                 _TEAM_MEM_INDEX.append((_norm_for_match(name), name, pid))
-                try:
-                    names_found.append(name)
-                except Exception:
-                    pass
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
     if not _TEAM_MEM_INDEX:
-        _alert("[WARN] Team Members index is empty; check NOTION_TEAM_DB_ID and that the 'Name' title property exists.")
-    else:
-        pass
-
-def _query_team_member_pid_by_title(name: str) -> str | None:
-    """Directly query Team Members DB to resolve a page id by the title.
-    Tries equals first, then contains; also attempts first token contains.
-    """
-    try:
-        if not (NOTION_TEAM_DB_ID and name and NOTION_ENABLED):
-            return None
-        prop = 'Name'
-        url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}/query"
-        def _run(flt: dict):
-            body = {"page_size": 50, "filter": flt}
-            r = _notion_request('POST', url, json_body=body)
-            if not r or r.status_code != 200:
-                return []
-            data = r.json() or {}
-            res = data.get('results') or []
-            return res
-        # Try exact equals
-        flt_eq = {"property": prop, "title": {"equals": name}}
-        res = _run(flt_eq)
-        # If no exact, try contains full string
-        if not res:
-            flt_contains = {"property": prop, "title": {"contains": name}}
-            res = _run(flt_contains)
-        # If still none, try first token contains
-        if not res:
-            tok = (name or '').strip().split()[0] if (name or '').strip() else ''
-            if tok and tok.lower() != name.strip().lower():
-                flt_tok = {"property": prop, "title": {"contains": tok}}
-                res = _run(flt_tok)
-        # If still none, try Notion search API as a last resort
-        if not res:
-            try:
-                pid = _search_team_member_pid_by_title(name)
-                if pid:
-                    return pid
-            except Exception:
-                pass
-        if not res:
-            return None
-        # Choose best match: prefer exact title match, else first
-        best_pid = None
-        best_exact = False
-        want = (name or '').strip().lower()
-        for pg in res:
-            pid = pg.get('id')
-            props = pg.get('properties', {})
-            t = props.get(prop, {})
-            title_txt = ""
-            if isinstance(t, dict) and t.get('type') == 'title':
-                for part in (t.get('title') or []):
-                    title_txt += part.get('plain_text', '')
-            title_txt = (title_txt or '').strip()
-            if title_txt and title_txt.lower() == want:
-                return pid
-            if not best_pid:
-                best_pid = pid
-        return best_pid
-    except Exception:
-        return None
-
-def _search_team_member_pid_by_title(name: str) -> str | None:
-    """Use Notion search API to find a Team Member page by title, scoped to the Team Members DB."""
-    try:
-        if not (NOTION_TEAM_DB_ID and name and NOTION_ENABLED):
-            return None
-        url = "https://api.notion.com/v1/search"
-        body = {
-            "query": name,
-            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
-            "filter": {"property": "object", "value": "page"}
-        }
-        r = _notion_request('POST', url, json_body=body, timeout=max(HTTP_TIMEOUT, 30))
-        if not r or r.status_code != 200:
-            return None
-        data = r.json() or {}
-        want_db = _norm_notion_id(NOTION_TEAM_DB_ID)
-        cand: list[tuple[float, str, str]] = []  # (score, title, pid)
-        for pg in data.get('results') or []:
-            pid = pg.get('id')
-            parent = pg.get('parent') or {}
-            parent_db = _norm_notion_id(parent.get('database_id') or '') if (parent.get('type') == 'database_id') else ''
-            if parent_db != want_db:
-                continue
-            props = pg.get('properties', {})
-            t = props.get('Name', {})
-            title_txt = ''
-            if isinstance(t, dict) and t.get('type') == 'title':
-                for part in (t.get('title') or []):
-                    title_txt += part.get('plain_text', '')
-            title_txt = (title_txt or '').strip()
-            if not title_txt:
-                continue
-            want = (name or '').strip().lower()
-            tt = title_txt.lower()
-            score = 1.0 if tt == want else (0.6 if want in tt or tt in want else 0.0)
-            if score > 0.0:
-                cand.append((score, title_txt, pid))
-        if not cand:
-            return None
-        cand.sort(reverse=True, key=lambda x: x[0])
-        best = cand[0]
-        return best[2]
-    except Exception:
-        return None
+        _alert("[WARN] Team Members index is empty; check NOTION_TEAM_DB_ID and that the Team Members DB has a title column.")
 
 def _best_team_member_page_id(user_display: str) -> str | None:
     if not NOTION_TEAM_DB_ID or not user_display:
@@ -1058,14 +1019,20 @@ def _best_team_member_page_id(user_display: str) -> str | None:
             best_score = score
             best_pid = cand_pid
             best_name = _orig
-    # Log top candidates
-    
-    pid = best_pid if best_score >= 0.25 else None
-    
-    # Fallback to targeted DB queries if no good fuzzy match or index empty
-    if not pid:
-        pid = _query_team_member_pid_by_title(user_display)
-        
+    pid = best_pid if best_score >= 0.40 else None
+
+    # Debug logging for selected sample names (first few runs only)
+    global _TEAM_DEBUG_LOG_COUNT
+    try:
+        if _norm_for_match(user_display) in _TEAM_DEBUG_NAMES and _TEAM_DEBUG_LOG_COUNT < _TEAM_DEBUG_MAX_LOGS:
+            _TEAM_DEBUG_LOG_COUNT += 1
+            _alert(
+                f"[DEBUG] Team match for '{user_display}': "
+                f"candidate='{best_name or ''}' score={best_score:.3f} selected_pid={pid or '<none>'}"
+            )
+    except Exception:
+        pass
+
     _TEAM_MEM_BEST_CACHE[key] = pid
     return pid
 
@@ -1505,7 +1472,7 @@ def _notion_archive_page(page_id: str):
 # (legacy run() removed)
 
 # ---- Optimized Notion window indexing and fast sync ----
-def notion_build_window_index(since: datetime, until: datetime) -> tuple[dict, dict]:
+def notion_build_window_index(since: datetime, until: datetime, context=None) -> tuple[dict, dict]:
     """Query Notion once for the window and build indexes.
     Returns (by_eid, by_user).
     by_eid: eid -> {page_id, snap, user_key}
@@ -1522,6 +1489,9 @@ def notion_build_window_index(since: datetime, until: datetime) -> tuple[dict, d
     ]}}
     cursor = None
     while True:
+        # Abort early if time budget is nearly exhausted
+        if context is not None and _should_exit_soon(context):
+            break
         body = dict(payload)
         if cursor:
             body["start_cursor"] = cursor
@@ -1530,6 +1500,8 @@ def notion_build_window_index(since: datetime, until: datetime) -> tuple[dict, d
             break
         js = r.json() or {}
         for pg in js.get("results") or []:
+            if context is not None and _should_exit_soon(context):
+                break
             pid = pg.get("id")
             props = pg.get("properties", {})
             # EID
@@ -1589,98 +1561,14 @@ def notion_build_window_index(since: datetime, until: datetime) -> tuple[dict, d
             by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
             if user_key:
                 by_user.setdefault(user_key, {})[str(eid)] = {"page_id": pid, "snap": snap}
-        if not js.get("has_more"):
+            # Enforce a hard cap on indexed entries per run
+            if MAX_INDEX_EIDS_PER_RUN > 0 and len(by_eid) >= MAX_INDEX_EIDS_PER_RUN:
+                break
+        # Stop if we've hit limits or there is no more data
+        if (MAX_INDEX_EIDS_PER_RUN > 0 and len(by_eid) >= MAX_INDEX_EIDS_PER_RUN) or not js.get("has_more"):
             break
         cursor = js.get("next_cursor")
     return by_eid, by_user
-
-def notion_build_index_for_eids(eids: list[str]) -> dict:
-    """Query Notion for only the given Entry IDs in batches. Returns by_eid mapping."""
-    out: dict[str, dict] = {}
-    if not (NOTION_TOKEN and NOTION_DATABASE_ID) or not eids:
-        return out
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    # Cap the total number of EIDs we index per run
-    if len(eids) > MAX_INDEX_EIDS_PER_RUN:
-        eids = eids[:MAX_INDEX_EIDS_PER_RUN]
-    # Determine property type once
-    ptype = _notion_prop_type(P_ENTRY_ID)
-    # Chunk EIDs to reasonable batch size
-    # Keep batches small to avoid Notion filter limits and rate pressure
-    try:
-        BATCH = int(os.getenv("NOTION_EID_BATCH", "20"))
-    except Exception:
-        BATCH = 20
-    for i in range(0, len(eids), BATCH):
-        batch = eids[i:i+BATCH]
-        flts = []
-        if ptype == 'number':
-            for eid in batch:
-                if eid.isdigit():
-                    flts.append({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
-        elif ptype == 'rich_text':
-            for eid in batch:
-                flts.append({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
-        else:
-            # Unknown schema; try both types
-            for eid in batch:
-                if eid.isdigit():
-                    flts.append({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
-                flts.append({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
-        if not flts:
-            continue
-        body = {"page_size": 100, "filter": {"or": flts}}
-        r = _notion_request('POST', url, json_body=body)
-        if not r or r.status_code != 200:
-            continue
-        js = r.json() or {}
-        for pg in js.get("results") or []:
-            pid = pg.get("id")
-            props = pg.get("properties", {})
-            # Extract eid and snap (same as window index builder)
-            eid = None
-            p = props.get(P_ENTRY_ID, {})
-            if p.get("type") == "number" and p.get("number") is not None:
-                try:
-                    eid = str(int(p.get("number")))
-                except Exception:
-                    eid = None
-            elif p.get("type") == "rich_text":
-                eid = ("".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])])).strip()
-            if not eid:
-                continue
-            def _get_date(n):
-                d = (props.get(n, {}).get("date") or {})
-                return d.get("start") or ""
-            def _get_range(n):
-                d = (props.get(n, {}).get("date") or {})
-                return d.get("start") or "", d.get("end") or ""
-            def _get_num(n):
-                q = props.get(n, {})
-                return q.get("number") if q.get("type") == "number" else 0
-            def _get_text(n):
-                q = props.get(n, {})
-                return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
-            def _get_sel(n):
-                q = props.get(n, {})
-                return (q.get("select") or {}).get("name") or "No project"
-            def _get_tags(n):
-                q = props.get(n, {})
-                return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
-            start_s, end_s = _get_range(P_DATE)
-            updated_s = _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time")
-            snap = {
-                "dur": int(_get_num(P_DURATION) or 0) * 1000,
-                "desc": _get_text(P_DESCRIPTION),
-                "project": _get_sel(P_PROJECT),
-                "tags": _get_tags(P_TAGS),
-                "start": start_s,
-                "end": end_s,
-                "updated": updated_s,
-                "workspace": int(_get_num(P_WORKSPACE) or 0),
-            }
-            out[str(eid)] = {"page_id": pid, "snap": snap}
-    return out
 
 def _get_title_text(prop: dict) -> str:
     if not isinstance(prop, dict):
@@ -1690,6 +1578,56 @@ def _get_title_text(prop: dict) -> str:
     if prop.get("type") == "rich_text":
         return "".join([p.get("plain_text", "") for p in (prop.get("rich_text") or [])]).strip()
     return ""
+
+def _get_webhook_url_from_props(props: dict) -> str:
+    """Extract Webhook URL from the Time Entries DB properties.
+    Supports direct url/rich_text/title as well as rollup lookups.
+    """
+    try:
+        if not isinstance(props, dict):
+            return ""
+        pw = props.get(P_WEBHOOK, {})
+        if not isinstance(pw, dict):
+            return ""
+        ptype = pw.get("type")
+        # Direct url property
+        if ptype == "url":
+            return (pw.get("url") or "").strip()
+        # Text-based properties
+        if ptype == "rich_text":
+            return "".join([x.get("plain_text", "") for x in (pw.get("rich_text") or [])]).strip()
+        if ptype == "title":
+            return "".join([x.get("plain_text", "") for x in (pw.get("title") or [])]).strip()
+        # Lookup/rollup from Team Members.webhook
+        if ptype == "rollup":
+            roll = pw.get("rollup") or {}
+            rtype = roll.get("type")
+            if rtype == "array":
+                for it in (roll.get("array") or []):
+                    if not isinstance(it, dict):
+                        continue
+                    it_type = it.get("type")
+                    if it_type == "url":
+                        u = (it.get("url") or "").strip()
+                        if u:
+                            return u
+                    if it_type == "rich_text":
+                        txt = "".join([x.get("plain_text", "") for x in (it.get("rich_text") or [])]).strip()
+                        if txt:
+                            return txt
+                    if it_type == "title":
+                        txt = "".join([x.get("plain_text", "") for x in (it.get("title") or [])]).strip()
+                        if txt:
+                            return txt
+            elif rtype == "number":
+                v = roll.get("number")
+                return (str(v).strip() if v is not None else "")
+            elif rtype == "date":
+                d = roll.get("date") or {}
+                return (d.get("start") or "").strip()
+        return ""
+    except Exception:
+        return ""
 
 def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid_to_name: dict, context=None) -> int:
     if not NOTION_ENABLED or limit <= 0:
@@ -1750,10 +1688,12 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
             upd_prop = props.get(P_UPDATED, {}).get("date") or {}
             updated_s = upd_prop.get("start") or pg.get("last_edited_time") or pg.get("created_time") or ""
             updated_dt = _parse_iso8601(updated_s, default=start_dt)
-            name = uid_to_name.get(user_key) or ""
-            wh = user_map.get(name) or user_map_norm.get(_norm(name)) if name else None
-            if not (NOTIFY_ENABLED and wh):
+            # Webhook URL is stored on the Time Entries DB as a lookup from Team Members.webhook
+            wh = _get_webhook_url_from_props(props)
+            if not wh:
                 continue
+            # Prefer mapped display name from current run; fall back to stored user_key
+            name = uid_to_name.get(user_key) or user_key or ""
             lines = [
                 f"## 🆕 Time Entry",
                 f"👤 **User**: {name or user_key}",
@@ -1788,6 +1728,10 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
     return notified
 
 def fast_sync(context=None):
+    # Track per-invocation runtime so _remaining_s can enforce MAX_RUNTIME_S
+    global _RUN_START_TS
+    _RUN_START_TS = time.monotonic()
+
     # Reset circuit so warm containers can re-attempt health-checks
     _reset_notion_circuit()
     # Fail fast if Notion is not available (invalid token/DB permissions)
@@ -1822,11 +1766,8 @@ def fast_sync(context=None):
     if not workspaces:
         _alert("WORKSPACES sheet empty or unreachable."); return {"status":"no_workspaces"}
 
-    if NOTIFY_ENABLED:
-        user_map={t["name"]:t.get("discord_webhook_url","" ).strip() for t in team if t.get("discord_webhook_url")}
-        user_map_norm={_norm(k):v for k,v in user_map.items()}
-    else:
-        user_map={}; user_map_norm={}
+    user_map={t["name"]:t.get("discord_webhook_url","" ).strip() for t in team if t.get("discord_webhook_url")}
+    user_map_norm={_norm(k):v for k,v in user_map.items()}
 
     try:
         if not _NOTION_SCHEMA:
@@ -1842,10 +1783,7 @@ def fast_sync(context=None):
             pass
 
     now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
-    by_eid, by_user = ({}, {})
-    mode = (NOTION_INDEX_MODE or 'eids')
-    if mode == 'window':
-        by_eid, by_user = notion_build_window_index(since, now)
+    by_eid, by_user = notion_build_window_index(since, now, context=context)
 
     # Stage tasks separately to prioritize NEW inserts over updates
     staged_new: list[tuple] = []
@@ -1876,7 +1814,6 @@ def fast_sync(context=None):
         staged_updates.append((existing, notion_user_key, notion_entry, wid, add_block))
 
     notified = 0
-    all_entries = []  # when mode='eids', collect first then index
     for token in workspaces:
         if _should_exit_soon(context):
             break
@@ -1896,20 +1833,6 @@ def fast_sync(context=None):
             for e in entries:
                 if _should_exit_soon(context):
                     break
-                # If using EID index mode, collect entries and process later
-                if mode == 'eids':
-                    # capture uid->name for later notifications
-                    try:
-                        uid = e.get('uid')
-                        user = e.get('user') or ''
-                        if uid is not None and user:
-                            uid_to_name[f"user:{uid}"] = user
-                    except Exception:
-                        pass
-                    all_entries.append((wid, e))
-                    continue
-
-                # Otherwise (window index mode), process on the fly with the prebuilt index
                 eid = str(e.get("id") or "").strip()
                 user = e.get("user") or ""
                 if not eid or not user:
@@ -1926,8 +1849,9 @@ def fast_sync(context=None):
                 processed_eids.add(eid)
                 notion_user_key = f"user:{uid}" if uid is not None else user
                 current_ids_by_user.setdefault(notion_user_key, set()).add(eid)
-
-                wh = user_map.get(user) or user_map_norm.get(_norm(user)) if NOTIFY_ENABLED else None
+                # Map Notion user_key to display name for notifications
+                if notion_user_key and user:
+                    uid_to_name.setdefault(notion_user_key, user)
 
                 try:
                     start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if start_s else now
@@ -1978,6 +1902,7 @@ def fast_sync(context=None):
                 new_set = set(tags) if isinstance(tags, list) else set()
                 changed_tags = old_set != new_set
                 changed_start = (start_dt != prev_start_dt)
+
                 # Insert only first-seen entries here (batch-limited)
                 if first_seen:
                     # Require Team Member relation on insert
@@ -1999,7 +1924,8 @@ def fast_sync(context=None):
                     }
                     existing = None
                     add_block = True
-                    # Insert with Processed or Ignored based on SEND_NOTIFICATIONS
+                    # For new entries, choose Status based on SEND_NOTIFICATIONS:
+                    # when False, insert as Ignored; when True, insert as Processed.
                     notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
                     _queue_new(existing, notion_user_key, notion_entry, wid, add_block)
 
@@ -2016,136 +1942,11 @@ def fast_sync(context=None):
                         "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
                         "description": desc,
                         # Reset status to Processed so staged notifier can send updates
-                        "status": STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED,
+                        "status": STATUS_PROCESSED,
                     }
                     existing = {"page_id": (prev or {}).get("page_id")}
                     add_block = changed_desc
                     _queue_update(existing, notion_user_key, notion_entry, wid, add_block)
-
-    # If in EID index mode, build Notion index now and process accumulated entries
-    if mode == 'eids':
-        # Build set of EIDs
-        eids = []
-        for _, e in all_entries:
-            eid = str(e.get("id") or "").strip()
-            if eid:
-                eids.append(eid)
-        # Cap by configured limit and time budget
-        if len(eids) > MAX_INDEX_EIDS_PER_RUN:
-            eids = eids[:MAX_INDEX_EIDS_PER_RUN]
-        if context and _remaining_s(context) < MIN_SECONDS_FOR_NOTION:
-            by_eid = {}
-        else:
-            by_eid = notion_build_index_for_eids(eids)
-        # Process accumulated entries
-        for wid, e in all_entries:
-            if _should_exit_soon(context):
-                break
-            eid = str(e.get("id") or "").strip()
-            user = e.get("user") or ""
-            if not eid or not user:
-                continue
-            project = _canon_select(P_PROJECT, e.get("project") or "No project")
-            tags = _canon_tags(P_TAGS, e.get("tags") or [])
-            desc = e.get("description") or "No description"
-            dur_ms = int(e.get("dur") or 0)
-            start_s = e.get("start") or ""
-            end_s = e.get("end") or ""
-            upd_s = e.get("updated") or e.get("at") or ""
-            uid = e.get("uid")
-
-            processed_eids.add(eid)
-            notion_user_key = f"user:{uid}" if uid is not None else user
-            current_ids_by_user.setdefault(notion_user_key, set()).add(eid)
-
-            wh = user_map.get(user) or user_map_norm.get(_norm(user)) if NOTIFY_ENABLED else None
-
-            try:
-                start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if start_s else now
-            except Exception:
-                start_dt = now
-            if end_s:
-                try:
-                    end_dt = datetime.strptime(end_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-                except Exception:
-                    end_dt = start_dt + timedelta(milliseconds=max(0, dur_ms))
-            else:
-                end_dt = start_dt + timedelta(milliseconds=max(0, dur_ms))
-            try:
-                upd_dt = datetime.strptime(upd_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if upd_s else now
-            except Exception:
-                upd_dt = now
-
-            prev = by_eid.get(eid)
-            prev_snap = (prev or {}).get("snap") or {}
-            # Guard against cross-workspace collisions in EID index mode
-            try:
-                prev_ws = int(prev_snap.get("workspace") or 0)
-            except Exception:
-                prev_ws = 0
-            if prev and prev_ws != int(wid or 0):
-                prev = None
-                prev_snap = {}
-            first_seen = prev is None
-            prev_dur = int(prev_snap.get("dur", dur_ms))
-            prev_desc = prev_snap.get("desc", desc)
-            prev_proj = prev_snap.get("project", project)
-            prev_tags = prev_snap.get("tags", list(tags))
-            prev_start_s = prev_snap.get("start", start_s)
-            try:
-                prev_start_dt = datetime.strptime(prev_start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if prev_start_s else start_dt
-            except Exception:
-                prev_start_dt = start_dt
-
-            changed_time = dur_ms != prev_dur
-            changed_proj = project != prev_proj
-            changed_desc = not _desc_equal(desc, prev_desc)
-            old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
-            new_set = set(tags) if isinstance(tags, list) else set()
-            changed_tags = old_set != new_set
-            changed_start = (start_dt != prev_start_dt)
-
-            # Insert only first-seen entries (batch-limited)
-            if first_seen:
-                # Require Team Member relation on insert
-                tm_pid = _resolve_team_member_pid(user)
-                if not tm_pid:
-                    _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
-                    continue
-                notion_entry = {
-                    "id": eid,
-                    "user": user,
-                    "team_member_pid": tm_pid,
-                    "project": project,
-                    "tags": tags,
-                    "dur": dur_ms,
-                    "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "description": desc,
-                }
-                existing = None
-                add_block = True
-                notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
-                _queue_new(existing, notion_user_key, notion_entry, wid, add_block)
-
-            # For existing entries, upsert when any key field changed
-            elif (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
-                notion_entry = {
-                    "id": eid,
-                    "user": user,
-                    "project": project,
-                    "tags": tags,
-                    "dur": dur_ms,
-                    "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                    "description": desc,
-                    "status": STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED,
-                }
-                existing = {"page_id": (prev or {}).get("page_id")}
-                add_block = changed_desc
-                _queue_update(existing, notion_user_key, notion_entry, wid, add_block)
 
     # Build prioritized task list
     # Requirement: As long as there are new (not-yet-in-DB) entries,
@@ -2180,7 +1981,7 @@ def fast_sync(context=None):
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
     # Stage-2: notify a batch of Processed items and mark as Notified
-    if NOTIFY_ENABLED and not _should_exit_soon(context):
+    if not _should_exit_soon(context):
         try:
             to_notify = int(NOTIFY_BATCH_SIZE)
             n = notion_notify_processed(to_notify, user_map, user_map_norm, uid_to_name, context)
@@ -2188,30 +1989,25 @@ def fast_sync(context=None):
         except Exception as e:
             _alert(f"[ERROR] notify processed failed: {e}")
 
-    # Deletions based on Notion index vs current run
+    # Deletions based on Notion index vs current run (window index always available)
     delete_tasks = []
-    if not _should_exit_soon(context):
-        # Only available when we have a window index
-        if mode == 'window' or NOTION_ENABLE_DELETION_SCAN:
-            if mode != 'window':
-                # Build a fresh window index just for deletions
-                _, by_user = notion_build_window_index(since, now)
-            for ukey, pages in by_user.items():
-                cur = current_ids_by_user.get(ukey, set())
-                for eid, item in pages.items():
-                    if eid in cur:
-                        continue
-                    snap = item.get("snap") or {}
-                    pid = item.get("page_id")
-                    try:
-                        s = snap.get("start") or ""
-                        sdt = datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if s else None
-                    except Exception:
-                        sdt = None
-                    if not (sdt and sdt >= since):
-                        continue
-                    if pid:
-                        delete_tasks.append(pid)
+    if not _should_exit_soon(context) and NOTION_ENABLE_DELETION_SCAN:
+        for ukey, pages in by_user.items():
+            cur = current_ids_by_user.get(ukey, set())
+            for eid, item in pages.items():
+                if eid in cur:
+                    continue
+                snap = item.get("snap") or {}
+                pid = item.get("page_id")
+                try:
+                    s = snap.get("start") or ""
+                    sdt = datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if s else None
+                except Exception:
+                    sdt = None
+                if not (sdt and sdt >= since):
+                    continue
+                if pid:
+                    delete_tasks.append(pid)
 
     if delete_tasks and not _should_exit_soon(context) and (not context or _remaining_s(context) >= MIN_SECONDS_FOR_CLEANUP):
         max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
@@ -2232,7 +2028,7 @@ def fast_sync(context=None):
         except Exception as e:
             _alert(f"[ERROR] Dedupe failed: {e}")
 
-    return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":0,"dry_run_no_send":DRY_RUN_NO_SEND,"send_notifications":SEND_NOTIFICATIONS,"notify_enabled":NOTIFY_ENABLED}
+    return {"status":"complete","notified":notified,"skipped_notifies":0,"skipped_deletions":0,"send_notifications": SEND_NOTIFICATIONS}
 
 # ---- Local main for testing ----
 # (legacy lambda_handler overload removed)
