@@ -21,9 +21,6 @@ _START_TS = time.monotonic()  # module import time (kept for compatibility)
 _RUN_START_TS = 0.0           # set at the beginning of each invocation
 
 # ENV
-GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "https://docs.google.com/spreadsheets/d/1nBwSZ_uk2l1dcQcRXrNLXyBUevZABVHNK3FE71toWl4/edit?gid=536270775#gid=536270775")
-TEAM_GID = os.getenv("TEAM_GID", "2144513925")
-WORKSPACES_GID = os.getenv("WORKSPACES_GID", "536270775")
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/api/webhooks/1401155910126272553/xF3EHp8wQlA0mx4tvcUXvvzUmXBoJgfNae21TN6N-a7mZR699QdGLkqPGQjgtKkxj2_I")
 
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
@@ -98,6 +95,8 @@ STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "286a1576955180d6acdec21f7a45dfcc").strip()
 NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
 NOTION_TEAM_DB_ID_DASH = _dashify_notion_id(NOTION_TEAM_DB_ID)
+NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "").strip()
+NOTION_TOGGL_WORKSPACES_DB_ID_DASH = _dashify_notion_id(NOTION_TOGGL_WORKSPACES_DB_ID) if NOTION_TOGGL_WORKSPACES_DB_ID else ""
 
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "2"))            # target rps (global per integration)
@@ -332,65 +331,54 @@ def _alert(msg: str):
         try: SESSION.post(SYSTEM_ALERT_WEBHOOK, json={"content": msg}, timeout=HTTP_TIMEOUT)
         except Exception: pass
 
-# Sheets
-def _sheet_export_csv_url(sheet_url: str, gid: str) -> str:
-    if not sheet_url or not gid: return ""
-    try:
-        sid = sheet_url.split("/d/")[1].split("/")[0]
-        return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
-    except Exception: return ""
-
-def _fetch_csv_rows(sheet_url: str, gid: str) -> list[list[str]]:
-    url = _sheet_export_csv_url(sheet_url, gid)
-    if not url: return []
-    r = SESSION.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return list(csv.reader(StringIO(r.text)))
-
-def _find_header(headers: list[str], *cands) -> int | None:
-    h = [x.strip().lower() for x in headers]
-    for c in cands:
-        if c in h: return h.index(c)
-    return None
-
-def _norm(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
-
-def load_team_sheet() -> list[dict]:
-    rows = _fetch_csv_rows(GOOGLE_SHEET_URL, TEAM_GID)
-    if not rows:
-        _alert("TEAM tab not reachable or empty")
-        return []
-    headers = rows[0]
-    i_name = _find_header(headers, "name", "full name", "fullname")
-    i_web  = _find_header(headers, "discord_webhook_url", "webhook", "discord webhook")
-    team = []
-    for r in rows[1:]:
-        try:
-            name = r[i_name].strip() if i_name is not None and i_name < len(r) else ""
-            if not name: continue
-            item = {"name": name}
-            if i_web is not None and i_web < len(r) and r[i_web].strip():
-                item["discord_webhook_url"] = r[i_web].strip()
-            team.append(item)
-        except Exception: continue
-    return team
-
 def load_workspace_tokens() -> list[dict]:
-    rows = _fetch_csv_rows(GOOGLE_SHEET_URL, WORKSPACES_GID)
-    if not rows:
-        _alert("WORKSPACES tab not reachable or empty")
+    """Load Toggl workspace API tokens from the Notion 'Toggl Workspaces' database.
+
+    Expected schema (properties):
+      - Name: title
+      - api_token: rich_text
+    """
+    db_id = NOTION_TOGGL_WORKSPACES_DB_ID_DASH
+    if not db_id:
+        _alert("Toggl Workspaces DB id (NOTION_TOGGL_WORSPACES_DB_ID) not configured")
         return []
-    headers = rows[0]
-    i_name = _find_header(headers, "name")
-    i_tok  = _find_header(headers, "api_token", "token", "api token")
-    out = []
-    for r in rows[1:]:
-        try:
-            name = r[i_name].strip() if i_name is not None and i_name < len(r) else ""
-            tok  = r[i_tok].strip()  if i_tok  is not None and i_tok  < len(r) else ""
-            if name and tok: out.append({"name": name, "api_token": tok})
-        except Exception: continue
+    url = f"https://api.notion.com/v1/databases/{db_id}/query"
+    out: list[dict] = []
+
+    def _get_title(props: dict, name: str) -> str:
+        p = props.get(name, {})
+        if p.get("type") == "title":
+            return "".join([x.get("plain_text", "") for x in (p.get("title") or [])]).strip()
+        return ""
+
+    def _get_rich_text(props: dict, name: str) -> str:
+        p = props.get(name, {})
+        if p.get("type") == "rich_text":
+            return "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
+        return ""
+
+    payload = {"page_size": 100}
+    cursor = None
+    while True:
+        body = dict(payload)
+        if cursor:
+            body["start_cursor"] = cursor
+        r = _notion_request("POST", url, json_body=body)
+        if not r or r.status_code != 200:
+            _alert(f"[WARN] Toggl Workspaces query failed: status={getattr(r, 'status_code', None)}")
+            break
+        data = r.json() or {}
+        for pg in (data.get("results") or []):
+            props = pg.get("properties", {}) or {}
+            name = _get_title(props, "Name")
+            tok = _get_rich_text(props, "api_token")
+            if tok:
+                out.append({"name": name or "", "api_token": tok})
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    if not out:
+        _alert("Toggl Workspaces DB empty or unreachable")
     return out
 
 # Toggl
@@ -1861,14 +1849,15 @@ def fast_sync(context=None):
                 return {"status": "low_time_budget"}
     except Exception:
         pass
-    team=load_team_sheet(); workspaces=load_workspace_tokens()
-    if not team:
-        _alert("TEAM sheet empty or unreachable."); return {"status":"no_team"}
+    workspaces = load_workspace_tokens()
     if not workspaces:
-        _alert("WORKSPACES sheet empty or unreachable."); return {"status":"no_workspaces"}
+        _alert("Toggl Workspaces DB empty or unreachable.")
+        return {"status": "no_workspaces"}
 
-    user_map={t["name"]:t.get("discord_webhook_url","" ).strip() for t in team if t.get("discord_webhook_url")}
-    user_map_norm={_norm(k):v for k,v in user_map.items()}
+    # Legacy user_map/user_map_norm (from Google Sheets) are no longer used.
+    # Keep empty dicts to preserve notion_notify_processed signature.
+    user_map = {}
+    user_map_norm = {}
 
     try:
         if not _NOTION_SCHEMA:
