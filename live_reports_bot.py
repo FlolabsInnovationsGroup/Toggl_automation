@@ -80,7 +80,7 @@ NH = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28",
 NOTION_ENABLED = bool(NOTION_TOKEN and NOTION_DATABASE_ID)
 _NOTION_DISABLED_LOGGED = False
 P_USER_KEY    = os.getenv("NOTION_PROP_USER_KEY", "User Key")
-P_USER_ID     = os.getenv("NOTION_PROP_USER_ID", "ID")
+P_USER_ID     = os.getenv("NOTION_PROP_USER_ID", "User ID")
 P_ENTRY_ID    = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")
 P_PROJECT     = os.getenv("NOTION_PROP_PROJECT", "Project")
 P_TAGS        = os.getenv("NOTION_PROP_TAGS", "Tags")
@@ -1465,8 +1465,8 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         if sv:
             props[P_STATUS] = sv
     if existing and existing.get("page_id"):
-        page_id = existing['page_id']
-        _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
+        page_id = existing["page_id"]
+        _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
         if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
             _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
         return page_id
@@ -1474,22 +1474,27 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
         # Try to create idempotently: lock eid, lookup, then create, then on conflict lookup and patch
         # 1) pre-create lookup under lock
         with lk:
+            # Prefer workspace-scoped lookup, but fall back to global Entry ID
+            # lookup so we never create a duplicate page for the same Toggl
+            # time entry, even if the Workspace property type/schema changed.
             found = _notion_find_entry_by_eid_ws(eid, workspace_id, user_key=user_key, start_iso=entry.get("start"))
+            if not found:
+                found = _notion_find_entry_by_eid(eid)
             if found:
                 page_id = found.get("page_id")
                 if page_id:
-                    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
+                    _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
                     if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
                         _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
-                    return
+                    return page_id
             # 2) attempt create
-            body={"parent":{"database_id":NOTION_DATABASE_ID},"properties":props}
+            body = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props}
             if NOTION_ADD_DESCRIPTION_BLOCKS and (entry.get("description") or "").strip():
                 blk = _desc_block(entry.get("description") or "")
                 if blk:
                     body["children"] = [blk]
-            r = _notion_request('POST', "https://api.notion.com/v1/pages", json_body=body)
-            if r and r.status_code in (200,201):
+            r = _notion_request("POST", "https://api.notion.com/v1/pages", json_body=body)
+            if r and r.status_code in (200, 201):
                 try:
                     created = r.json() or {}
                     pid = created.get("id")
@@ -1499,9 +1504,11 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
             else:
                 # 3) if failed (e.g., 409), lookup again and patch
                 found2 = _notion_find_entry_by_eid_ws(eid, workspace_id, user_key=user_key, start_iso=entry.get("start"))
+                if not found2:
+                    found2 = _notion_find_entry_by_eid(eid)
                 if found2 and found2.get("page_id"):
                     page_id = found2.get("page_id")
-                    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties":props})
+                    _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
                     if NOTION_ADD_DESCRIPTION_BLOCKS and add_desc_block and (entry.get("description") or "").strip():
                         _notion_append_blocks(page_id, [_desc_block(entry.get("description") or "")])
                     return page_id
@@ -1879,19 +1886,11 @@ def fast_sync(context=None):
     now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
     by_eid, by_user = notion_build_window_index(since, now, context=context)
 
-    # Stage-2 (early): notify a batch of already-Processed items and mark as Notified.
-    # This runs before heavy Toggl/Notion work so notifications are not starved by time budget.
+    # Counters for notifications; actual notify step runs later,
+    # after we know whether there are any new entries this run.
     notified = 0
     skipped_notifies = 0
     uid_to_name: dict[str, str] = {}
-    if NOTION_ENABLED and not _should_exit_soon(context):
-        try:
-            to_notify = int(NOTIFY_BATCH_SIZE)
-            n, skipped = notion_notify_processed(to_notify, user_map, user_map_norm, uid_to_name, context)
-            notified += n
-            skipped_notifies += skipped
-        except Exception as e:
-            _alert(f"[ERROR] notify processed (early) failed: {e}")
 
     # Stage tasks separately to prioritize NEW inserts over updates
     staged_new: list[tuple] = []
@@ -1986,9 +1985,17 @@ def fast_sync(context=None):
                 if prev and prev_ws != int(wid or 0):
                     prev = None
                     prev_snap = {}
-                # Guard against user mismatch if index provides user_key
+                # Guard against user mismatch if index provides user_key.
+                # Legacy pages may store user_key as "user:{uid}", while new
+                # pages store the Toggl display name. Accept either form so
+                # we do not treat existing pages as "new" and re-insert them.
                 if prev and isinstance(prev, dict) and prev.get("user_key"):
-                    if prev.get("user_key") != (f"user:{uid}" if uid is not None else user):
+                    prev_uk = (prev.get("user_key") or "").strip()
+                    expected = (user or "").strip()
+                    # Backwards compatibility for older "user:{uid}" keys.
+                    if uid is not None and prev_uk.startswith("user:"):
+                        expected = f"user:{uid}"
+                    if prev_uk != expected:
                         prev = None
                         prev_snap = {}
                 first_seen = prev is None
@@ -2088,6 +2095,19 @@ def fast_sync(context=None):
                         keep_upserted_ids.add(pid)
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
+
+    # Stage-2: notify a batch of already-Processed items and mark as Notified.
+    # Only run this when there are no new entries to insert from any workspace
+    # in this invocation, so existing pages are patched only when the run
+    # has no pending new inserts.
+    if NOTION_ENABLED and not _should_exit_soon(context) and not staged_new:
+        try:
+            to_notify = int(NOTIFY_BATCH_SIZE)
+            n, skipped = notion_notify_processed(to_notify, user_map, user_map_norm, uid_to_name, context)
+            notified += n
+            skipped_notifies += skipped
+        except Exception as e:
+            _alert(f"[ERROR] notify processed failed: {e}")
 
     # Deletions based on Notion index vs current run (window index always available)
     delete_tasks = []
