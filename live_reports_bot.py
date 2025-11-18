@@ -192,6 +192,7 @@ _NOTION_429_COUNT = 0
 _NOTION_5XX_COUNT = 0
 _NOTION_EXHAUSTED = 0
 _NOTION_EXC_COUNT = 0
+_NOTION_INDEX_OK = False
 _KNOWN_EIDS: set[str] = set()
 try:
     from threading import Lock
@@ -230,7 +231,7 @@ def _reset_notion_circuit():
     """
     global NOTION_ENABLED, _NOTION_DISABLED_LOGGED
     global _NOTION_429_COUNT, _NOTION_5XX_COUNT, _NOTION_EXHAUSTED, _NOTION_EXC_COUNT
-    global _NOTION_RESUME_AT, _NOTION_LAST_CALL
+    global _NOTION_RESUME_AT, _NOTION_LAST_CALL, _NOTION_INDEX_OK
     NOTION_ENABLED = bool(NOTION_TOKEN and NOTION_DATABASE_ID)
     _NOTION_DISABLED_LOGGED = False
     _NOTION_429_COUNT = 0
@@ -239,6 +240,7 @@ def _reset_notion_circuit():
     _NOTION_EXC_COUNT = 0
     _NOTION_RESUME_AT = 0.0
     _NOTION_LAST_CALL = 0.0
+    _NOTION_INDEX_OK = False
 
 def notion_health_check() -> tuple[bool, str]:
     """Verify Notion credentials and database access before heavy work.
@@ -1352,15 +1354,16 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
     by_eid: eid -> {page_id, snap, user_key}
     by_user: user_key -> {eid -> {page_id, snap}}
     """
+    global _NOTION_INDEX_OK
+    _NOTION_INDEX_OK = False
+
     by_eid: dict[str, dict] = {}
     by_user: dict[str, dict] = {}
     if not (NOTION_TOKEN and NOTION_DATABASE_ID):
         return by_eid, by_user
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    payload = {"page_size": 100, "filter": {"and": [
-        {"property": P_DATE, "date": {"on_or_after": since.astimezone(timezone.utc).replace(microsecond=0).isoformat()}},
-        {"property": P_DATE, "date": {"on_or_before": until.astimezone(timezone.utc).replace(microsecond=0).isoformat()}},
-    ]}}
+    # Full-database index: no date filter, rely on Toggl TIME_WINDOW_DAYS for scope.
+    payload = {"page_size": 100}
     cursor = None
     while True:
         # Abort early if time budget is nearly exhausted
@@ -1372,6 +1375,7 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
         r = _notion_request('POST', url, json_body=body)
         if not r or r.status_code != 200:
             break
+        _NOTION_INDEX_OK = True
         js = r.json() or {}
         for pg in js.get("results") or []:
             if context is not None and _should_exit_soon(context):
@@ -1701,6 +1705,10 @@ def fast_sync(context=None):
 
     now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
     by_eid, by_user = notion_build_window_index(since, now, context=context)
+    # If the Notion index query failed, abort inserts to avoid duplicates.
+    if not _NOTION_INDEX_OK:
+        _alert("[WARN] Notion index query failed or returned no data; skipping inserts this run to avoid duplicates.")
+        return {"status": "notion_index_failed"}
     # Seed known Entry IDs from the current Notion window index so we do not
     # treat existing pages as new in this or subsequent warm runs.
     try:
