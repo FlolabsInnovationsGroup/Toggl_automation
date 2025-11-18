@@ -1,13 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import json
-import csv
-from io import StringIO
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
-import unicodedata
-import re
+
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
@@ -19,51 +19,52 @@ except Exception:
 SESSION = requests.Session()
 
 # ==========================
-# ENVIRONMENT (minimal)
+# ENVIRONMENT
 # ==========================
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 MAX_SEND_WORKERS = int(os.getenv("MAX_SEND_WORKERS", "8"))
 
-# Google Sheet (Discord webhooks)
-GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()
-TEAM_GID = os.getenv("TEAM_GID", "").strip()
-
 # Notion
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "").strip()
+NOTION_TOKEN = os.getenv(
+    "NOTION_TOKEN", "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"
+).strip()
+NOTION_DATABASE_ID = os.getenv(
+    "NOTION_DATABASE_ID", "297a157695518075ab6cea94e60e4220"
+).strip()  # Time Entries DB
+NOTION_TOGGL_WORSPACES_DB_ID = os.getenv(
+    "NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce"
+).strip()  # Toggl Workspaces DB with api_token
+NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "").strip()
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28").strip()
+
 NH = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": NOTION_VERSION,
     "Content-Type": "application/json",
 }
 
-# Property names (allow override via env, default to repo schema)
+# Time Entries DB property names
 P_USER_KEY = os.getenv("NOTION_PROP_USER_KEY", "User Key")
 P_PROJECT = os.getenv("NOTION_PROP_PROJECT", "Project")
-P_DATE = os.getenv("NOTION_PROP_DATE", "Date")  # date range (start used)
+P_DATE = os.getenv("NOTION_PROP_DATE", "Date")  # date range
 P_DURATION = os.getenv("NOTION_PROP_DURATION", "Duration")  # seconds (number)
 P_HOURS = os.getenv("NOTION_PROP_HOURS", "Hours")  # hours (formula/number)
-P_TEAM_MEMBER = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")
-NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "").strip()
+P_TEAM_MEMBER = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")  # relation
 P_ENTRY_ID = os.getenv("NOTION_PROP_ENTRY_ID", "Entry ID")
+P_WEBHOOK = os.getenv("NOTION_PROP_WEBHOOK", "Webhook")  # rollup from Team Members.webhook
+P_TIME_COMMITMENT = os.getenv(
+    "NOTION_PROP_TIME_COMMITMENT", "Time Commitment"
+)  # numeric rollup, hours/week
 
 # Week timezone (IANA name preferred). Example: "Europe/Sofia", "America/New_York".
 WEEK_TZ = os.getenv("WEEK_TZ", "UTC").strip()
 WEEK_TZ_OFFSET_HOURS = int(os.getenv("WEEK_TZ_OFFSET_HOURS", "0"))
 
-# Optional Team Members database to resolve display names from relation
-# (same as above, kept for clarity of purpose)
-
 
 # ==========================
 # Utilities
 # ==========================
-def _norm(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
-
-
-def _alert(msg: str):
+def _alert(msg: str) -> None:
     print(f"[ALERT] {msg}")
 
 
@@ -82,35 +83,7 @@ def format_hours_to_hm(hours_float: float) -> str:
 
 
 # ==========================
-# Gamification (kept from original)
-# ==========================
-def gamified_badge(total_hours: float) -> str:
-    steps = [
-        (70, "👹 Oni mode! Inhuman productivity week!"),
-        (65, "🦄 Mythical productivity!"),
-        (60, "🐉 Legendary productivity week!"),
-        (55, "🦖 Epic productivity week!"),
-        (50, "🐜 Ant-like productivity week!"),
-        (45, "🥇 Elite productivity week!"),
-        (40, "🏆 Great productivity week!"),
-        (35, "🏅 Strong productivity week!"),
-        (30, "🔥 High productivity week!"),
-        (25, "👍 Solid productivity week!"),
-        (20, "⚡ Moderate productivity week"),
-        (15, "🚀 Getting traction"),
-        (10, "🛠️ Building momentum"),
-        (5,  "🐣 Warm-up week"),
-        (0,  "💀 Bro (Barely present week)"),
-    ]
-    for bound, line in steps:
-        if total_hours >= bound:
-            return line
-    return "💀 Bro (Barely present week)"
-
-
-
-# ==========================
-# Notion minimal client
+# Minimal Notion client
 # ==========================
 def _notion_request(method: str, url: str, body: dict | None = None):
     try:
@@ -129,9 +102,13 @@ def _extract_title_text(prop: dict) -> str:
         return ""
     t = prop.get("type")
     if t == "title":
-        return "".join([x.get("plain_text", "") for x in (prop.get("title") or [])]).strip()
+        return "".join(
+            [x.get("plain_text", "") for x in (prop.get("title") or [])]
+        ).strip()
     if t == "rich_text":
-        return "".join([x.get("plain_text", "") for x in (prop.get("rich_text") or [])]).strip()
+        return "".join(
+            [x.get("plain_text", "") for x in (prop.get("rich_text") or [])]
+        ).strip()
     return ""
 
 
@@ -177,9 +154,7 @@ def _extract_number(prop: dict) -> float:
 
 
 def _extract_entry_id(props: dict) -> str:
-    """Return canonical Entry ID string from the Notion property.
-    Supports number or rich_text types. Returns "" if missing.
-    """
+    """Return canonical Entry ID string from the Notion property."""
     try:
         p = props.get(P_ENTRY_ID) or {}
         t = p.get("type")
@@ -192,7 +167,9 @@ def _extract_entry_id(props: dict) -> str:
             except Exception:
                 return str(v)
         if t == "rich_text":
-            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
+            txt = "".join(
+                [x.get("plain_text", "") for x in (p.get("rich_text") or [])]
+            ).strip()
             return txt
     except Exception:
         pass
@@ -204,7 +181,7 @@ def _extract_relation_ids(prop: dict) -> list[str]:
         return []
     if prop.get("type") == "relation":
         rel = prop.get("relation") or []
-        out = []
+        out: list[str] = []
         for item in rel:
             pid = (item or {}).get("id")
             if pid:
@@ -213,18 +190,73 @@ def _extract_relation_ids(prop: dict) -> list[str]:
     return []
 
 
+def _get_webhook_from_props(props: dict) -> str:
+    """Extract webhook URL/string from the Time Entries DB properties."""
+    try:
+        if not isinstance(props, dict):
+            return ""
+        pw = props.get(P_WEBHOOK, {})
+        if not isinstance(pw, dict):
+            return ""
+        ptype = pw.get("type")
+        # Direct url
+        if ptype == "url":
+            return (pw.get("url") or "").strip()
+        # Direct text properties
+        if ptype == "rich_text":
+            return "".join(
+                [x.get("plain_text", "") for x in (pw.get("rich_text") or [])]
+            ).strip()
+        if ptype == "title":
+            return "".join(
+                [x.get("plain_text", "") for x in (pw.get("title") or [])]
+            ).strip()
+        # Rollup from Team Members.webhook
+        if ptype == "rollup":
+            roll = pw.get("rollup") or {}
+            rtype = roll.get("type")
+            if rtype == "array":
+                for it in (roll.get("array") or []):
+                    if not isinstance(it, dict):
+                        continue
+                    it_type = it.get("type")
+                    if it_type == "url":
+                        u = (it.get("url") or "").strip()
+                        if u:
+                            return u
+                    if it_type == "rich_text":
+                        txt = "".join(
+                            [x.get("plain_text", "") for x in (it.get("rich_text") or [])]
+                        ).strip()
+                        if txt:
+                            return txt
+                    if it_type == "title":
+                        txt = "".join(
+                            [x.get("plain_text", "") for x in (it.get("title") or [])]
+                        ).strip()
+                        if txt:
+                            return txt
+            elif rtype == "number":
+                v = roll.get("number")
+                return (str(v).strip() if v is not None else "")
+            elif rtype == "date":
+                d = roll.get("date") or {}
+                return (d.get("start") or "").strip()
+        return ""
+    except Exception:
+        return ""
+
+
 def query_time_entries_between(start_dt: datetime, end_dt: datetime) -> list[dict]:
-    """Return Notion pages for time entries broadly around [start, end).
-    Uses a widened window to avoid Notion filter edge cases, then we filter locally.
-    """
+    """Return Notion pages for time entries broadly around [start, end)."""
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    pages = []
+    pages: list[dict] = []
     cursor = None
     # Widen by one day on both sides
     start_wide = (start_dt - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_wide = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     while True:
-        body = {
+        body: dict = {
             "page_size": 100,
             "filter": {
                 "and": [
@@ -238,7 +270,9 @@ def query_time_entries_between(start_dt: datetime, end_dt: datetime) -> list[dic
         r = _notion_request("POST", url, body)
         if not r or r.status_code != 200:
             txt = r.text if r is not None else "<no response>"
-            _alert(f"[WARN] Notion query failed {r.status_code if r else 'NA'}: {txt}")
+            _alert(
+                f"[WARN] Notion query failed {r.status_code if r else 'NA'}: {txt}"
+            )
             break
         data = r.json() or {}
         pages.extend(data.get("results") or [])
@@ -249,12 +283,13 @@ def query_time_entries_between(start_dt: datetime, end_dt: datetime) -> list[dic
 
 
 # ==========================
-# Aggregation & formatting
+# Team Members: name resolution
 # ==========================
 _PAGE_TITLE_CACHE: dict[str, str] = {}
 _TEAM_MEM_ID_TO_NAME: dict[str, str] = {}
 
-def notion_build_team_members_index():
+
+def notion_build_team_members_index() -> None:
     """Build a cache of Team Member page_id -> display name from the Team Members DB."""
     global _TEAM_MEM_ID_TO_NAME
     if not NOTION_TEAM_DB_ID or _TEAM_MEM_ID_TO_NAME:
@@ -271,20 +306,25 @@ def notion_build_team_members_index():
         data = r.json() or {}
         for pg in data.get("results") or []:
             pid = pg.get("id")
-            props = pg.get("properties", {})
+            props = pg.get("properties", {}) or {}
             name = ""
             t = props.get("Name", {})
-            if (t or {}).get("type") == "title":
-                name = "".join([x.get("plain_text", "") for x in (t.get("title") or [])]).strip()
+            if isinstance(t, dict) and t.get("type") == "title":
+                name = "".join(
+                    [x.get("plain_text", "") for x in (t.get("title") or [])]
+                ).strip()
             if pid and name:
                 _TEAM_MEM_ID_TO_NAME[pid] = name
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
 
+
 def _user_display_name_from_props(props: dict) -> str:
-    """Resolve display name strictly from Team Member relation. No fallback."""
-    rel_ids = _extract_relation_ids(props.get(P_TEAM_MEMBER) or {}) if P_TEAM_MEMBER else []
+    """Resolve display name strictly from Team Member relation."""
+    rel_ids = (
+        _extract_relation_ids(props.get(P_TEAM_MEMBER) or {}) if P_TEAM_MEMBER else []
+    )
     # Try Team Members DB index if configured
     if rel_ids and NOTION_TEAM_DB_ID:
         notion_build_team_members_index()
@@ -292,7 +332,7 @@ def _user_display_name_from_props(props: dict) -> str:
             nm = _TEAM_MEM_ID_TO_NAME.get(rid)
             if nm:
                 return nm
-    # Otherwise, fetch page title for the relation id(s) directly (no DB id needed)
+    # Otherwise, fetch page title for the relation id(s) directly
     if rel_ids:
         for rid in rel_ids:
             nm = _PAGE_TITLE_CACHE.get(rid)
@@ -302,11 +342,15 @@ def _user_display_name_from_props(props: dict) -> str:
                     if r and r.status_code == 200:
                         js = r.json() or {}
                         props2 = js.get("properties") or {}
-                        # Find first title property dynamically
                         title_txt = ""
                         for _k, meta in props2.items():
                             if isinstance(meta, dict) and meta.get("type") == "title":
-                                title_txt = "".join([x.get("plain_text", "") for x in (meta.get("title") or [])]).strip()
+                                title_txt = "".join(
+                                    [
+                                        x.get("plain_text", "")
+                                        for x in (meta.get("title") or [])
+                                    ]
+                                ).strip()
                                 if title_txt:
                                     break
                         if title_txt:
@@ -317,35 +361,69 @@ def _user_display_name_from_props(props: dict) -> str:
             if nm:
                 return nm
     return ""
+
+
+def _get_team_member_ids_from_props(props: dict) -> list[str]:
+    if not isinstance(props, dict) or not P_TEAM_MEMBER:
+        return []
+    return _extract_relation_ids(props.get(P_TEAM_MEMBER) or {})
+
+
 def _parse_iso_opt(s: str) -> datetime | None:
     if not s:
         return None
     try:
-        s2 = s.replace('Z', '+00:00')
+        s2 = s.replace("Z", "+00:00")
         # Date-only like YYYY-MM-DD
-        if len(s2) == 10 and s2[4] == '-' and s2[7] == '-':
-            return datetime.strptime(s2, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        if len(s2) == 10 and s2[4] == "-" and s2[7] == "-":
+            return datetime.strptime(s2, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         return datetime.fromisoformat(s2)
     except Exception:
         try:
-            return datetime.strptime(s, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except Exception:
             return None
 
 
-def aggregate_week(pages: list[dict], week_start_local: datetime, week_end_local: datetime) -> dict:
-    """Aggregate totals (in hours) per user and per project from Notion pages."""
-    users = {}
+# ==========================
+# Aggregation & formatting
+# ==========================
+def aggregate_week(
+    pages: list[dict], week_start_local: datetime, week_end_local: datetime
+) -> dict[str, dict]:
+    """Aggregate totals per Team Member from Notion pages.
+
+    Output:
+      user_key (Team Member page_id) -> {
+        "user_id": str,
+        "username": str,
+        "webhook": str,
+        "time_commitment": float,
+        "total_hours": float,
+        "total_entries": int,
+        "per_project": dict[str, float],
+      }
+    """
+    users: dict[str, dict] = {}
     seen_ids_by_user: dict[str, set[str]] = {}
     for pg in pages or []:
-        props = pg.get("properties", {})
-        user_name = _user_display_name_from_props(props)
-        if not user_name:
+        props = pg.get("properties", {}) or {}
+        tm_ids = _get_team_member_ids_from_props(props)
+        if not tm_ids:
             continue
+        user_key = tm_ids[0]
+        user_name = _user_display_name_from_props(props) or ""
+        webhook = _get_webhook_from_props(props) or ""
+        time_commitment = (
+            _extract_number(props.get(P_TIME_COMMITMENT) or {})
+            if P_TIME_COMMITMENT
+            else 0.0
+        )
+
         # Local time window filter using Date range (include any overlap with window)
-        date_prop = (props.get(P_DATE) or {}).get('date') or {}
-        start_s = date_prop.get('start') or ''
-        end_s = date_prop.get('end') or ''
+        date_prop = (props.get(P_DATE) or {}).get("date") or {}
+        start_s = date_prop.get("start") or ""
+        end_s = date_prop.get("end") or ""
         start_dt = _parse_iso_opt(start_s)
         end_dt = _parse_iso_opt(end_s)
         if not start_dt:
@@ -361,10 +439,10 @@ def aggregate_week(pages: list[dict], week_start_local: datetime, week_end_local
                 hrs = _extract_number(props.get(P_HOURS) or {})
                 end_dt = start_dt + timedelta(hours=float(hrs or 0))
         if end_dt is None:
-            # still unknown; treat as zero-length
             end_dt = start_dt
         if end_dt.tzinfo is None:
             end_dt = end_dt.replace(tzinfo=timezone.utc)
+
         # Compare in local week timezone; compute overlap
         start_local = start_dt.astimezone(week_start_local.tzinfo)
         end_local = end_dt.astimezone(week_start_local.tzinfo)
@@ -373,22 +451,42 @@ def aggregate_week(pages: list[dict], week_start_local: datetime, week_end_local
         # Skip if no overlap
         if end_local <= week_start_local or start_local >= week_end_local:
             continue
+
         # De-duplicate by Entry ID per user to avoid double-counting
         eid = _extract_entry_id(props)
-        s = seen_ids_by_user.setdefault(user_name, set())
+        s = seen_ids_by_user.setdefault(user_key, set())
         if eid and eid in s:
             continue
+
         # Add only the overlapped portion
-        overlap_seconds = (min(end_local, week_end_local) - max(start_local, week_start_local)).total_seconds()
+        overlap_seconds = (
+            min(end_local, week_end_local) - max(start_local, week_start_local)
+        ).total_seconds()
         if overlap_seconds <= 0:
             continue
         hours_val = overlap_seconds / 3600.0
         project = _extract_select_name(props.get(P_PROJECT) or {}) or "No project"
 
-        u = users.get(user_name)
+        u = users.get(user_key)
         if not u:
-            u = {"total_hours": 0.0, "total_entries": 0, "per_project": defaultdict(float)}
-            users[user_name] = u
+            u = {
+                "user_id": user_key,
+                "username": user_name,
+                "webhook": webhook,
+                "time_commitment": float(time_commitment or 0.0),
+                "total_hours": 0.0,
+                "total_entries": 0,
+                "per_project": defaultdict(float),
+            }
+            users[user_key] = u
+        else:
+            if not u.get("username") and user_name:
+                u["username"] = user_name
+            if not u.get("webhook") and webhook:
+                u["webhook"] = webhook
+            if (u.get("time_commitment") in (None, 0.0)) and time_commitment:
+                u["time_commitment"] = float(time_commitment)
+
         val = max(0.0, float(hours_val))
         u["total_hours"] += val
         u["total_entries"] += 1
@@ -398,25 +496,39 @@ def aggregate_week(pages: list[dict], week_start_local: datetime, week_end_local
     return users
 
 
-def _format_project_breakdown(per_project_hours: dict[str, float], total_hours: float, max_rows: int = 12) -> str:
+def _format_project_breakdown(
+    per_project_hours: dict[str, float], total_hours: float, max_rows: int = 12
+) -> str:
     if not per_project_hours or total_hours <= 0:
         return ""
     rows = sorted(per_project_hours.items(), key=lambda kv: kv[1], reverse=True)
-    lines = []
-    for i, (proj, secs) in enumerate(rows):
+    lines: list[str] = []
+    for i, (proj, hrs) in enumerate(rows):
         if i >= max_rows:
             hidden = rows[max_rows:]
-            hhrs = sum(s for _, s in hidden)
-            hpct = (hhrs / total_hours * 100.0) if total_hours > 0 else 0.0
-            lines.append(f"- **…and {len(hidden)} more** — {format_hours_to_hm(hhrs)} ({hpct:.1f}%)")
+            hidden_hours = sum(v for _, v in hidden)
+            hpct = (hidden_hours / total_hours * 100.0) if total_hours > 0 else 0.0
+            lines.append(
+                f"- **…and {len(hidden)} more** – {format_hours_to_hm(hidden_hours)} ({hpct:.1f}%)"
+            )
             break
-        pct = (secs / total_hours * 100.0) if total_hours > 0 else 0.0
-        lines.append(f"- **{proj}** — {format_hours_to_hm(secs)} ({pct:.1f}%)")
+        pct = (hrs / total_hours * 100.0) if total_hours > 0 else 0.0
+        lines.append(
+            f"- **{proj}** – {format_hours_to_hm(hrs)} ({pct:.1f}%)"
+        )
     return "\n".join(lines)
 
 
-def build_weekly_message(username: str, week_start: datetime, week_end: datetime, total_hours: float, total_entries: int, per_project_hours: dict[str, float]) -> str:
-    parts = [
+def build_weekly_message(
+    username: str,
+    week_start: datetime,
+    week_end: datetime,
+    total_hours: float,
+    total_entries: int,
+    per_project_hours: dict[str, float],
+    time_commitment_hours: float | None = None,
+) -> str:
+    parts: list[str] = [
         "# 📊 WEEKLY TIME TRACKING REPORT",
         "=" * 40,
         f"## 👤 Team member: {username}",
@@ -424,18 +536,62 @@ def build_weekly_message(username: str, week_start: datetime, week_end: datetime
         f"📅 **Week:** {week_start.strftime('%B %d')} - {(week_end - timedelta(days=1)).strftime('%B %d, %Y')}",
         f"⏰ **Total Time:** {format_hours_to_hm(total_hours)} ({total_hours:.1f} hours)",
         f"📝 **Total Entries:** {total_entries}",
-        "",
-        gamified_badge(total_hours),
     ]
+
+    if time_commitment_hours and time_commitment_hours > 0:
+        diff = total_hours - time_commitment_hours
+        pct = (
+            (total_hours / time_commitment_hours) * 100.0
+            if time_commitment_hours > 0
+            else 0.0
+        )
+        parts.append(f"🎯 **Time Commitment:** {time_commitment_hours:.1f} hours/week")
+        parts.append(
+            f"📊 **Variance vs commitment:** {diff:+.1f} hours ({pct:.1f}% of commitment)"
+        )
+
+    parts.append("")
+    parts.append(gamified_badge(total_hours))
+
     if total_hours > 0 and per_project_hours:
         parts.append("\n### ⛏️ Time by Project")
         parts.append(_format_project_breakdown(per_project_hours, total_hours, max_rows=12))
-    parts.append(f"\n🤖 *Generated on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC*")
+
+    parts.append(
+        f"\n🤖 *Generated on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC*"
+    )
     return "\n".join(parts)
 
 
 # ==========================
-# Discord sending (kept behavior)
+# Gamification (kept from original)
+# ==========================
+def gamified_badge(total_hours: float) -> str:
+    steps = [
+        (70, "👹 Oni mode! Inhuman productivity week!"),
+        (65, "🦄 Mythical productivity!"),
+        (60, "🐉 Legendary productivity week!"),
+        (55, "🦖 Epic productivity week!"),
+        (50, "🐜 Ant-like productivity week!"),
+        (45, "🥇 Elite productivity week!"),
+        (40, "🏆 Great productivity week!"),
+        (35, "🏅 Strong productivity week!"),
+        (30, "🔥 High productivity week!"),
+        (25, "👍 Solid productivity week!"),
+        (20, "⚡ Moderate productivity week"),
+        (15, "🚀 Getting traction"),
+        (10, "🛠️ Building momentum"),
+        (5, "🐣 Warm-up week"),
+        (0, "💀 Bro (Barely present week)"),
+    ]
+    for bound, line in steps:
+        if total_hours >= bound:
+            return line
+    return "💀 Bro (Barely present week)"
+
+
+# ==========================
+# Discord sending
 # ==========================
 def _send_one(webhook_url: str, content: str) -> bool:
     try:
@@ -445,13 +601,16 @@ def _send_one(webhook_url: str, content: str) -> bool:
         return False
 
 
-def send_reports_parallel(reports: list[dict], name_to_webhook: dict) -> int:
+def send_reports_parallel(reports: list[dict]) -> int:
+    """Send each report to its own webhook in parallel."""
     sent = 0
-    futures = []
-    with ThreadPoolExecutor(max_workers=min(MAX_SEND_WORKERS, max(1, len(reports)))) as ex:
+    futures: list = []
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_SEND_WORKERS, max(1, len(reports)))
+    ) as ex:
         for r in reports:
             uname = r.get("username")
-            wh = name_to_webhook.get(_norm(uname))
+            wh = (r.get("webhook") or "").strip()
             if not wh:
                 _alert(f"⚠️ Missing Discord webhook for user: '{uname}'")
                 continue
@@ -466,125 +625,66 @@ def send_reports_parallel(reports: list[dict], name_to_webhook: dict) -> int:
 
 
 # ==========================
-# Google Sheet helpers (same approach as live_reports_bot)
+# Workspace tokens (Notion DB)
 # ==========================
-def _sheet_export_csv_url(sheet_url: str, gid: str) -> str:
-    if not sheet_url or not gid:
-        return ""
-    try:
-        sid = sheet_url.split("/d/")[1].split("/")[0]
-        return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
-    except Exception:
-        return ""
+def load_workspace_tokens() -> list[dict]:
+    """Load Toggl workspace API tokens from the Notion 'Toggl Workspaces' database.
 
-
-def _fetch_csv_rows(sheet_url: str, gid: str) -> list[list[str]]:
-    url = _sheet_export_csv_url(sheet_url, gid)
-    if not url:
-        return []
-    r = SESSION.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return list(csv.reader(StringIO(r.text)))
-
-
-def _find_header(headers: list[str], *cands) -> int | None:
-    h = [x.strip().lower() for x in headers]
-    for c in cands:
-        if c in h:
-            return h.index(c)
-    return None
-
-
-def load_team_sheet() -> list[dict]:
-    rows = _fetch_csv_rows(GOOGLE_SHEET_URL, TEAM_GID)
-    if not rows:
-        _alert("TEAM tab not reachable or empty")
-        return []
-    headers = rows[0]
-    i_name = _find_header(headers, "name", "full name", "fullname")
-    i_web = _find_header(headers, "discord_webhook_url", "webhook", "discord webhook")
-    team = []
-    for r in rows[1:]:
-        try:
-            name = r[i_name].strip() if i_name is not None and i_name < len(r) else ""
-            if not name:
-                continue
-            item = {"name": name}
-            if i_web is not None and i_web < len(r) and r[i_web].strip():
-                item["discord_webhook_url"] = r[i_web].strip()
-            team.append(item)
-        except Exception:
-            continue
-    return team
-
-
-# ==========================
-# Name matching (closest sheet name)
-# ==========================
-_QUOTE_CHARS = "\"'`‘’‚‛“”‟‹›«»"
-
-def _strip_accents(s: str) -> str:
-    """Remove accents and transliterate a few special letters that NFKD won't decompose.
-    Handles cases like Polish Ł/ł which otherwise remain unchanged.
+    Expected schema (properties):
+      - Name: title
+      - api_token: rich_text
     """
-    try:
-        # Targeted transliterations first
-        special = {
-            'Ł': 'L', 'ł': 'l',
-            'Đ': 'D', 'đ': 'd',
-            'Ø': 'O', 'ø': 'o',
-            'Æ': 'AE', 'æ': 'ae',
-            'Œ': 'OE', 'œ': 'oe',
-            'Þ': 'TH', 'þ': 'th',
-            'ß': 'ss',
-        }
-        for k, v in special.items():
-            s = s.replace(k, v)
-        # Then strip diacritics
-        return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
-    except Exception:
-        return s
+    db_id = NOTION_TOGGL_WORSPACES_DB_ID
+    if not db_id:
+        _alert(
+            "Toggl Workspaces DB id (NOTION_TOGGL_WORSPACES_DB_ID) not configured"
+        )
+        return []
+    url = f"https://api.notion.com/v1/databases/{db_id}/query"
+    out: list[dict] = []
 
-def _norm_for_match(s: str) -> str:
-    s = _strip_accents(s or "").lower()
-    # Remove quoted nicknames and parentheses content
-    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
-    s = re.sub(rf"[{re.escape(_QUOTE_CHARS)}].*?[{re.escape(_QUOTE_CHARS)}]", " ", s)
-    # Drop suffix after comma (e.g., ", ms")
-    s = s.split(',', 1)[0]
-    # Keep alnum and spaces only
-    s = ''.join(ch if (ch.isalnum() or ch.isspace()) else ' ' for ch in s)
-    return ' '.join(s.split())
+    def _get_title(props: dict, name: str) -> str:
+        p = props.get(name, {})
+        if p.get("type") == "title":
+            return "".join(
+                [x.get("plain_text", "") for x in (p.get("title") or [])]
+            ).strip()
+        return ""
 
-def _tokenize(s: str) -> set[str]:
-    return set(_norm_for_match(s).split())
+    def _get_rich_text(props: dict, name: str) -> str:
+        p = props.get(name, {})
+        if p.get("type") == "rich_text":
+            return "".join(
+                [x.get("plain_text", "") for x in (p.get("rich_text") or [])]
+            ).strip()
+        return ""
 
-def _best_sheet_name(notion_name: str, team_names: list[str]) -> str | None:
-    base = _norm_for_match(notion_name)
-    if not base:
-        return None
-    tokens_in = _tokenize(notion_name)
-    best = None
-    best_score = 0.0
-    for cand in team_names:
-        cn = _norm_for_match(cand)
-        if not cn:
-            continue
-        t2 = _tokenize(cand)
-        inter = len(tokens_in & t2)
-        union = len(tokens_in | t2)
-        jacc = (inter / union) if union else 0.0
-        bonus = 0.0
-        if cn.startswith(base) or base.startswith(cn):
-            bonus += 0.2
-        if base and cn and (base in cn or cn in base):
-            bonus += 0.15
-        score = jacc + bonus
-        if score > best_score:
-            best_score = score
-            best = cand
-    # Threshold tuned to tolerate accents/suffixes but avoid bad matches
-    return best if best_score >= 0.35 else None
+    payload: dict = {"page_size": 100}
+    cursor = None
+    while True:
+        body = dict(payload)
+        if cursor:
+            body["start_cursor"] = cursor
+        r = _notion_request("POST", url, body)
+        if not r or r.status_code != 200:
+            _alert(
+                f"[WARN] Toggl Workspaces query failed: status={getattr(r, 'status_code', None)}"
+            )
+            break
+        data = r.json() or {}
+        for pg in data.get("results") or []:
+            props = pg.get("properties", {}) or {}
+            name = _get_title(props, "Name")
+            tok = _get_rich_text(props, "api_token")
+            if tok:
+                out.append({"name": name or "", "api_token": tok})
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    if not out:
+        _alert("Toggl Workspaces DB empty or unreachable")
+    return out
+
 
 # ==========================
 # Week window helpers
@@ -602,17 +702,21 @@ def _get_week_tz():
         return timezone.utc
 
 
-def _previous_week_bounds_local(now_utc: datetime) -> tuple[datetime, datetime, datetime, datetime]:
+def _previous_week_bounds_local(
+    now_utc: datetime,
+) -> tuple[datetime, datetime, datetime, datetime]:
     """Return (start_local, end_local, start_utc, end_utc) for the past week window.
+
     Uses local day boundaries: from start-of-day 7 days ago up to start-of-today.
-    This matches typical Notion/Toggl "Past week" summaries at day precision.
     """
     tz = _get_week_tz()
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     now_local = now_utc.astimezone(tz)
     # End at start of current day
-    week_end_local = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=tz)
+    week_end_local = datetime.combine(
+        now_local.date(), datetime.min.time(), tzinfo=tz
+    )
     # Start at start of day 7 days ago
     week_start_local = week_end_local - timedelta(days=7)
     # Convert to UTC
@@ -626,48 +730,58 @@ def _previous_week_bounds_local(now_utc: datetime) -> tuple[datetime, datetime, 
 # ==========================
 def lambda_handler(event, context):
     if not NOTION_TOKEN or not NOTION_DATABASE_ID:
-        return {"status": "error", "error": "Missing NOTION_TOKEN or NOTION_DATABASE_ID"}
+        return {
+            "status": "error",
+            "error": "Missing NOTION_TOKEN or NOTION_DATABASE_ID",
+        }
+
+    # Ensure workspace tokens DB is reachable (aligns with live_reports_bot)
+    workspaces = load_workspace_tokens()
+    if not workspaces:
+        return {
+            "status": "no_workspaces",
+            "users": 0,
+            "sent": 0,
+        }
 
     now_utc = datetime.now(timezone.utc)
-    week_start_local, week_end_local, week_start_utc, week_end_utc = _previous_week_bounds_local(now_utc)
-
-    # Load TEAM sheet for webhook resolution (same method as live_reports_bot)
-    team_cfg = load_team_sheet()
-    name_to_webhook = { _norm(u.get("name","")): (u.get("discord_webhook_url") or "").strip() for u in team_cfg if u.get("discord_webhook_url") }
-    team_names = [u.get("name", "") for u in team_cfg if u.get("name")] 
+    (
+        week_start_local,
+        week_end_local,
+        week_start_utc,
+        week_end_utc,
+    ) = _previous_week_bounds_local(now_utc)
 
     pages = query_time_entries_between(week_start_utc, week_end_utc)
     agg = aggregate_week(pages, week_start_local, week_end_local)
 
-    # Combine groups that map to the same TEAM sheet name
-    combined: dict[str, dict] = {}
-    for notion_username, data in agg.items():
-        if not notion_username:
-            continue
-        best_name = _best_sheet_name(notion_username, team_names)
-        if not best_name:
-            _alert(f"⚠️ Missing Discord webhook for user: '{notion_username}'")
-            continue
-        c = combined.setdefault(best_name, {"total_hours": 0.0, "total_entries": 0, "per_project": defaultdict(float)})
-        c["total_hours"] += float(data.get("total_hours", 0.0))
-        c["total_entries"] += int(data.get("total_entries", 0))
-        for proj, hrs in (data.get("per_project", {}) or {}).items():
-            c["per_project"][proj] += float(hrs)
+    reports: list[dict] = []
+    for data in agg.values():
+        username = data.get("username") or "Unknown"
+        webhook = data.get("webhook") or ""
+        total_hours = float(data.get("total_hours", 0.0))
+        total_entries = int(data.get("total_entries", 0))
+        per_project = dict(data.get("per_project", {}) or {})
+        time_commitment = float(data.get("time_commitment", 0.0) or 0.0)
 
-    # Build one message per sheet user
-    reports = []
-    for sheet_name, data in combined.items():
         msg = build_weekly_message(
-            username=sheet_name,
+            username=username,
             week_start=week_start_local,
             week_end=week_end_local,
-            total_hours=float(data.get("total_hours", 0.0)),
-            total_entries=int(data.get("total_entries", 0)),
-            per_project_hours=dict(data.get("per_project", {})),
+            total_hours=total_hours,
+            total_entries=total_entries,
+            per_project_hours=per_project,
+            time_commitment_hours=time_commitment if time_commitment > 0 else None,
         )
-        reports.append({"username": sheet_name, "message": msg})
+        reports.append(
+            {
+                "username": username,
+                "webhook": webhook,
+                "message": msg,
+            }
+        )
 
-    sent = send_reports_parallel(reports, name_to_webhook)
+    sent = send_reports_parallel(reports)
 
     return {
         "status": "complete",
