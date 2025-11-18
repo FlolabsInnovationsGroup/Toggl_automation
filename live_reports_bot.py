@@ -95,7 +95,7 @@ STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "286a1576955180d6acdec21f7a45dfcc").strip()
 NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
 NOTION_TEAM_DB_ID_DASH = _dashify_notion_id(NOTION_TEAM_DB_ID)
-NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "").strip()
+NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce").strip()
 NOTION_TOGGL_WORKSPACES_DB_ID_DASH = _dashify_notion_id(NOTION_TOGGL_WORKSPACES_DB_ID) if NOTION_TOGGL_WORKSPACES_DB_ID else ""
 
 # Notion throughput knobs
@@ -1399,37 +1399,43 @@ def notion_cleanup_duplicates_for_ids(eids: set[str], context, keep_ids: set[str
 
 # (legacy _notion_query_user removed)
 
-def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool=False) -> str | None:
+def _notion_upsert(existing: dict | None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool = False) -> str | None:
+    """Create a new Time Entry page; never edits existing pages.
+
+    Existence checks are handled in fast_sync via the window index (by_eid).
+    Here we:
+      - no-op if an existing page_id is supplied
+      - otherwise, create a new page with the given properties.
+    """
     if not NOTION_ENABLED:
         return existing.get("page_id") if isinstance(existing, dict) else None
-    eid=str(entry.get("id"))
+
+    eid = str(entry.get("id"))
     # Resolve Team Member (mandatory)
     tm_pid = (entry.get("team_member_pid") if isinstance(entry, dict) else None) or _resolve_team_member_pid(entry.get("user") or "")
     if not tm_pid:
         _alert(f"[WARN] Team Member not found for '{entry.get('user')}' (eid {eid}, ws {workspace_id}); skipping upsert.")
         return existing.get("page_id") if isinstance(existing, dict) else None
-    # Guard against duplicates: do lookup under an EID lock before create
-    lk = _eid_lock(eid)
-    # We intentionally keep the lock small in scope; we don't hold it across network requests
-    props={
-        # User Key now stores the Toggl display name
+
+    props = {
+        # User Key stores the Toggl display name
         P_USER_KEY: _title_val(user_key),
-        # Entry ID remains the Toggl time entry id
+        # Entry ID is the Toggl time entry id
         P_ENTRY_ID: {"number": int(eid)} if eid.isdigit() else _rt_val(eid),
-        P_PROJECT:  _select_val(entry.get("project")),
-        P_TAGS:     _multi_val(entry.get("tags") or []),
-        P_DATE:     _date_range_val(entry.get("start"), entry.get("end")),
-        P_UPDATED:  _date_val(entry.get("updated")),
-        P_DURATION: _num_val(int(int(entry.get("dur",0))/1000)),
-        P_WORKSPACE:_num_val(int(workspace_id or 0)),
+        P_PROJECT: _select_val(entry.get("project")),
+        P_TAGS: _multi_val(entry.get("tags") or []),
+        P_DATE: _date_range_val(entry.get("start"), entry.get("end")),
+        P_UPDATED: _date_val(entry.get("updated")),
+        P_DURATION: _num_val(int(int(entry.get("dur", 0)) / 1000)),
+        P_WORKSPACE: _num_val(int(workspace_id or 0)),
         P_DESCRIPTION: _rt_val(entry.get("description") or ""),
         P_TEAM_MEMBER: _relation(tm_pid),
     }
+
     # Optional: store Toggl user id in a separate "ID" property
     try:
         user_id = entry.get("user_id")
         if P_USER_ID and user_id is not None:
-            # Match the actual Notion property type for ID
             try:
                 id_prop_type = _notion_prop_type(P_USER_ID)
             except Exception:
@@ -1443,135 +1449,35 @@ def _notion_upsert(existing: dict|None, user_key: str, entry: dict, workspace_id
             elif id_prop_type == "rich_text":
                 props[P_USER_ID] = _rt_val(str(user_id))
             else:
-                # Fallback: treat as rich_text to avoid validation errors on unknown schema
                 props[P_USER_ID] = _rt_val(str(user_id))
     except Exception:
         pass
+
     st = entry.get("status")
     if P_STATUS and st:
         sv = _status_val(st)
         if sv:
             props[P_STATUS] = sv
-    def _entry_diff_from_snap(entry_snap: dict | None) -> tuple[bool, list[str]]:
-        """Compare current Toggl entry with a Notion snapshot.
-        Returns (is_different, changed_fields)."""
-        if not entry_snap:
-            return True, ["no_snapshot"]
-        changed_fields: list[str] = []
-        try:
-            dur_ms_new = int(entry.get("dur") or 0)
-        except Exception:
-            dur_ms_new = 0
-        dur_ms_old = int(entry_snap.get("dur") or 0)
-        if dur_ms_new != dur_ms_old:
-            changed_fields.append("duration")
-        desc_new = entry.get("description") or ""
-        desc_old = entry_snap.get("desc") or ""
-        if not _desc_equal(desc_new, desc_old):
-            changed_fields.append("description")
-        proj_new = entry.get("project") or ""
-        proj_old = entry_snap.get("project") or ""
-        if proj_new != proj_old:
-            changed_fields.append("project")
-        tags_new = set(entry.get("tags") or [])
-        tags_old = set(entry_snap.get("tags") or [])
-        if tags_new != tags_old:
-            changed_fields.append("tags")
-        try:
-            start_new = _parse_iso8601(entry.get("start"))
-        except Exception:
-            start_new = None
-        try:
-            start_old = _parse_iso8601(entry_snap.get("start"))
-        except Exception:
-            start_old = None
-        try:
-            if start_new and start_old:
-                # Consider starts equal if they differ by <= 2 seconds.
-                if abs((start_new - start_old).total_seconds()) > 60.0:
-                    changed_fields.append("start")
-        except Exception:
-            if start_new and start_old and start_new != start_old:
-                changed_fields.append("start")
-        try:
-            end_new = _parse_iso8601(entry.get("end"))
-        except Exception:
-            end_new = None
-        try:
-            end_old = _parse_iso8601(entry_snap.get("end"))
-        except Exception:
-            end_old = None
-        try:
-            if end_new and end_old:
-                # Consider ends equal if they differ by <= 2 seconds.
-                if abs((end_new - end_old).total_seconds()) > 60.0:
-                    changed_fields.append("end")
-        except Exception:
-            if end_new and end_old and end_new != end_old:
-                changed_fields.append("end")
-        return (len(changed_fields) > 0, changed_fields)
 
-    # Existing page explicitly supplied (from window index): only called when
-    # fast_sync has already detected a change, so we can safely patch.
+    # If an existing page_id is supplied, do not edit it here.
     if existing and existing.get("page_id"):
-        page_id = existing["page_id"]
-        _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
-        # Do not append description blocks for existing pages to avoid
-        # repeated paragraphs; description content lives in P_DESCRIPTION.
-        return page_id
-    else:
-        # Try to create idempotently: lock eid, lookup, then create, then on conflict lookup and patch.
-        # Existence and equality are based ONLY on the time entry ID.
-        with lk:
-            # 1) global lookup by Entry ID (no workspace/user filters)
-            found = _notion_find_entry_by_eid(eid)
-            if found:
-                page_id = found.get("page_id")
-                snap = found.get("snap") or {}
-                is_diff, changed_fields = _entry_diff_from_snap(snap)
-                if not is_diff:
-                    # No difference vs existing page: do not edit.
-                    return page_id
-                # There is a real difference: patch. Avoid appending blocks
-                # for existing pages to prevent repeated paragraphs.
-                try:
-                    _alert(f"[DEBUG] Updating existing entry eid={eid}: changed={','.join(changed_fields)}")
-                except Exception:
-                    pass
-                if page_id:
-                    _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
-                    return page_id
-            # 2) attempt create
-            body = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props}
-            # For new pages, we may add a single description block if enabled.
-            if NOTION_ADD_DESCRIPTION_BLOCKS and (entry.get("description") or "").strip():
-                blk = _desc_block(entry.get("description") or "")
-                if blk:
-                    body["children"] = [blk]
-            r = _notion_request("POST", "https://api.notion.com/v1/pages", json_body=body)
-            if r and r.status_code in (200, 201):
-                try:
-                    created = r.json() or {}
-                    pid = created.get("id")
-                    return pid
-                except Exception:
-                    return None
-            else:
-                # 3) if failed (e.g., 409), lookup again and patch
-                found2 = _notion_find_entry_by_eid(eid)
-                if found2 and found2.get("page_id"):
-                    page_id = found2.get("page_id")
-                    snap2 = found2.get("snap") or {}
-                    is_diff, changed_fields = _entry_diff_from_snap(snap2)
-                    if not is_diff:
-                        return page_id
-                    try:
-                        _alert(f"[DEBUG] Updating existing entry after conflict eid={eid}: changed={','.join(changed_fields)}")
-                    except Exception:
-                        pass
-                    _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
-                    return page_id
-        return None
+        return existing.get("page_id")
+
+    # Create a new page
+    body = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props}
+    if NOTION_ADD_DESCRIPTION_BLOCKS and (entry.get("description") or "").strip():
+        blk = _desc_block(entry.get("description") or "")
+        if blk:
+            body["children"] = [blk]
+    r = _notion_request("POST", "https://api.notion.com/v1/pages", json_body=body)
+    if r and r.status_code in (200, 201):
+        try:
+            created = r.json() or {}
+            pid = created.get("id")
+            return pid
+        except Exception:
+            return None
+    return None
 
 def _notion_archive_page(page_id: str):
     if not NOTION_ENABLED:
@@ -2059,30 +1965,10 @@ def fast_sync(context=None):
                         prev = None
                         prev_snap = {}
                 first_seen = prev is None
-                prev_dur = int(prev_snap.get("dur", dur_ms))
-                prev_desc = prev_snap.get("desc", desc)
-                prev_proj = prev_snap.get("project", project)
-                prev_tags = prev_snap.get("tags", list(tags))
-                prev_start_s = prev_snap.get("start", start_s)
-                try:
-                    prev_start_dt = datetime.strptime(prev_start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if prev_start_s else start_dt
-                except Exception:
-                    prev_start_dt = start_dt
 
-                changed_time = dur_ms != prev_dur
-                changed_proj = project != prev_proj
-                changed_desc = not _desc_equal(desc, prev_desc)
-                old_set = set(prev_tags) if isinstance(prev_tags, list) else set()
-                new_set = set(tags) if isinstance(tags, list) else set()
-                changed_tags = old_set != new_set
-                try:
-                    # Treat start times as equal if they differ by <= 2 seconds
-                    delta_start = abs((start_dt - prev_start_dt).total_seconds())
-                    changed_start = delta_start > 2.0
-                except Exception:
-                    changed_start = (start_dt != prev_start_dt)
-
-                # Insert only first-seen entries here (batch-limited)
+                # Insert only first-seen entries here (batch-limited).
+                # Existing entries are not edited in this mode; updates
+                # are intentionally skipped to minimize Notion writes.
                 if first_seen:
                     # Require Team Member relation on insert
                     tm_pid = _resolve_team_member_pid(user)
@@ -2109,26 +1995,6 @@ def fast_sync(context=None):
                     notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
                     _queue_new(existing, notion_user_key, notion_entry, wid, add_block)
 
-                # For existing entries, upsert when any key field changed
-                elif (changed_time or changed_proj or changed_desc or changed_tags or changed_start):
-                    notion_entry = {
-                        "id": eid,
-                        "user": user,
-                        "user_id": uid,
-                        "project": project,
-                        "tags": tags,
-                        "dur": dur_ms,
-                        "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                        "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                        "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                        "description": desc,
-                        # Reset status to Processed so staged notifier can send updates
-                        "status": STATUS_PROCESSED,
-                    }
-                    existing = {"page_id": (prev or {}).get("page_id")}
-                    add_block = changed_desc
-                    _queue_update(existing, notion_user_key, notion_entry, wid, add_block)
-
     # Build prioritized task list
     # Requirement: As long as there are new (not-yet-in-DB) entries,
     # do NOT run any updates. Only when there are zero new entries
@@ -2136,11 +2002,6 @@ def fast_sync(context=None):
     notion_tasks: list[tuple] = []
     if staged_new:
         for t in staged_new:
-            if len(notion_tasks) >= WRITES_LIMIT:
-                break
-            notion_tasks.append(t)
-    else:
-        for t in staged_updates:
             if len(notion_tasks) >= WRITES_LIMIT:
                 break
             notion_tasks.append(t)
