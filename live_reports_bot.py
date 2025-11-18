@@ -111,9 +111,6 @@ MAX_INDEX_EIDS_PER_RUN = int(os.getenv("MAX_INDEX_EIDS_PER_RUN", "10000"))
 MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "60"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "40"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
-MAX_TARGETED_LOOKUPS_PER_RUN = int(os.getenv("MAX_TARGETED_LOOKUPS_PER_RUN", "0"))
-MAX_DEDUPE_IDS_PER_RUN = int(os.getenv("MAX_DEDUPE_IDS_PER_RUN", "40"))
-MAX_DEDUPE_MARKS_PER_ID = int(os.getenv("MAX_DEDUPE_MARKS_PER_ID", "10"))
 NOTION_INDEX_MODE = "window"  # Fixed optimal index mode
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
 INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "20"))  # number of new entries to insert per run
@@ -1054,107 +1051,6 @@ def _best_team_member_page_id(user_display: str) -> str | None:
     return pid
 
 # ---- Targeted Notion lookup by Entry ID (to avoid duplicates/false-new) ----
-_EID_LOOKUP_CACHE: dict[str, dict] = {}
-_TARGETED_LOOKUPS_USED = 0
-
-def _notion_find_entry_by_eid(eid: str) -> dict | None:
-    global _TARGETED_LOOKUPS_USED
-    if not eid:
-        return None
-    if eid in _EID_LOOKUP_CACHE:
-        return _EID_LOOKUP_CACHE[eid]
-    # if limit <= 0, treat as unlimited
-    if MAX_TARGETED_LOOKUPS_PER_RUN > 0 and _TARGETED_LOOKUPS_USED >= MAX_TARGETED_LOOKUPS_PER_RUN:
-        return None
-    _TARGETED_LOOKUPS_USED += 1
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-
-    def _query_filter(flt: dict):
-        body = {"page_size": 100, "filter": flt}
-        r = _notion_request('POST', url, json_body=body)
-        if not r or r.status_code != 200:
-            return []
-        data = r.json() or {}
-        return data.get("results") or []
-
-    # Choose filter type based on actual Notion schema
-    prop_type = _notion_prop_type(P_ENTRY_ID)
-    results = []
-    if prop_type == "number":
-        if not eid.isdigit():
-            return None
-        results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
-    elif prop_type == "rich_text":
-        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
-    else:
-        # Fallback (unknown schema): prefer exact rich_text equals, then number equals if digits
-        results = _query_filter({"property": P_ENTRY_ID, "rich_text": {"equals": str(eid)}})
-        if not results and eid.isdigit():
-            results = _query_filter({"property": P_ENTRY_ID, "number": {"equals": int(eid)}})
-
-    candidates = []
-    for pg in results:
-        pid = pg.get("id")
-        props = pg.get("properties", {})
-        # Verify exact match on Entry ID
-        p = props.get(P_ENTRY_ID, {})
-        exact = False
-        if p.get("type") == "number" and eid.isdigit():
-            exact = (p.get("number") is not None and int(p.get("number")) == int(eid))
-        elif p.get("type") == "rich_text":
-            txt = "".join([x.get("plain_text", "") for x in (p.get("rich_text") or [])]).strip()
-            exact = (txt == eid)
-        if not exact:
-            continue
-        # Build snapshot similar to _notion_query_user
-        def _get_date(n):
-            d = (props.get(n, {}).get("date") or {})
-            return d.get("start") or ""
-        def _get_range(n):
-            d = (props.get(n, {}).get("date") or {})
-            return d.get("start") or "", d.get("end") or ""
-        def _get_num(n):
-            q = props.get(n, {})
-            return q.get("number") if q.get("type") == "number" else 0
-        def _get_text(n):
-            q = props.get(n, {})
-            return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip() if q.get("type") == "rich_text" else ""
-        def _get_sel(n):
-            q = props.get(n, {})
-            return (q.get("select") or {}).get("name") or "No project"
-        def _get_status(n):
-            q = props.get(n, {})
-            return (q.get("status") or {}).get("name") or ""
-        def _get_tags(n):
-            q = props.get(n, {})
-            return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
-        start_s, end_s = _get_range(P_DATE)
-        updated_s = _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time")
-        snap = {
-            "dur": int(_get_num(P_DURATION) or 0) * 1000,
-            "desc": _get_text(P_DESCRIPTION),
-            "project": _get_sel(P_PROJECT),
-            "status": _get_status(P_STATUS),
-            "tags": _get_tags(P_TAGS),
-            "start": start_s,
-            "end": end_s,
-            "updated": updated_s,
-        }
-        candidates.append({"page_id": pid, "snap": snap})
-
-    if not candidates:
-        _EID_LOOKUP_CACHE[eid] = None
-        return None
-
-    # Prefer the most recently updated candidate
-    def _ts(s):
-        try:
-            return datetime.strptime((s or "").replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-        except Exception:
-            return datetime.min.replace(tzinfo=timezone.utc)
-    best = max(candidates, key=lambda c: _ts(c["snap"].get("updated")))
-    _EID_LOOKUP_CACHE[eid] = best
-    return best
 
 def _notion_find_entry_by_eid_ws(eid: str, workspace_id: int | None, user_key: str | None = None, start_iso: str | None = None) -> dict | None:
     """Targeted lookup by Entry ID AND Workspace. Returns the most recently updated exact match.
@@ -1352,53 +1248,6 @@ def _notion_find_all_by_eid(eid: str) -> list[dict]:
         }
         out.append({"page_id": pid, "snap": snap})
     return out
-
-def notion_cleanup_duplicates_for_ids(eids: set[str], context, keep_ids: set[str] | None = None) -> dict:
-    """For each Entry ID, keep the latest-updated page; mark other duplicates Deleted."""
-    cleaned = 0
-    examined = 0
-    for eid in list(eids)[:MAX_DEDUPE_IDS_PER_RUN]:
-        if _should_exit_soon(context):
-            break
-        candidates = _notion_find_all_by_eid(eid)
-        if not candidates:
-            continue
-        # Group by workspace to avoid cross-workspace dedupe
-        groups: dict[int, list[dict]] = {}
-        for c in candidates:
-            ws = 0
-            try:
-                ws = int((c.get("snap", {}).get("workspace") or 0))
-            except Exception:
-                ws = 0
-            groups.setdefault(ws, []).append(c)
-        for ws, exact in groups.items():
-            if len(exact) <= 1:
-                continue
-            examined += 1
-            # Choose canonical: most recent Updated
-            def _ts(c):
-                s = (c.get("snap", {}).get("updated") or "")
-                try:
-                    return datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
-                except Exception:
-                    return datetime.min.replace(tzinfo=timezone.utc)
-            if keep_ids:
-                exact.sort(key=lambda c: (c.get("page_id") in keep_ids, _ts(c)), reverse=True)
-            else:
-                exact.sort(key=_ts, reverse=True)
-            keep = exact[0]
-            losers = [c for c in exact[1:MAX_DEDUPE_MARKS_PER_ID+1] if not (keep_ids and c.get("page_id") in keep_ids)]
-            for loser in losers:
-                if _should_exit_soon(context):
-                    break
-                pid = loser.get("page_id")
-                if pid:
-                    _notion_archive_page(pid)
-                    cleaned += 1
-    return {"examined": examined, "cleaned": cleaned}
-
-# (legacy _notion_query_user removed)
 
 def _notion_upsert(existing: dict | None, user_key: str, entry: dict, workspace_id: int, add_desc_block: bool = False) -> str | None:
     """Create a new Time Entry page; never edits existing pages.
@@ -1868,10 +1717,8 @@ def fast_sync(context=None):
 
     # Stage tasks separately to prioritize NEW inserts over updates
     staged_new: list[tuple] = []
-    staged_updates: list[tuple] = []
     scheduled_upserts: set[tuple] = set()
     WRITES_LIMIT = min(INSERT_BATCH_SIZE, int(os.getenv("MAX_NOTION_WRITES_PER_RUN", "300")))
-    processed_eids: set[str] = set()
     current_ids_by_user: dict[str, set[str]] = {}
     keep_upserted_ids: set[str] = set()
 
@@ -1883,15 +1730,6 @@ def fast_sync(context=None):
             return
         scheduled_upserts.add(key)
         staged_new.append((existing, notion_user_key, notion_entry, wid, add_block))
-
-    def _queue_update(existing, notion_user_key, notion_entry, wid, add_block):
-        if not NOTION_ENABLED:
-            return
-        key = (notion_user_key, notion_entry.get("id"))
-        if key in scheduled_upserts:
-            return
-        scheduled_upserts.add(key)
-        staged_updates.append((existing, notion_user_key, notion_entry, wid, add_block))
 
     for token in workspaces:
         if _should_exit_soon(context):
@@ -1924,8 +1762,6 @@ def fast_sync(context=None):
                 end_s = e.get("end") or ""
                 upd_s = e.get("updated") or e.get("at") or ""
                 uid = e.get("uid")
-
-                processed_eids.add(eid)
                 # Use the Toggl display name as the Notion User Key value
                 notion_user_key = user
                 current_ids_by_user.setdefault(notion_user_key, set()).add(eid)
@@ -2080,15 +1916,6 @@ def fast_sync(context=None):
                     f.result()
                 except Exception as e:
                     _alert(f"[ERROR] Notion archive task: {e}")
-
-    # Dedupe processed eids
-    if processed_eids and not _should_exit_soon(context) and (not context or _remaining_s(context) >= MIN_SECONDS_FOR_CLEANUP):
-        try:
-            stats = notion_cleanup_duplicates_for_ids(processed_eids, context, keep_ids=keep_upserted_ids)
-            if stats.get("cleaned"):
-                _alert(f"[INFO] Dedupe: examined={stats.get('examined')} cleaned={stats.get('cleaned')}")
-        except Exception as e:
-            _alert(f"[ERROR] Dedupe failed: {e}")
 
     return {"status":"complete","notified":notified,"skipped_notifies":skipped_notifies,"send_notifications": SEND_NOTIFICATIONS}
 
