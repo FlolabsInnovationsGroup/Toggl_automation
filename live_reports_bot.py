@@ -26,7 +26,7 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/ap
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
 # Use a generous default HTTP timeout so Notion/index queries can complete
 # even on slower networks. Can be overridden via HTTP_TIMEOUT_SECONDS env.
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 
 DISCORD_MIN_INTERVAL_MS = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
 DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))
@@ -107,7 +107,7 @@ NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
 NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "5"))
 NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "4"))
-MAX_INDEX_EIDS_PER_RUN = int(os.getenv("MAX_INDEX_EIDS_PER_RUN", "300"))
+MAX_INDEX_EIDS_PER_RUN = int(os.getenv("MAX_INDEX_EIDS_PER_RUN", "10000"))
 MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "60"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "40"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
@@ -195,6 +195,7 @@ _NOTION_429_COUNT = 0
 _NOTION_5XX_COUNT = 0
 _NOTION_EXHAUSTED = 0
 _NOTION_EXC_COUNT = 0
+_KNOWN_EIDS: set[str] = set()
 try:
     from threading import Lock
     _NOTION_LOCK = Lock()
@@ -1851,6 +1852,13 @@ def fast_sync(context=None):
 
     now=datetime.now(timezone.utc); since=now - timedelta(days=TIME_WINDOW_DAYS)
     by_eid, by_user = notion_build_window_index(since, now, context=context)
+    # Seed known Entry IDs from the current Notion window index so we do not
+    # treat existing pages as new in this or subsequent warm runs.
+    try:
+        global _KNOWN_EIDS
+        _KNOWN_EIDS.update(by_eid.keys())
+    except Exception:
+        pass
 
     # Counters for notifications; actual notify step runs later,
     # after we know whether there are any new entries this run.
@@ -1964,7 +1972,15 @@ def fast_sync(context=None):
                     if prev_uk != expected:
                         prev = None
                         prev_snap = {}
-                first_seen = prev is None
+                # First-seen is defined by absence in the known ID set.
+                try:
+                    if eid not in _KNOWN_EIDS:
+                        first_seen = True
+                        _KNOWN_EIDS.add(eid)
+                    else:
+                        first_seen = False
+                except Exception:
+                    first_seen = prev is None
 
                 # Insert only first-seen entries here (batch-limited).
                 # Existing entries are not edited in this mode; updates
