@@ -35,6 +35,18 @@ TEAM_INDEX_CACHE_ENABLED = bool(TEAM_INDEX_CACHE_PATH)
 # Default HTTP timeout kept intentionally conservative to avoid Lambda
 # timeouts on slow upstreams. Can be overridden via HTTP_TIMEOUT_SECONDS env.
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+try:
+    TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "25"))
+except Exception:
+    TEAM_DB_QUERY_PAGE_SIZE = 25
+try:
+    TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "120"))
+except Exception:
+    TEAM_DB_TIMEOUT_SECONDS = 120
+try:
+    TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "300"))
+except Exception:
+    TEAM_DB_MAX_INDEX_SECONDS = 300
 
 DISCORD_MIN_INTERVAL_MS = int(os.getenv("DISCORD_MIN_INTERVAL_MS", "500"))
 DISCORD_GLOBAL_MIN_INTERVAL_MS = int(os.getenv("DISCORD_GLOBAL_MIN_INTERVAL_MS", "0"))
@@ -113,6 +125,16 @@ TEAM_WEBHOOK_PROP = os.getenv("TEAM_WEBHOOK_PROP", "Webhook")
 NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce").strip()
 NOTION_TOGGL_WORKSPACES_DB_ID_DASH = _dashify_notion_id(NOTION_TOGGL_WORKSPACES_DB_ID) if NOTION_TOGGL_WORKSPACES_DB_ID else ""
 
+# Team Members index tuning defaults
+TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "40"))
+TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "60"))
+TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "220"))
+TEAM_INDEX_CACHE_PATH = os.getenv("TEAM_INDEX_CACHE_PATH", "/tmp/team_members_index.json")
+try:
+    TEAM_INDEX_CACHE_SECONDS = int(os.getenv("TEAM_INDEX_CACHE_SECONDS", "3600"))
+except Exception:
+    TEAM_INDEX_CACHE_SECONDS = 3600
+
 TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "50"))
 TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "180"))
 TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "540"))
@@ -136,6 +158,15 @@ TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "25"))
 TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "120"))
 TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "240"))
 
+# Team database tuning knobs
+TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "25"))
+TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "180"))
+TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "260"))
+# Optional dedicated token (falls back to the main Notion token)
+NOTION_TEAM_TOKEN = os.getenv("NOTION_TEAM_TOKEN", NOTION_TOKEN).strip()
+TEAM_HEADERS = {"Authorization": f"Bearer {NOTION_TEAM_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
+TEAM_MATCH_MIN_SCORE = float(os.getenv("TEAM_MATCH_MIN_SCORE", "0.1"))
+
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "2"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "5"))  # threads for Notion writes
@@ -152,11 +183,24 @@ NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
 NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "500"))
 NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "20"))
+try:
+    TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "40"))
+except Exception:
+    TEAM_DB_QUERY_PAGE_SIZE = 40
+try:
+    TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "120"))
+except Exception:
+    TEAM_DB_TIMEOUT_SECONDS = 120
+try:
+    TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "240"))
+except Exception:
+    TEAM_DB_MAX_INDEX_SECONDS = 240
+_TEAM_DB_PROPERTIES = [p.strip() for p in os.getenv("TEAM_DB_QUERY_PROPERTIES", "Name,Webhook").split(",") if p.strip()]
 TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "180"))
 TEAM_DB_MAX_INDEX_SECONDS = int(os.getenv("TEAM_DB_MAX_INDEX_SECONDS", "360"))
 TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "200"))
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "50"))  # number of new entries to insert per run
-NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "50"))  # number of processed entries to notify per run
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "100"))  # number of new entries to insert per run
+NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "100"))  # number of processed entries to notify per run
 
 # Team Members index tuning
 TEAM_TITLE_PROP = os.getenv("TEAM_TITLE_PROP", "Name")
@@ -944,6 +988,7 @@ _TEAM_MEM_NAME_BY_ID: dict[str, str] = {}              # page_id -> original nam
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
 _TEAM_MEM_INDEX_FAILED = False  # avoid repeated slow attempts when index build fails
+_TEAM_MEM_INDEX_SOURCE = "none"  # "live", "cache", or "none"
 # Title properties discovered via Team Members schema
 _TEAM_DB_TITLE_PROPS: list[str] = []
 _TEAM_MEM_CACHE_HIT = False
@@ -1050,6 +1095,7 @@ def notion_build_team_members_index():
     MIN_PAGE_SIZE = 5
     shrink_attempts = 0
     payload = {"page_size": page_size_cur}
+    team_props = ["Name", "Webhook"]
     cursor = None
     # Total time budget for building the Team Members index, so a slow Notion
     # response cannot consume the entire invocation window. Defaults are tuned
@@ -1101,13 +1147,16 @@ def notion_build_team_members_index():
         pages_scanned = 0
         pages_with_name = 0
         pages_missing_name_logged = 0
+        index_timeout_exceeded = False
         while True:
             # Stop building the index if we've exceeded the per-run time budget.
             if TEAM_DB_MAX_INDEX_SECONDS > 0 and (time.monotonic() - start_ts) > TEAM_DB_MAX_INDEX_SECONDS:
                 _alert("[WARN] Team Members index exceeded time budget; stopping index build early.")
+                index_timeout_exceeded = True
                 break
             body = dict(payload)
             body["page_size"] = page_size_cur
+            body["properties"] = team_props
             if cursor:
                 body["start_cursor"] = cursor
             data = _tm_request(body)
