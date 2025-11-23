@@ -65,7 +65,7 @@ SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
 # MAX_RUNTIME_S is only used when an execution context timer is not available
 # (e.g. local tests without a real Lambda context). When a context with
 # get_remaining_time_in_millis is present, that timer is used instead.
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "660"))
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "900"))
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "10"))   # leave safety margin for shutdown
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
@@ -107,36 +107,28 @@ STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "286a1576955180d6acdec21f7a45dfcc").strip()
 NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
 NOTION_TEAM_DB_ID_DASH = _dashify_notion_id(NOTION_TEAM_DB_ID)
-TEAM_TITLE_PROP = os.getenv("TEAM_TITLE_PROP", "Name")
-TEAM_WEBHOOK_PROP = os.getenv("TEAM_WEBHOOK_PROP", "Webhook")
 NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce").strip()
 NOTION_TOGGL_WORKSPACES_DB_ID_DASH = _dashify_notion_id(NOTION_TOGGL_WORKSPACES_DB_ID) if NOTION_TOGGL_WORKSPACES_DB_ID else ""
 
 # Notion throughput knobs
-NOTION_RPS = float(os.getenv("NOTION_RPS", "2"))            # target rps (global per integration)
-NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "5"))  # threads for Notion writes
-NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "3"))
+NOTION_RPS = float(os.getenv("NOTION_RPS", "2.8"))            # target rps (global per integration)
+NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "10"))  # threads for Notion writes
+NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "5"))
 # Circuit breaker thresholds to fail fast on persistent errors
 NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
 NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "5"))
 NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "4"))
-MAX_INDEX_EIDS_PER_RUN = int(os.getenv("MAX_INDEX_EIDS_PER_RUN", "10000"))
-MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "120"))
+MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "300"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "60"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
-NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "500"))
-NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "30"))
-TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "200"))
-TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "200"))
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "300"))  # number of new entries to insert per run
-NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "200"))  # number of processed entries to notify per run
-
-# Team Members index tuning
-TEAM_TITLE_PROP = os.getenv("TEAM_TITLE_PROP", "Name")
-TEAM_WEBHOOK_PROP = os.getenv("TEAM_WEBHOOK_PROP", "Webhook")
-TEAM_TITLE_PROP = os.getenv("TEAM_TITLE_PROP", "Name")
+NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "2000"))
+NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "300"))
+TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "300"))
+TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "1000"))
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "1000"))  # number of new entries to insert per run
+NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "1000"))  # number of processed entries to notify per run
 
 TEAM_DB_MAX_INDEX_SECONDS = MAX_RUNTIME_S - MIN_SECONDS_FOR_NOTION - NOTION_INDEX_TIMEOUT
 
@@ -296,7 +288,7 @@ def team_db_health_check() -> tuple[bool, str]:
     """Verify Team Members database is accessible (title property 'Name' present).
     Returns (ok, reason). If not ok, relation resolution cannot proceed this run.
     """
-    global _TEAM_SCHEMA_LOGGED
+    global _TEAM_SCHEMA_LOGGED, TEAM_TITLE_PROP
     if not NOTION_TEAM_DB_ID:
         return False, "missing_team_db_id"
     url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}"
@@ -312,7 +304,7 @@ def team_db_health_check() -> tuple[bool, str]:
             if not _TEAM_SCHEMA_LOGGED:
                 try:
                     prop_names = ", ".join(sorted(str(k) for k in (props.keys() or [])))
-                    preferred_title = os.getenv("TEAM_TITLE_PROP", "Name")
+                    preferred_title = TEAM_TITLE_PROP
                     _alert(
                         f"[DEBUG] Team Members DB schema: "
                         f"properties=[{prop_names}] preferred_title_prop={preferred_title!r}"
@@ -1017,7 +1009,7 @@ def notion_build_team_members_index():
         Does not use the global _notion_request circuit breaker.
         Uses a moderate timeout so we fail fast when Notion is slow but gives
         heavy CRM pages enough time to respond."""
-        global TEAM_DB_MAX_INDEX_SECONDS, EXIT_MARGIN_S
+        global TEAM_DB_MAX_INDEX_SECONDS, EXIT_MARGIN_S, TEAM_TITLE_PROP
         timeout_s = TEAM_DB_MAX_INDEX_SECONDS - EXIT_MARGIN_S
         timeout_s = max(5, timeout_s)
         for attempt in range(1, 3):
@@ -1095,7 +1087,7 @@ def notion_build_team_members_index():
                 pid = pg.get("id")
                 props = pg.get("properties", {})
                 # Prefer TEAM_TITLE_PROP/"Name", fall back to first title property
-                preferred_title = os.getenv("TEAM_TITLE_PROP", "Name")
+                preferred_title = TEAM_TITLE_PROP
                 t = props.get(preferred_title, {})
                 name = ""
                 if isinstance(t, dict) and t.get("type") == "title":
@@ -1612,11 +1604,9 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
             by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
             if user_key:
                 by_user.setdefault(user_key, {})[str(eid)] = {"page_id": pid, "snap": snap}
-            # Enforce a hard cap on indexed entries per run
-            if MAX_INDEX_EIDS_PER_RUN > 0 and len(by_eid) >= MAX_INDEX_EIDS_PER_RUN:
-                break
-        # Stop if we've hit limits or there is no more data
-        if (MAX_INDEX_EIDS_PER_RUN > 0 and len(by_eid) >= MAX_INDEX_EIDS_PER_RUN) or not js.get("has_more"):
+
+        # Stop if there is no more data
+        if not js.get("has_more"):
             break
         cursor = js.get("next_cursor")
     return by_eid, by_user
