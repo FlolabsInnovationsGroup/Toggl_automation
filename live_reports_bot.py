@@ -77,7 +77,7 @@ SEND_NOTIFICATIONS = _env_bool("SEND_NOTIFICATIONS", False)
 # MAX_RUNTIME_S is only used when an execution context timer is not available
 # (e.g. local tests without a real Lambda context). When a context with
 # get_remaining_time_in_millis is present, that timer is used instead.
-MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "900"))
+MAX_RUNTIME_S = int(os.getenv("MAX_RUNTIME_S", "600"))
 EXIT_MARGIN_S = int(os.getenv("EXIT_MARGIN_S", "10"))   # leave safety margin for shutdown
 
 # Toggl API budget/rate guardrails (minimize cost and 402 spam)
@@ -119,7 +119,7 @@ STATUS_DELETED   = os.getenv("NOTION_STATUS_DELETED", "Deleted")
 NOTION_ONBOARDINGS_DB_ID = os.getenv("NOTION_ONBOARDINGS_DB_ID", "a1a106fab63548089279dc54d63eab89").strip()
 NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
 NOTION_ONBOARDINGS_DB_ID_DASH = _dashify_notion_id(NOTION_ONBOARDINGS_DB_ID)
-NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce").strip()
+NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORKSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce").strip()
 NOTION_TOGGL_WORKSPACES_DB_ID_DASH = _dashify_notion_id(NOTION_TOGGL_WORKSPACES_DB_ID) if NOTION_TOGGL_WORKSPACES_DB_ID else ""
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", NOTION_ONBOARDINGS_DB_ID).strip()
 
@@ -132,19 +132,19 @@ NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
 NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "5"))
 NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "10"))
-MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "120"))
+MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "200"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "30"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
 NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "2000"))
 NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "120"))
 ONBOARDINGS_DB_QUERY_PAGE_SIZE = int(os.getenv("ONBOARDINGS_DB_QUERY_PAGE_SIZE", "400"))
-ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "300")))
+ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "180")))
 ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS = max(1, int(os.getenv("ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS", "5")))
-ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "120"))
+ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "180"))
 
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "500"))  # number of new entries to insert per run
-NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "500"))  # number of processed entries to notify per run
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "10000"))  # number of new entries to insert per run
+NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "1000"))  # number of processed entries to notify per run
 
 # Cached Notion schema (property name -> type)
 _NOTION_SCHEMA: dict[str, str] = {}
