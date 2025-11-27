@@ -1,4 +1,4 @@
-﻿import os, json, base64, requests, csv, time, random
+﻿import os, json, base64, requests, csv, time, random, re
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,17 +20,29 @@ _init_http_session()
 _START_TS = time.monotonic()  # module import time (kept for compatibility)
 _RUN_START_TS = 0.0           # set at the beginning of each invocation
 
+def _looks_like_uuid(s: str) -> bool:
+    pattern = r"[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    return bool(re.fullmatch(pattern, (s or "").strip(), re.IGNORECASE))
+
 # ENV
 SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/api/webhooks/1401155910126272553/xF3EHp8wQlA0mx4tvcUXvvzUmXBoJgfNae21TN6N-a7mZR699QdGLkqPGQjgtKkxj2_I")
 
 # Team index caching
-# Team Members index tuning defaults (these envs can still override)
+# Team Members index tuning defaults (Onboardings DB; these envs can still override)
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
-TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "200"))
-TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "180"))
 TEAM_INDEX_CACHE_PATH = os.getenv("TEAM_INDEX_CACHE_PATH", "/tmp/team_members_index.json").strip()
-TEAM_INDEX_CACHE_TTL_S = int(os.getenv("TEAM_INDEX_CACHE_TTL_SECONDS", "3600"))
 TEAM_INDEX_CACHE_ENABLED = bool(TEAM_INDEX_CACHE_PATH)
+PROFILE_DEBUG_PAGE_ID = os.getenv("ONBOARDINGS_PROFILE_DEBUG_PAGE_ID", "").strip()
+TEAM_MEM_CACHE_PATH = os.getenv("TEAM_MEM_CACHE_PATH", "/tmp/team_members_index_cache.json").strip()
+TEAM_MEM_CACHE_TTL = max(0, int(os.getenv("TEAM_MEM_CACHE_TTL_SECONDS", "7200")))
+TEAM_MATCH_MIN_SCORE = float(os.getenv("TEAM_MATCH_MIN_SCORE", "0.4"))
+TEAM_MEM_STATUS_PROP = os.getenv("TEAM_MEM_STATUS_PROP", "Status").strip()
+_TEAM_MEMBER_STATUS_FILTER = [
+    status.strip()
+    for status in os.getenv("TEAM_MEMBER_STATUS_FILTER", "Not started,Signed,Paused,In Progress,Completed").split(",")
+    if status.strip()
+]
+_TEAM_MEMBER_STATUS_FILTER_SET = {status.lower() for status in _TEAM_MEMBER_STATUS_FILTER}
 # Default HTTP timeout kept intentionally conservative to avoid Lambda
 # timeouts on slow upstreams. Can be overridden via HTTP_TIMEOUT_SECONDS env.
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
@@ -100,37 +112,39 @@ P_TEAM_MEMBER = os.getenv("NOTION_PROP_TEAM_MEMBER", "Team Member")
 P_STATUS      = os.getenv("NOTION_PROP_STATUS", "Status")
 P_WEBHOOK     = os.getenv("NOTION_PROP_WEBHOOK", "Webhook")
 TEAM_TITLE_PROP = os.getenv("TEAM_TITLE_PROP", "Name")
-TEAM_WEBHOOK_PROP = os.getenv("TEAM_WEBHOOK_PROP", "Webhook")
 STATUS_NOTIFIED  = os.getenv("NOTION_STATUS_NOTIFIED", "Notified")
 STATUS_PROCESSED = os.getenv("NOTION_STATUS_PROCESSED", "Processed")
 STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
-NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "286a1576955180d6acdec21f7a45dfcc").strip()
+STATUS_DELETED   = os.getenv("NOTION_STATUS_DELETED", "Deleted")
+NOTION_ONBOARDINGS_DB_ID = os.getenv("NOTION_ONBOARDINGS_DB_ID", "a1a106fab63548089279dc54d63eab89").strip()
 NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
-NOTION_TEAM_DB_ID_DASH = _dashify_notion_id(NOTION_TEAM_DB_ID)
+NOTION_ONBOARDINGS_DB_ID_DASH = _dashify_notion_id(NOTION_ONBOARDINGS_DB_ID)
 NOTION_TOGGL_WORKSPACES_DB_ID = os.getenv("NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce").strip()
 NOTION_TOGGL_WORKSPACES_DB_ID_DASH = _dashify_notion_id(NOTION_TOGGL_WORKSPACES_DB_ID) if NOTION_TOGGL_WORKSPACES_DB_ID else ""
+NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", NOTION_ONBOARDINGS_DB_ID).strip()
 
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "2.8"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "10"))  # threads for Notion writes
-NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "5"))
+NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "8"))
 # Circuit breaker thresholds to fail fast on persistent errors
 NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
 NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "5"))
-NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "4"))
-MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "300"))
-MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "60"))
+NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "10"))
+MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "120"))
+MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "30"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
 NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "2000"))
-NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "300"))
-TEAM_DB_TIMEOUT_SECONDS = int(os.getenv("TEAM_DB_TIMEOUT_SECONDS", "300"))
-TEAM_DB_QUERY_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "1000"))
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "1000"))  # number of new entries to insert per run
-NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "1000"))  # number of processed entries to notify per run
+NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "120"))
+ONBOARDINGS_DB_QUERY_PAGE_SIZE = int(os.getenv("ONBOARDINGS_DB_QUERY_PAGE_SIZE", "400"))
+ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "300")))
+ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS = max(1, int(os.getenv("ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS", "5")))
+ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "120"))
 
-TEAM_DB_MAX_INDEX_SECONDS = MAX_RUNTIME_S - MIN_SECONDS_FOR_NOTION - NOTION_INDEX_TIMEOUT
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "500"))  # number of new entries to insert per run
+NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "500"))  # number of processed entries to notify per run
 
 # Cached Notion schema (property name -> type)
 _NOTION_SCHEMA: dict[str, str] = {}
@@ -249,6 +263,8 @@ def _reset_notion_circuit():
     global _NOTION_429_COUNT, _NOTION_5XX_COUNT, _NOTION_EXHAUSTED, _NOTION_EXC_COUNT
     global _NOTION_RESUME_AT, _NOTION_LAST_CALL, _NOTION_INDEX_OK
     global _METRICS_TEAM_INDEX_COUNT, _METRICS_TEAM_INDEX_SECONDS
+    global _METRICS_TEAM_INDEX_CACHE_HITS, _METRICS_TEAM_INDEX_CACHE_MISSES
+    global _METRICS_TEAM_INDEX_CACHE_AGE, _METRICS_TEAM_INDEX_CACHE_STALE, _METRICS_TEAM_INDEX_CACHE_FALLBACKS
     NOTION_ENABLED = bool(NOTION_TOKEN and NOTION_DATABASE_ID)
     _NOTION_DISABLED_LOGGED = False
     _NOTION_429_COUNT = 0
@@ -260,6 +276,11 @@ def _reset_notion_circuit():
     _NOTION_INDEX_OK = False
     _METRICS_TEAM_INDEX_COUNT = 0
     _METRICS_TEAM_INDEX_SECONDS = 0.0
+    _METRICS_TEAM_INDEX_CACHE_HITS = 0
+    _METRICS_TEAM_INDEX_CACHE_MISSES = 0
+    _METRICS_TEAM_INDEX_CACHE_AGE = 0.0
+    _METRICS_TEAM_INDEX_CACHE_STALE = 0
+    _METRICS_TEAM_INDEX_CACHE_FALLBACKS = 0
 
 def notion_health_check() -> tuple[bool, str]:
     """Verify Notion credentials and database access before heavy work.
@@ -283,69 +304,6 @@ def notion_health_check() -> tuple[bool, str]:
         _disable_notion(f"{r.status_code} auth failure")
         return False, "unauthorized"
     return False, f"http_{r.status_code}"
-
-def team_db_health_check() -> tuple[bool, str]:
-    """Verify Team Members database is accessible (title property 'Name' present).
-    Returns (ok, reason). If not ok, relation resolution cannot proceed this run.
-    """
-    global _TEAM_SCHEMA_LOGGED, TEAM_TITLE_PROP
-    if not NOTION_TEAM_DB_ID:
-        return False, "missing_team_db_id"
-    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}"
-    try:
-        r = SESSION.get(url, headers=NH, timeout=min(HTTP_TIMEOUT, 8))
-    except Exception:
-        return False, "request_failed"
-    if r.status_code == 200:
-        try:
-            js = r.json() or {}
-            props = js.get("properties") or {}
-            # One-time schema debug: property names only, plus preferred title prop.
-            if not _TEAM_SCHEMA_LOGGED:
-                try:
-                    prop_names = ", ".join(sorted(str(k) for k in (props.keys() or [])))
-                    preferred_title = TEAM_TITLE_PROP
-                    _alert(
-                        f"[DEBUG] Team Members DB schema: "
-                        f"properties=[{prop_names}] preferred_title_prop={preferred_title!r}"
-                    )
-                except Exception:
-                    pass
-                _TEAM_SCHEMA_LOGGED = True
-            name_prop = props.get("Name", {})
-            if isinstance(name_prop, dict) and name_prop.get("type") == "title":
-                return True, "ok"
-            return False, "missing_name_title"
-        except Exception:
-            return False, "parse_failed"
-    if r.status_code in (401, 403):
-        return False, "unauthorized"
-    return False, f"http_{r.status_code}"
-
-def verify_team_member_relation_target() -> tuple[bool, str, str | None]:
-    """Verify that the Time Entries DB relation property points to NOTION_TEAM_DB_ID.
-    Returns (ok, reason, found_target_db_id).
-    """
-    try:
-        if not (NOTION_DATABASE_ID and NOTION_TEAM_DB_ID):
-            return False, "missing_config", None
-        url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}"
-        r = _notion_request('GET', url)
-        if not r or r.status_code != 200:
-            return False, "time_entries_db_get_failed", None
-        js = r.json() or {}
-        props = js.get("properties") or {}
-        tm = props.get(P_TEAM_MEMBER, {})
-        if not isinstance(tm, dict) or tm.get("type") != "relation":
-            return False, "team_member_prop_not_relation", None
-        target = ((tm.get("relation") or {}).get("database_id") or "").strip()
-        if not target:
-            return False, "relation_missing_target", None
-        if _norm_notion_id(target) != _norm_notion_id(NOTION_TEAM_DB_ID):
-            return False, "relation_target_mismatch", target
-        return True, "ok", target
-    except Exception:
-        return False, "exception", None
 
 # ------------------ DynamoDB removed ------------------
 
@@ -880,20 +838,76 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
         pass
     return None
 
-# ---- Team Members index + fuzzy match ----
-TEAM_MEM_CACHE_PATH = os.getenv("TEAM_MEM_CACHE_PATH", "/tmp/team_members_index_cache.json").strip()
-try:
-    TEAM_MEM_CACHE_TTL = max(0, int(os.getenv("TEAM_MEM_CACHE_TTL_SECONDS", "7200")))
-except Exception:
-    TEAM_MEM_CACHE_TTL = 7200
+
+
+
+def _log_onboarding_profile_debug(page_id: str):
+    if not page_id:
+        return
+    if not _looks_like_uuid(page_id):
+        _alert(f"[DEBUG] skipping profile debug: {page_id!r} is not a UUID")
+        return
+    try:
+        resp = _notion_request("GET", f"https://api.notion.com/v1/pages/{page_id}", timeout=min(HTTP_TIMEOUT, 8))
+    except Exception as exc:
+        _alert(f"[DEBUG] onboarding profile request failed: {exc}")
+        return
+    if not resp or resp.status_code != 200:
+        _alert(f"[DEBUG] onboarding profile request status: {getattr(resp, 'status_code', None)}")
+        return
+    payload = resp.json() or {}
+    props = payload.get("properties", {}) or {}
+    profile = props.get("Profile") or {}
+    try:
+        _alert(f"[DEBUG] onboarding profile payload: {json.dumps({'id': page_id, 'profile': profile}, default=str)}")
+    except Exception:
+        _alert(f"[DEBUG] onboarding profile property keys: {sorted(props.keys())}")
+
+
+if PROFILE_DEBUG_PAGE_ID:
+    _log_onboarding_profile_debug(PROFILE_DEBUG_PAGE_ID)
+
+def _debug_dump_onboardings_database():
+    """Log full Notion responses for every page in the Onboardings database."""
+    if not (NOTION_TOKEN and NOTION_ONBOARDINGS_DB_ID_DASH):
+        return
+    url = f"https://api.notion.com/v1/databases/{NOTION_ONBOARDINGS_DB_ID_DASH}/query"
+    payload = {"page_size": 100}
+    page_count = 0
+    while True:
+        resp = _notion_request("POST", url, json_body=payload, timeout=min(HTTP_TIMEOUT, 8))
+        if not resp or resp.status_code != 200:
+            _alert(f"[DEBUG] onboardings dump failed status {getattr(resp, 'status_code', None)}")
+            return
+        data = resp.json() or {}
+        page_count += 1
+        try:
+            _alert(f"[DEBUG] onboardings dump page {page_count}: {json.dumps(data, default=str)}")
+        except Exception:
+            _alert(f"[DEBUG] onboardings dump page {page_count}: <unable to serialize>")
+        cursor = data.get("next_cursor")
+        if not cursor or not data.get("has_more"):
+            break
+        payload["start_cursor"] = cursor
+
+
+_debug_dump_onboardings_database()
+
+
+# ---- Onboardings-based team member index + fuzzy match ----
+# Team member indexes/caches
 _TEAM_MEM_INDEX: list[tuple[str, str, str, str]] = []  # (norm_name, orig_name, page_id, webhook_url)
 _TEAM_MEM_WEBHOOK_BY_ID: dict[str, str] = {}           # page_id -> webhook_url
 _TEAM_MEM_NAME_BY_ID: dict[str, str] = {}              # page_id -> original name
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
 _TEAM_MEM_INDEX_FAILED = False  # avoid repeated slow attempts when index build fails
+_TEAM_MEM_INDEX_FALLBACK: list[tuple[str, str, str, str]] = []
+_TEAM_MEM_FALLBACK_NAME_BY_ID: dict[str, str] = {}
+_TEAM_MEM_FALLBACK_WEBHOOK_BY_ID: dict[str, str] = {}
+_METRICS_TEAM_INDEX_CACHE_STALE = 0
+_METRICS_TEAM_INDEX_CACHE_FALLBACKS = 0
 # Title properties discovered via Team Members schema
-_TEAM_DB_TITLE_PROPS: list[str] = []
 _TEAM_MEM_CACHE_HIT = False
 _TEAM_MEM_CACHE_MISS = False
 _TEAM_MEM_CACHE_AGE: float | None = None
@@ -904,44 +918,6 @@ _METRICS_TEAM_INDEX_CACHE_HITS = 0
 _METRICS_TEAM_INDEX_CACHE_MISSES = 0
 _METRICS_TEAM_INDEX_CACHE_AGE = 0.0
 _TEAM_INDEX_CACHE_USED = False
-# Debug helpers: sample names and log cap so we can inspect fuzzy matches
-_TEAM_DEBUG_NAMES = {
-    "mariya",
-    "haya al nuwab",
-    "filip lysak",
-    "hajni katona",
-    "oliver abreu",
-    "sayali patil",
-    "tim tarver",
-    "daniela torres almeida",
-}
-_TEAM_DEBUG_LOG_COUNT = 0
-try:
-    _TEAM_DEBUG_MAX_LOGS = int(os.getenv("TEAM_MATCH_DEBUG_MAX", "10"))
-except Exception:
-    _TEAM_DEBUG_MAX_LOGS = 10
-try:
-    TEAM_MATCH_MIN_SCORE = float(os.getenv("TEAM_MATCH_MIN_SCORE", "0.2"))
-except Exception:
-    TEAM_MATCH_MIN_SCORE = 0.2
-
-def _debug_team_index_snapshot(label: str = "Team Members index"):
-    """Best-effort debug dump of the in-memory Team Members index.
-    Logs count and a small sample without exposing full webhook URLs.
-    """
-    try:
-        if not _TEAM_MEM_INDEX:
-            _alert(f"[DEBUG] {label}: empty")
-            return
-        _alert(f"[DEBUG] {label}: count={len(_TEAM_MEM_INDEX)}")
-        sample = _TEAM_MEM_INDEX[: min(10, len(_TEAM_MEM_INDEX))]
-        for _norm, name, pid, wh in sample:
-            pid_short = (pid or "")[:8]
-            has_wh = bool(wh)
-            _alert(f"[DEBUG] TM sample: name='{name}' pid='{pid_short}' has_webhook={has_wh}")
-    except Exception:
-        pass
-
 def _norm_for_match(s: str) -> str:
     """Normalize a human name for fuzzy matching.
     Lowercase, remove accents/diacritics, drop punctuation, and collapse spaces.
@@ -969,8 +945,271 @@ def _norm_for_match(s: str) -> str:
 def _tokenize(s: str) -> set[str]:
     return set(_norm_for_match(s).split())
 
+def _split_members_list(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"[,\n]+", text or "") if part.strip()]
+
+def _store_team_members_index_cache_fallback(index: list[tuple[str, str, str, str]], names: dict[str, str], webhooks: dict[str, str]):
+    """Keep a stale cache around in case the build attempt fails."""
+    global _TEAM_MEM_INDEX_FALLBACK, _TEAM_MEM_FALLBACK_NAME_BY_ID, _TEAM_MEM_FALLBACK_WEBHOOK_BY_ID
+    _TEAM_MEM_INDEX_FALLBACK = list(index)
+    _TEAM_MEM_FALLBACK_NAME_BY_ID = dict(names)
+    _TEAM_MEM_FALLBACK_WEBHOOK_BY_ID = dict(webhooks)
+
+def _find_profile_relation_property(props: dict) -> tuple[str, dict]:
+    """Return the relation property dictionary that holds the profile, if any."""
+    if not isinstance(props, dict) or not props:
+        return "Profile", {}
+
+    def _normalize_key(key: str) -> str:
+        return "".join(ch for ch in key.strip().lower() if ch.isalnum())
+
+    for key in props:
+        if isinstance(key, str) and _normalize_key(key) == "profile":
+            candidate = props.get(key) or {}
+            if isinstance(candidate, dict) and candidate.get("type") == "relation":
+                return key, candidate
+
+    for key, value in props.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        if value.get("type") != "relation":
+            continue
+        if "profile" in key.lower():
+            return key, value
+
+    return "Profile", (props.get("Profile") or {})
+
+
+def _process_team_member_page(pg: dict, stats: dict[str, int | set]):
+    """Extract team member references from an Onboardings page."""
+    stats["pages_scanned"] += 1
+    props = pg.get("properties", {}) or {}
+    title_prop = props.get(TEAM_TITLE_PROP, {})
+    name = ""
+    if isinstance(title_prop, dict) and title_prop.get("type") == "title":
+        for part in (title_prop.get("title") or []):
+            name += part.get("plain_text", "")
+    if not name:
+        for value in props.values():
+            if isinstance(value, dict) and value.get("type") == "title":
+                for part in (value.get("title") or []):
+                    name += part.get("plain_text", "")
+                break
+    name = (name or "").strip()
+    if not name and stats["pages_missing_name_logged"] < 5:
+        stats["pages_missing_name_logged"] += 1
+        try:
+            pid = (pg.get("id") or "")[:8]
+            prop_keys = ", ".join(sorted(str(k) for k in (props.keys() or [])))
+            _alert(
+                f"[DEBUG] Onboardings page {pid!r} has no title; available properties=[{prop_keys}]"
+            )
+        except Exception:
+            pass
+
+    profile_key, profile_prop = _find_profile_relation_property(props)
+    if not (isinstance(profile_prop, dict) and profile_prop.get("type") == "relation"):
+        _alert(f"[DEBUG] Onboarding {pg.get('id')} missing/invalid '{profile_key}' relation.")
+        try:
+            key_info = ", ".join(repr(k) for k in sorted(props.keys()))
+            _alert(f"[DEBUG] Onboarding props keys: {key_info}")
+            _alert(f"[DEBUG] Profile raw payload: {profile_prop}")
+            if isinstance(profile_prop, dict):
+                _alert(f"[DEBUG] Profile payload detail: {json.dumps(profile_prop, default=str)}")
+            if isinstance(props, dict):
+                _alert(f"[DEBUG] Full properties snapshot: {json.dumps(props, default=str)}")
+        except Exception:
+            pass
+        return
+    relations = profile_prop.get("relation") or []
+    if not relations:
+        _alert(f"[DEBUG] Onboarding {pg.get('id')} has empty Profile relations.")
+        _alert(f"[DEBUG] Profile payload detail: {json.dumps(profile_prop, default=str)}")
+        return
+
+    for rel in relations:
+        pid = (rel.get("id") or "").strip()
+        if not pid or pid in stats["seen_pids"]:
+            continue
+        stats["seen_pids"].add(pid)
+        profile_name = _fetch_page_name(pid) or name
+        if not profile_name:
+            _alert(f"[DEBUG] Profile relation target {pid} returned empty name.")
+            continue
+        stats["pages_with_name"] += 1
+        norm = _norm_for_match(profile_name)
+        _TEAM_MEM_INDEX.append((norm, profile_name, pid, ""))
+        _TEAM_MEM_NAME_BY_ID[pid] = profile_name
+
+def _load_team_members_index_cache() -> bool:
+    """Load the cached Team Members index if it is fresh enough."""
+    global _TEAM_MEM_INDEX, _TEAM_MEM_NAME_BY_ID, _TEAM_MEM_WEBHOOK_BY_ID
+    global _TEAM_MEM_CACHE_HIT, _TEAM_MEM_CACHE_MISS, _TEAM_MEM_CACHE_AGE
+    global _TEAM_INDEX_CACHE_USED, _METRICS_TEAM_INDEX_CACHE_HITS, _METRICS_TEAM_INDEX_CACHE_MISSES, _METRICS_TEAM_INDEX_CACHE_AGE
+    global _METRICS_TEAM_INDEX_CACHE_STALE
+
+    if not TEAM_MEM_CACHE_PATH or TEAM_MEM_CACHE_TTL <= 0:
+        return False
+
+    try:
+        with open(TEAM_MEM_CACHE_PATH, "r", encoding="utf-8") as fp:
+            cached = json.load(fp) or {}
+    except Exception:
+        _METRICS_TEAM_INDEX_CACHE_MISSES += 1
+        _TEAM_MEM_CACHE_MISS = True
+        return False
+
+    ts = cached.get("timestamp")
+    try:
+        ts = float(ts)
+    except Exception:
+        ts = None
+    if ts is None:
+        _METRICS_TEAM_INDEX_CACHE_MISSES += 1
+        _TEAM_MEM_CACHE_MISS = True
+        return False
+
+    age = max(0.0, time.time() - ts)
+    _METRICS_TEAM_INDEX_CACHE_AGE = age
+    _TEAM_MEM_CACHE_AGE = age
+
+    entries = cached.get("entries")
+    if not isinstance(entries, list):
+        _METRICS_TEAM_INDEX_CACHE_MISSES += 1
+        _TEAM_MEM_CACHE_MISS = True
+        return False
+
+    temp_index: list[tuple[str, str, str, str]] = []
+    name_by_id: dict[str, str] = {}
+    webhook_by_id: dict[str, str] = {}
+    for raw in entries:
+        if not isinstance(raw, dict):
+            continue
+        pid = (raw.get("page_id") or "").strip()
+        if not pid:
+            continue
+        name = (raw.get("name") or "").strip()
+        webhook = (raw.get("webhook") or "").strip()
+        norm = (raw.get("norm") or _norm_for_match(name)).strip()
+        temp_index.append((norm, name, pid, webhook))
+        if name:
+            name_by_id[pid] = name
+        if webhook:
+            webhook_by_id[pid] = webhook
+
+    if not temp_index:
+        _METRICS_TEAM_INDEX_CACHE_MISSES += 1
+        _TEAM_MEM_CACHE_MISS = True
+        return False
+
+    if TEAM_MEM_CACHE_TTL > 0 and age > TEAM_MEM_CACHE_TTL:
+        _store_team_members_index_cache_fallback(temp_index, name_by_id, webhook_by_id)
+        _METRICS_TEAM_INDEX_CACHE_STALE += 1
+        _TEAM_MEM_CACHE_MISS = True
+        return False
+
+    _TEAM_MEM_INDEX = temp_index
+    _TEAM_MEM_NAME_BY_ID = name_by_id
+    _TEAM_MEM_WEBHOOK_BY_ID = webhook_by_id
+    _METRICS_TEAM_INDEX_CACHE_HITS += 1
+    _TEAM_MEM_CACHE_HIT = True
+    _TEAM_INDEX_CACHE_USED = True
+    return True
+
+def _save_team_members_index_cache():
+    """Persist the current Team Members index to disk for subsequent runs."""
+    if not TEAM_MEM_CACHE_PATH or TEAM_MEM_CACHE_TTL <= 0 or not _TEAM_MEM_INDEX:
+        return
+    directory = os.path.dirname(TEAM_MEM_CACHE_PATH)
+    if directory:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except Exception:
+            pass
+    payload = {
+        "timestamp": time.time(),
+        "entries": [
+            {
+                "page_id": pid,
+                "name": name,
+                "norm": norm,
+                **({"webhook": webhook} if webhook else {}),
+            }
+            for norm, name, pid, webhook in _TEAM_MEM_INDEX
+        ],
+    }
+    try:
+        with open(TEAM_MEM_CACHE_PATH, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp)
+    except Exception:
+        pass
+
+def _apply_team_members_index_cache_fallback() -> bool:
+    """Restore the stale cache collected earlier when the live query failed."""
+    global _TEAM_MEM_INDEX, _TEAM_MEM_NAME_BY_ID, _TEAM_MEM_WEBHOOK_BY_ID
+    global _METRICS_TEAM_INDEX_CACHE_FALLBACKS, _TEAM_INDEX_CACHE_USED
+    if _TEAM_MEM_INDEX or not _TEAM_MEM_INDEX_FALLBACK:
+        return False
+    _TEAM_MEM_INDEX = list(_TEAM_MEM_INDEX_FALLBACK)
+    _TEAM_MEM_NAME_BY_ID = dict(_TEAM_MEM_FALLBACK_NAME_BY_ID)
+    _TEAM_MEM_WEBHOOK_BY_ID = dict(_TEAM_MEM_FALLBACK_WEBHOOK_BY_ID)
+    _METRICS_TEAM_INDEX_CACHE_FALLBACKS += 1
+    _TEAM_INDEX_CACHE_USED = True
+    return True
+
+def _build_team_members_index_via_search(start_ts: float, stats: dict[str, int | set]) -> bool:
+    """Fallback to the Onboardings search index when the database query is too slow."""
+    if not (NOTION_TOKEN and NOTION_ONBOARDINGS_DB_ID_DASH):
+        return False
+    search_url = "https://api.notion.com/v1/search"
+    page_size = max(1, min(20, ONBOARDINGS_DB_QUERY_PAGE_SIZE))
+    cursor = None
+    while True:
+        if ONBOARDINGS_DB_MAX_INDEX_SECONDS > 0 and (time.monotonic() - start_ts) > ONBOARDINGS_DB_MAX_INDEX_SECONDS:
+            _alert("[WARN] Onboardings search index exceeded time budget; stopping fallback.")
+            break
+        body = {
+            "page_size": page_size,
+            "filter": {"property": "object", "value": "page"},
+            "sort": {"direction": "ascending", "timestamp": "last_edited_time"},
+        }
+        if cursor:
+            body["start_cursor"] = cursor
+        timeout_s = max(5, min(ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS, max(5, ONBOARDINGS_DB_MAX_INDEX_SECONDS - EXIT_MARGIN_S)))
+        try:
+            r = SESSION.post(search_url, headers=NH, json=body, timeout=timeout_s)
+        except Exception as exc:
+            _alert(f"[WARN] Onboardings search exception: {exc}")
+            break
+        if r.status_code != 200:
+            _alert(f"[WARN] Onboardings search failed {r.status_code}: {r.text}")
+            break
+        data = r.json() or {}
+        results = data.get("results") or []
+        for pg in results:
+            parent = (pg.get("parent") or {}) or {}
+            parent_db_id = parent.get("database_id") or parent.get("id")
+            if not parent_db_id or _norm_notion_id(parent_db_id) != _norm_notion_id(NOTION_ONBOARDINGS_DB_ID):
+                continue
+            props = pg.get("properties", {}) or {}
+            status_value = ""
+            status_prop = props.get(TEAM_MEM_STATUS_PROP, {}) or {}
+            if isinstance(status_prop, dict):
+                status_value = (status_prop.get("status") or {}).get("name") or ""
+            if _TEAM_MEMBER_STATUS_FILTER and status_value and status_value.lower() not in _TEAM_MEMBER_STATUS_FILTER_SET:
+                continue
+            _process_team_member_page(pg, stats)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
+    return bool(_TEAM_MEM_INDEX)
+
 def notion_build_team_members_index():
-    """Build an in-memory index of Team Members pages.
+    """Build an in-memory index of Team Members pages from the Onboardings DB.
 
     Design goals:
     - Keep index-building to at most one attempt per invocation to avoid
@@ -978,26 +1217,36 @@ def notion_build_team_members_index():
     - No use of the global Notion circuit breaker; failures here never disable Notion globally.
     - Robust name extraction: prefer TEAM_TITLE_PROP/"Name", fall back to first title property.
     """
-    global _TEAM_SCHEMA_LOGGED, _TEAM_MEM_INDEX_FAILED, _METRICS_TEAM_INDEX_COUNT, _METRICS_TEAM_INDEX_SECONDS, TEAM_DB_MAX_INDEX_SECONDS
-    if not NOTION_TEAM_DB_ID or _TEAM_MEM_INDEX or _TEAM_MEM_INDEX_FAILED:
+    global _TEAM_SCHEMA_LOGGED, _TEAM_MEM_INDEX_FAILED, _METRICS_TEAM_INDEX_COUNT, _METRICS_TEAM_INDEX_SECONDS, ONBOARDINGS_DB_MAX_INDEX_SECONDS, ONBOARDINGS_DB_QUERY_PAGE_SIZE
+    if _TEAM_MEM_INDEX or _TEAM_MEM_INDEX_FAILED:
+        return
+    if _load_team_members_index_cache():
         return
     # Fast-fail when basic Notion config is missing
-    if not (NOTION_TOKEN and NOTION_TEAM_DB_ID_DASH):
+    if not (NOTION_TOKEN and NOTION_ONBOARDINGS_DB_ID_DASH):
         return
-
-    url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID_DASH}/query"
     try:
-        # Default page size tuned for CRM-like Team Members DB (smaller batches reduce payload/timeouts)
-        TM_PAGE_SIZE = int(os.getenv("TEAM_DB_QUERY_PAGE_SIZE", "50"))
+        _alert(f"[DEBUG] Building Team Members index using Onboardings DB {NOTION_ONBOARDINGS_DB_ID_DASH}")
     except Exception:
-        TM_PAGE_SIZE = 50
+        pass
+
+    url = f"https://api.notion.com/v1/databases/{NOTION_ONBOARDINGS_DB_ID_DASH}/query"
     # Start at the configured page size (clamped to Notion's max) and shrink
     # adaptively on gateway/timeout failures to make progress instead of
     # abandoning the index build.
-    page_size_cur = max(1, min(200, TM_PAGE_SIZE))
+    page_size_cur = max(1, ONBOARDINGS_DB_QUERY_PAGE_SIZE)
     MIN_PAGE_SIZE = 5
     shrink_attempts = 0
-    payload = {"page_size": page_size_cur}
+    payload = {
+        "page_size": page_size_cur,
+        "sorts": [{"property": TEAM_TITLE_PROP, "direction": "ascending"}],
+    }
+    if _TEAM_MEMBER_STATUS_FILTER:
+        status_filters = [
+            {"property": TEAM_MEM_STATUS_PROP, "status": {"equals": status}}
+            for status in _TEAM_MEMBER_STATUS_FILTER
+        ]
+        payload["filter"] = {"or": status_filters} if len(status_filters) > 1 else status_filters[0]
     cursor = None
     # Total time budget for building the Team Members index, so a slow Notion
     # response cannot consume the entire invocation window. Defaults are tuned
@@ -1005,30 +1254,38 @@ def notion_build_team_members_index():
     start_ts = time.monotonic()
 
     def _tm_request(body: dict) -> dict | None:
-        """Dedicated lightweight request for Team Members DB.
-        Does not use the global _notion_request circuit breaker.
-        Uses a moderate timeout so we fail fast when Notion is slow but gives
-        heavy CRM pages enough time to respond."""
-        global TEAM_DB_MAX_INDEX_SECONDS, EXIT_MARGIN_S, TEAM_TITLE_PROP
-        timeout_s = TEAM_DB_MAX_INDEX_SECONDS - EXIT_MARGIN_S
+        """Dedicated lightweight request for the Onboardings DB."""
+        global ONBOARDINGS_DB_MAX_INDEX_SECONDS, EXIT_MARGIN_S, TEAM_TITLE_PROP
+        max_budget_timeout = max(5, ONBOARDINGS_DB_MAX_INDEX_SECONDS - EXIT_MARGIN_S)
+        timeout_s = min(ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS, max_budget_timeout)
         timeout_s = max(5, timeout_s)
         for attempt in range(1, 3):
             try:
                 r = SESSION.post(url, headers=NH, json=body, timeout=timeout_s)
             except Exception as e:
                 if attempt >= 2:
-                    _alert(f"[WARN] Team Members query exception: {e}")
+                    _alert(f"[WARN] Onboardings query exception: {e}")
                     return None
                 time.sleep(0.3 * attempt)
                 continue
             if r.status_code == 200:
                 try:
-                    return r.json() or {}
+                    resp_text = r.text or ""
+                    _alert("[DEBUG] Onboardings response: " + resp_text)
+                except Exception:
+                    pass
+                try:
+                    data = r.json() or {}
+                    try:
+                        _alert(f"[DEBUG] Onboardings response JSON: {json.dumps(data, default=str)}")
+                    except Exception:
+                        pass
+                    return data
                 except Exception:
                     return None
             # For auth/config errors, log once and stop.
             if r.status_code in (400, 401, 403, 404):
-                _alert(f"[WARN] Team Members query failed {r.status_code}: {r.text}")
+                _alert(f"[WARN] Onboardings query failed {r.status_code}: {r.text}")
                 return None
             # For transient 5xx/429, brief backoff then retry.
             try:
@@ -1036,23 +1293,27 @@ def notion_build_team_members_index():
                 if attempt == 1:
                     txt = (r.text or "").replace("\n", " ").replace("\r", " ")
                     preview = txt[:200]
-                    _alert(
-                        f"[DEBUG] Team Members query non-200 status={r.status_code} "
-                        f"retrying attempt={attempt} body_preview={preview!r}"
-                    )
+                _alert(
+                    f"[DEBUG] Onboardings query non-200 status={r.status_code} "
+                    f"retrying attempt={attempt} body_preview={preview!r}"
+                )
             except Exception:
                 pass
             time.sleep(0.3 * attempt)
         return None
 
     try:
-        pages_scanned = 0
-        pages_with_name = 0
-        pages_missing_name_logged = 0
+        stats = {
+            "pages_scanned": 0,
+            "pages_with_name": 0,
+            "pages_missing_name_logged": 0,
+            "seen_pids": set(),
+        }
+        search_fallback_needed = False
         while True:
-            # Stop building the index if we've exceeded the per-run time budget.
-            if TEAM_DB_MAX_INDEX_SECONDS > 0 and (time.monotonic() - start_ts) > TEAM_DB_MAX_INDEX_SECONDS:
-                _alert("[WARN] Team Members index exceeded time budget; stopping index build early.")
+            if ONBOARDINGS_DB_MAX_INDEX_SECONDS > 0 and (time.monotonic() - start_ts) > ONBOARDINGS_DB_MAX_INDEX_SECONDS:
+                search_fallback_needed = True
+                _alert("[WARN] Onboardings index exceeded time budget; stopping index build early.")
                 break
             body = dict(payload)
             body["page_size"] = page_size_cur
@@ -1060,76 +1321,39 @@ def notion_build_team_members_index():
                 body["start_cursor"] = cursor
             data = _tm_request(body)
             if not data:
-                # Attempt to make forward progress by shrinking page_size on
-                # gateway/timeout failures before bailing out for this run.
-                if page_size_cur > MIN_PAGE_SIZE and shrink_attempts < 2:
+                if page_size_cur > MIN_PAGE_SIZE and shrink_attempts < ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS:
                     page_size_cur = max(MIN_PAGE_SIZE, page_size_cur // 2)
                     shrink_attempts += 1
                     try:
-                        _alert(f"[WARN] Team Members query failed; retrying with smaller page_size={page_size_cur}")
+                        _alert(f"[WARN] Onboardings query failed; retrying with smaller page_size={page_size_cur}")
                     except Exception:
                         pass
-                    # Retry same cursor with a smaller page size
                     continue
-                _alert("[WARN] Team Members query failed or timed out; stopping index build early.")
+                search_fallback_needed = True
+                _alert("[WARN] Onboardings query failed or timed out; stopping index build early.")
                 break
             page_results = data.get("results") or []
             if not page_results:
                 try:
                     _alert(
-                        f"[DEBUG] Team Members DB query returned 0 results on this page; "
+                        f"[DEBUG] Onboardings query returned 0 results on this page; "
                         f"has_more={bool(data.get('has_more'))}"
                     )
                 except Exception:
                     pass
             for pg in page_results:
-                pages_scanned += 1
-                pid = pg.get("id")
-                props = pg.get("properties", {})
-                # Prefer TEAM_TITLE_PROP/"Name", fall back to first title property
-                preferred_title = TEAM_TITLE_PROP
-                t = props.get(preferred_title, {})
-                name = ""
-                if isinstance(t, dict) and t.get("type") == "title":
-                    for part in (t.get("title") or []):
-                        name += part.get("plain_text", "")
-                if not name:
-                    # Fallback: first title property in the page
-                    for v in props.values():
-                        if isinstance(v, dict) and v.get("type") == "title":
-                            for part in (v.get("title") or []):
-                                name += part.get("plain_text", "")
-                            break
-                name = (name or "").strip()
-                if not name and pages_missing_name_logged < 5:
-                    pages_missing_name_logged += 1
-                    try:
-                        pid_short = (pid or "")[:8]
-                        prop_keys = ", ".join(sorted(str(k) for k in (props.keys() or [])))
-                        _alert(
-                            f"[DEBUG] Team Members page {pid_short!r} has no non-empty "
-                            f"title in '{preferred_title}'; available properties=[{prop_keys}]"
-                        )
-                    except Exception:
-                        pass
-                # Extract webhook URL from Team Members DB (single url property "webhook" or "Webhook")
-                w = ""
-                try:
-                    wh_prop = props.get("webhook") or props.get("Webhook") or {}
-                    if isinstance(wh_prop, dict) and wh_prop.get("type") == "url":
-                        w = (wh_prop.get("url") or "").strip()
-                except Exception:
-                    w = ""
-                if pid and name:
-                    pages_with_name += 1
-                    norm = _norm_for_match(name)
-                    _TEAM_MEM_INDEX.append((norm, name, pid, w))
-                    _TEAM_MEM_NAME_BY_ID[pid] = name
-                    if w:
-                        _TEAM_MEM_WEBHOOK_BY_ID[pid] = w
+                _process_team_member_page(pg, stats)
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
+        if not _TEAM_MEM_INDEX and search_fallback_needed:
+            _alert("[WARN] Falling back to Notion search for Onboardings index build.")
+            _build_team_members_index_via_search(start_ts, stats)
+        if _TEAM_MEM_INDEX:
+            try:
+                _store_team_members_index_cache_fallback(_TEAM_MEM_INDEX, _TEAM_MEM_NAME_BY_ID, _TEAM_MEM_WEBHOOK_BY_ID)
+            except Exception:
+                pass
     finally:
         # Record how much time we spent attempting to build the Team Members index.
         try:
@@ -1137,17 +1361,50 @@ def notion_build_team_members_index():
             _METRICS_TEAM_INDEX_SECONDS += max(0.0, time.monotonic() - start_ts)
         except Exception:
             pass
+    fallback_used = False
     if not _TEAM_MEM_INDEX:
-        try:
-            _alert(
-                "[WARN] Team Members index is empty after scan; "
-                f"pages_scanned={pages_scanned} pages_with_name={pages_with_name}"
-            )
-        except Exception:
-            _alert("[WARN] Team Members index is empty after scan; unable to emit scan stats.")
-        _TEAM_MEM_INDEX_FAILED = True
+        fallback_used = _apply_team_members_index_cache_fallback()
+        if fallback_used:
+            try:
+                _alert("[WARN] Using stale Onboardings cache due to repeated query failures.")
+            except Exception:
+                pass
+        else:
+            try:
+                _alert(
+                    "[WARN] Team Members index is empty after Onboardings scan; "
+                    f"pages_scanned={stats['pages_scanned']} pages_with_name={stats['pages_with_name']}"
+                )
+            except Exception:
+                _alert("[WARN] Team Members index is empty after scan; unable to emit scan stats.")
+            _TEAM_MEM_INDEX_FAILED = True
     else:
-        _debug_team_index_snapshot("Team Members index built")
+        try:
+            missing_names = {
+                pid for (_, _, pid, _) in _TEAM_MEM_INDEX
+                if not _TEAM_MEM_NAME_BY_ID.get(pid) or _TEAM_MEM_NAME_BY_ID.get(pid, "").lower() == "team members"
+            }
+            for pid in sorted(missing_names):
+                name = _fetch_page_name(pid)
+                if name:
+                    _TEAM_MEM_NAME_BY_ID[pid] = name
+            names = set()
+            for _, name, pid, _ in _TEAM_MEM_INDEX:
+                names.add(_TEAM_MEM_NAME_BY_ID.get(pid, name))
+            names_list = ", ".join(sorted(names))
+            preview = names_list[:200]
+            _alert(f"[DEBUG] Team Members index contains {len(_TEAM_MEM_INDEX)} entries: {preview}")
+            try:
+                entries = [
+                    {"id": pid, "name": _TEAM_MEM_NAME_BY_ID.get(pid, name)}
+                    for _, name, pid, _ in _TEAM_MEM_INDEX
+                ]
+                _alert(f"[DEBUG] Team Members index detail: {json.dumps(entries, default=str)}")
+            except Exception:
+                pass
+        except Exception:
+            pass
+    _save_team_members_index_cache()
 
 def _best_team_member_page_id(user_display: str) -> str | None:
     if not NOTION_TEAM_DB_ID or not user_display:
@@ -1196,17 +1453,6 @@ def _best_team_member_page_id(user_display: str) -> str | None:
     pid = best_pid if best_score >= threshold else None
 
     # Debug logging for selected sample names (first few runs only)
-    global _TEAM_DEBUG_LOG_COUNT
-    try:
-        if _norm_for_match(user_display) in _TEAM_DEBUG_NAMES and _TEAM_DEBUG_LOG_COUNT < _TEAM_DEBUG_MAX_LOGS:
-            _TEAM_DEBUG_LOG_COUNT += 1
-            _alert(
-                f"[DEBUG] Team match for '{user_display}': "
-                f"candidate='{best_name or ''}' score={best_score:.3f} selected_pid={pid or '<none>'}"
-            )
-    except Exception:
-        pass
-
     _TEAM_MEM_BEST_CACHE[key] = pid
     return pid
 
@@ -1424,7 +1670,7 @@ def _notion_upsert(existing: dict | None, user_key: str, entry: dict, workspace_
     # Resolve Team Member (mandatory)
     tm_pid = (entry.get("team_member_pid") if isinstance(entry, dict) else None) or _resolve_team_member_pid(entry.get("user") or "")
     if not tm_pid:
-        _alert(f"[WARN] Team Member not found for '{entry.get('user')}' (eid {eid}, ws {workspace_id}); skipping upsert.")
+        #_alert(f"[WARN] Team Member not found for '{entry.get('user')}' (eid {eid}, ws {workspace_id}); skipping upsert.")
         return existing.get("page_id") if isinstance(existing, dict) else None
 
     props = {
@@ -1489,13 +1735,15 @@ def _notion_upsert(existing: dict | None, user_key: str, entry: dict, workspace_
             return None
     return None
 
-def _notion_archive_page(page_id: str):
-    if not NOTION_ENABLED:
+def _notion_mark_deleted(page_id: str, detected_at: datetime | None = None):
+    if not NOTION_ENABLED or not page_id:
         return
-    if not page_id:
-        return
-    # Archive the page (removes it from the database view)
-    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"archived": True})
+    status_name = _canon_select(P_STATUS, STATUS_DELETED)
+    props: dict[str, dict] = {P_STATUS: {"status": {"name": status_name}}}
+    if P_UPDATED:
+        iso = (detected_at or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        props[P_UPDATED] = _date_val(iso)
+    _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
 
 # Deleted msg
 # (legacy deleted-message helpers removed)
@@ -1592,14 +1840,26 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
                 d = (props.get(n, {}).get("date") or {})
                 return d.get("start") or "", d.get("end") or ""
             start_s, end_s = _get_range(P_DATE)
+            try:
+                start_dt = _parse_iso8601(start_s, default=None)
+            except Exception:
+                start_dt = None
+            if not (start_dt and start_dt >= since):
+                continue
             # Minimal snapshot: only fields needed for cross-workspace guard
             # and deletion scan (start + workspace id).
             def _get_num(n):
                 q = props.get(n, {})
                 return q.get("number") if q.get("type") == "number" else 0
+            def _get_status(prop_name):
+                q = props.get(prop_name, {})
+                if not isinstance(q, dict):
+                    return ""
+                return (q.get("status") or {}).get("name") or ""
             snap = {
                 "start": start_s,
                 "workspace": int(_get_num(P_WORKSPACE) or 0),
+                "status": _canon_select(P_STATUS, _get_status(P_STATUS)),
             }
             by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
             if user_key:
@@ -1619,6 +1879,19 @@ def _get_title_text(prop: dict) -> str:
     if prop.get("type") == "rich_text":
         return "".join([p.get("plain_text", "") for p in (prop.get("rich_text") or [])]).strip()
     return ""
+
+def _fetch_page_name(page_id: str) -> str:
+    if not page_id:
+        return ""
+    try:
+        r = _notion_request("GET", f"https://api.notion.com/v1/pages/{page_id}")
+        if not r or r.status_code != 200:
+            return ""
+        pg = r.json() or {}
+        props = pg.get("properties", {}) or {}
+        return _get_title_text(props.get("Name", {}))
+    except Exception:
+        return ""
 
 def _sanitize_webhook_url(u: str | None) -> str:
     s = (u or "").strip()
@@ -1695,26 +1968,12 @@ def _get_webhook_url_from_props(props: dict) -> str:
         return ""
 
 def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid_to_name: dict, context=None) -> tuple[int, int]:
-    """Notify up to `limit` Processed time entries.
-    Returns (notified_count, skipped_count) where skipped_count includes
-    Processed entries that were examined but had no usable webhook.
-    """
+    """Notify up to `limit` Processed/Deleted time entries."""
     if not NOTION_ENABLED or limit <= 0:
         return 0, 0
     notified = 0
     skipped = 0
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    status_name = _canon_select(P_STATUS, STATUS_PROCESSED)
-    body = {
-        "page_size": min(100, int(limit)),
-        "filter": {"property": P_STATUS, "status": {"equals": status_name}},
-        "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
-    }
-    try:
-        _alert(f"[DEBUG] notion_notify_processed filter: status == {status_name!r}")
-    except Exception:
-        pass
-    cursor = None
 
     def _chunk_pairs(pairs, limit_chars=1900, sep="\n\n"):
         chunk = []
@@ -1733,97 +1992,154 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
         if chunk:
             yield sep.join(chunk), list(chunk_ids)
 
-    while notified < limit:
-        if cursor:
-            body["start_cursor"] = cursor
-        r = _notion_request('POST', url, json_body=body)
-        if not r or r.status_code != 200:
-            _alert(f"[WARN] notion_notify_processed query failed: status={getattr(r, 'status_code', None)}")
-            break
-        js = r.json() or {}
-        results = js.get("results") or []
+    def _prepare_notification_data(pg: dict) -> dict:
+        props = pg.get("properties", {}) or {}
+        user_key = _get_title_text(props.get(P_USER_KEY, {}))
+        desc = _get_title_text(props.get(P_DESCRIPTION, {})) or "No description"
+        proj = (props.get(P_PROJECT, {}).get("select") or {}).get("name") or "No project"
+        tags = [t.get("name", "") for t in (props.get(P_TAGS, {}).get("multi_select") or []) if t.get("name")]
+        dur_s = props.get(P_DURATION, {}).get("number") or 0
+        dur_ms = int(float(dur_s)) * 1000
+        dt = props.get(P_DATE, {}).get("date") or {}
+        start_s = dt.get("start") or (pg.get("created_time") or "")
+        start_dt = _parse_iso8601(start_s, default=datetime.now(timezone.utc))
+        upd_prop = props.get(P_UPDATED, {}).get("date") or {}
+        updated_s = upd_prop.get("start") or pg.get("last_edited_time") or pg.get("created_time") or ""
+        updated_dt = _parse_iso8601(updated_s, default=start_dt)
+        name = user_key or ""
         try:
-            _alert(f"[DEBUG] notion_notify_processed batch: results={len(results)} notified_so_far={notified}")
+            tm = props.get(P_TEAM_MEMBER, {})
+            if isinstance(tm, dict) and tm.get("type") == "relation":
+                rel = (tm.get("relation") or [])
+                if rel:
+                    tm_pid = (rel[0].get("id") or "").strip()
+                    if tm_pid:
+                        tm_name = _TEAM_MEM_NAME_BY_ID.get(tm_pid) or ""
+                        if tm_name:
+                            name = tm_name
         except Exception:
             pass
-        if not results:
-            # No more Processed items to notify
-            break
+        return {
+            "pid": pg.get("id"),
+            "props": props,
+            "user_key": user_key,
+            "name": name,
+            "desc": desc,
+            "project": proj,
+            "tags": tags,
+            "dur_ms": dur_ms,
+            "start_dt": start_dt,
+            "updated_dt": updated_dt,
+        }
 
-        outbox_pairs: dict[str, list[tuple[str, str]]] = {}
+    def _build_processed_lines(data: dict) -> list[str]:
+        display_name = data["name"] or data["user_key"] or "Unknown"
+        return [
+            "## ?? Time Entry",
+            f"?? **User**: {display_name}",
+            f"?? **Project:** {data['project']}",
+            f"??? **Tags:** {', '.join(data['tags']) if data['tags'] else 'No tags'}",
+            f"?? **Task:** {data['desc']}",
+            f"?? **Time Tracked:** {convert_ms_to_hms(data['dur_ms'])}",
+            f"??? **Start:** {data['start_dt'].strftime('%Y-%m-%d %H:%M:%S')}",
+            f"?? **Updated:** {data['updated_dt'].strftime('%Y-%m-%d %H:%M:%S')}",
+            "-",
+        ]
 
-        for pg in results:
-            if notified >= limit or _should_exit_soon(context):
+    def _build_deleted_lines(data: dict) -> list[str]:
+        def _strike(val: str) -> str:
+            return f"~~{val}~~"
+        user_label = data["name"] or data["user_key"] or "Unknown"
+        project_label = data["project"] or "No project"
+        tags_label = ", ".join(data["tags"]) if data["tags"] else "No tags"
+        desc_label = data["desc"]
+        time_label = convert_ms_to_hms(data["dur_ms"])
+        start_label = data["start_dt"].strftime("%Y-%m-%d %H:%M:%S")
+        detected_label = data["updated_dt"].strftime("%Y-%m-%d %H:%M:%S")
+        return [
+            "## 🗑️ Time Entry Deleted",
+            f"👤 **User**: {_strike(user_label)}",
+            f"📁 **Project:** {_strike(project_label)}",
+            f"🏷️ **Tags:** {_strike(tags_label)}",
+            f"📝 **Task:** {_strike(desc_label)}",
+            f"⏱️ **Time Tracked:** {_strike(time_label)}",
+            f"🗓️ **Start:** {_strike(start_label)}",
+            f"🕑 **Deleted detected:** {detected_label}",
+            "—",
+        ]
+
+    def _notify_for_status(status_value: str, build_lines):
+        nonlocal notified, skipped
+        if notified >= limit:
+            return
+        status_name = _canon_select(P_STATUS, status_value)
+        page_size = max(1, min(100, int(limit)))
+        body = {
+            "page_size": page_size,
+            "filter": {"property": P_STATUS, "status": {"equals": status_name}},
+            "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+        }
+        cursor = None
+        try:
+            _alert(f"[DEBUG] notion_notify_processed filter: status == {status_name!r}")
+        except Exception:
+            pass
+        while notified < limit:
+            if cursor:
+                body["start_cursor"] = cursor
+            r = _notion_request('POST', url, json_body=body)
+            if not r or r.status_code != 200:
+                _alert(f"[WARN] notion_notify_processed query failed: status={getattr(r, 'status_code', None)}")
                 break
-            pid = pg.get("id")
-            props = pg.get("properties", {})
-            user_key = _get_title_text(props.get(P_USER_KEY, {}))
-            desc = _get_title_text(props.get(P_DESCRIPTION, {})) or "No description"
-            proj = (props.get(P_PROJECT, {}).get("select") or {}).get("name") or "No project"
-            tags = [t.get("name", "") for t in (props.get(P_TAGS, {}).get("multi_select") or []) if t.get("name")]
-            dur_s = props.get(P_DURATION, {}).get("number") or 0
-            dur_ms = int(float(dur_s)) * 1000
-            dt = props.get(P_DATE, {}).get("date") or {}
-            start_s = dt.get("start") or (pg.get("created_time") or "")
-            start_dt = _parse_iso8601(start_s, default=datetime.now(timezone.utc))
-            upd_prop = props.get(P_UPDATED, {}).get("date") or {}
-            updated_s = upd_prop.get("start") or pg.get("last_edited_time") or pg.get("created_time") or ""
-            updated_dt = _parse_iso8601(updated_s, default=start_dt)
-            # Webhook URL is stored on the Time Entries DB as a lookup from Team Members.webhook
-            wh = _get_webhook_url_from_props(props)
-            if not wh:
-                # Helpful debug: show why a Processed item is being skipped
-                skipped += 1
-                try:
-                    _alert(f"[DEBUG] Skipping Processed entry without webhook: user_key={user_key} proj={proj}")
-                except Exception:
-                    pass
-                continue
-            # Prefer Team Member name from relation, then fall back to User Key
-            name = user_key or ""
+            js = r.json() or {}
+            results = js.get("results") or []
             try:
-                tm = props.get(P_TEAM_MEMBER, {})
-                if isinstance(tm, dict) and tm.get("type") == "relation":
-                    rel = (tm.get("relation") or [])
-                    if rel:
-                        tm_pid = (rel[0].get("id") or "").strip()
-                        if tm_pid:
-                            tm_name = _TEAM_MEM_NAME_BY_ID.get(tm_pid) or ""
-                            if tm_name:
-                                name = tm_name
+                _alert(f"[DEBUG] notion_notify_processed batch ({status_value}): results={len(results)} notified_so_far={notified}")
             except Exception:
                 pass
-            lines = [
-                f"## 🆕 Time Entry",
-                f"👤 **User**: {name or user_key}",
-                f"📁 **Project:** {proj}",
-                f"🏷️ **Tags:** {', '.join(tags) if tags else 'No tags'}",
-                f"📝 **Task:** {desc}",
-                f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_ms)}",
-                f"🗓️ **Start:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                f"🕑 **Updated:** {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-                "—",
-            ]
-            msg = "\n".join(lines)
-            outbox_pairs.setdefault(wh, []).append((pid, msg))
-
-        # Send batched per webhook
-        for wh, pairs in outbox_pairs.items():
-            if _should_exit_soon(context) or notified >= limit:
+            if not results:
                 break
-            for payload, pids in _chunk_pairs(pairs):
+            outbox_pairs: dict[str, list[tuple[str, str]]] = {}
+            for pg in results:
+                if notified >= limit or _should_exit_soon(context):
+                    break
+                data = _prepare_notification_data(pg)
+                pid = data.get("pid")
+                wh = _get_webhook_url_from_props(data["props"])
+                if not wh:
+                    skipped += 1
+                    try:
+                        _alert(f"[DEBUG] Skipping {status_value} entry without webhook: user_key={data['user_key']} project={data['project']}")
+                    except Exception:
+                        pass
+                    continue
+                lines = build_lines(data)
+                msg = "\n".join(lines)
+                if pid:
+                    outbox_pairs.setdefault(wh, []).append((pid, msg))
+            for wh, pairs in outbox_pairs.items():
                 if _should_exit_soon(context) or notified >= limit:
                     break
-                if send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT):
-                    # Mark all included pages as Notified
-                    for pid in pids:
-                        _notion_request('PATCH', f"https://api.notion.com/v1/pages/{pid}", json_body={"properties": {P_STATUS: {"status": {"name": _canon_select(P_STATUS, STATUS_NOTIFIED)}}}})
-                    notified += len(pids)
+                for payload, pids in _chunk_pairs(pairs):
+                    if _should_exit_soon(context) or notified >= limit:
+                        break
+                    if send_discord_with_backoff(wh, payload, timeout=HTTP_TIMEOUT):
+                        notify_body = {
+                            "properties": {
+                                P_STATUS: {"status": {"name": _canon_select(P_STATUS, STATUS_NOTIFIED)}}
+                            }
+                        }
+                        if status_value == STATUS_DELETED:
+                            notify_body["archived"] = True
+                        for pid in pids:
+                            _notion_request('PATCH', f"https://api.notion.com/v1/pages/{pid}", json_body=notify_body)
+                        notified += len(pids)
+            if not js.get("has_more"):
+                break
+            cursor = js.get("next_cursor")
 
-        if not js.get("has_more"):
-            break
-        cursor = js.get("next_cursor")
-
+    _notify_for_status(STATUS_PROCESSED, _build_processed_lines)
+    _notify_for_status(STATUS_DELETED, _build_deleted_lines)
     return notified, skipped
 
 def fast_sync(context=None):
@@ -1836,7 +2152,7 @@ def fast_sync(context=None):
 
     # Reset circuit so warm containers can re-attempt health-checks
     _reset_notion_circuit()
-    global _TEAM_MEM_INDEX_FAILED
+    global _TEAM_MEM_INDEX_FAILED, INSERT_BATCH_SIZE
     if not _TEAM_MEM_INDEX:
         _TEAM_MEM_INDEX_FAILED = False
     # Fail fast if Notion is not available (invalid token/DB permissions)
@@ -1844,19 +2160,6 @@ def fast_sync(context=None):
     if not ok:
         _alert(f"[WARN] Notion health-check failed: {reason}. Aborting sync.")
         return {"status": "notion_auth_failed", "reason": reason}
-    # Verify Team Members DB access early to avoid noisy logs
-    t_ok, t_reason = team_db_health_check()
-    if not t_ok:
-        _alert(f"[WARN] Team Members DB health-check failed: {t_reason}. Aborting sync.")
-        return {"status": "team_db_unreachable", "reason": t_reason}
-    # Ensure Time Entries relation points to the configured Team Members DB
-    rel_ok, rel_reason, rel_target = verify_team_member_relation_target()
-    if not rel_ok:
-        if rel_reason == "relation_target_mismatch":
-            _alert(f"[WARN] Team Member relation target mismatch. NOTION_TEAM_DB_ID={NOTION_TEAM_DB_ID} actual_target={rel_target}")
-        else:
-            _alert(f"[WARN] Team Member relation verify failed: {rel_reason}")
-        return {"status": "team_db_relation_mismatch", "reason": rel_reason, "found_target": rel_target}
     # Ensure we have enough time left to perform Notion work
     try:
         if context and hasattr(context, 'get_remaining_time_in_millis'):
@@ -1865,11 +2168,6 @@ def fast_sync(context=None):
                 return {"status": "low_time_budget"}
     except Exception:
         pass
-    workspaces = load_workspace_tokens()
-    if not workspaces:
-        _alert("Toggl Workspaces DB empty or unreachable.")
-        return {"status": "no_workspaces"}
-
     # Legacy user_map/user_map_norm (from Google Sheets) are no longer used.
     # Keep empty dicts to preserve notion_notify_processed signature.
     user_map = {}
@@ -1915,7 +2213,6 @@ def fast_sync(context=None):
     # Stage tasks separately to prioritize NEW inserts over updates
     staged_new: list[tuple] = []
     scheduled_upserts: set[tuple] = set()
-    WRITES_LIMIT = min(INSERT_BATCH_SIZE, int(os.getenv("MAX_NOTION_WRITES_PER_RUN", "300")))
     current_ids_by_user: dict[str, set[str]] = {}
     keep_upserted_ids: set[str] = set()
 
@@ -1930,7 +2227,12 @@ def fast_sync(context=None):
 
     if not team_index_ready:
         _alert("[WARN] Team Members index is empty or unavailable; skipping Toggl inserts/deletions this run.")
+        workspaces = []
     else:
+        workspaces = load_workspace_tokens()
+        if not workspaces:
+            _alert("Toggl Workspaces DB empty or unreachable.")
+            workspaces = []
         for token in workspaces:
             if _should_exit_soon(context):
                 break
@@ -2025,7 +2327,7 @@ def fast_sync(context=None):
                         # Require Team Member relation on insert
                         tm_pid = _resolve_team_member_pid(user)
                         if not tm_pid:
-                            _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
+                            # _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
                             continue
                         notion_entry = {
                             "id": eid,
@@ -2054,7 +2356,7 @@ def fast_sync(context=None):
     notion_tasks: list[tuple] = []
     if staged_new:
         for t in staged_new:
-            if len(notion_tasks) >= WRITES_LIMIT:
+            if len(notion_tasks) >= INSERT_BATCH_SIZE:
                 break
             notion_tasks.append(t)
 
@@ -2074,6 +2376,43 @@ def fast_sync(context=None):
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
+    delete_tasks: list[tuple[str, datetime]] = []
+    if index_ok and team_index_ready and not _should_exit_soon(context) and NOTION_ENABLE_DELETION_SCAN:
+        try:
+            deleted_skip_status = _canon_select(P_STATUS, STATUS_NOTIFIED)
+        except Exception:
+            deleted_skip_status = STATUS_NOTIFIED
+        for ukey, pages in by_user.items():
+            if _should_exit_soon(context):
+                break
+            cur = current_ids_by_user.get(ukey, set())
+            for eid, item in pages.items():
+                if _should_exit_soon(context):
+                    break
+                if eid in cur:
+                    continue
+                snap = item.get("snap") or {}
+                pid = item.get("page_id")
+                snap_status = _canon_select(P_STATUS, snap.get("status") or "")
+                if snap_status and snap_status == deleted_skip_status:
+                    continue
+                start_s = snap.get("start") or ""
+                start_dt = _parse_iso8601(start_s, default=None)
+                if not (start_dt and start_dt >= since):
+                    continue
+                if pid:
+                    delete_tasks.append((pid, datetime.now(timezone.utc)))
+
+    if delete_tasks and not _should_exit_soon(context) and (not context or _remaining_s(context) >= MIN_SECONDS_FOR_CLEANUP):
+        max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex3:
+            futs = [ex3.submit(_notion_mark_deleted, pid, ts) for pid, ts in delete_tasks]
+            for f in as_completed(futs):
+                try:
+                    f.result()
+                except Exception as e:
+                    _alert(f"[ERROR] Notion delete status task: {e}")
+
     # Stage-2: notify a batch of already-Processed items and mark as Notified.
     # Run this after handling inserts, as long as there is enough time left
     # in the invocation budget.
@@ -2091,36 +2430,6 @@ def fast_sync(context=None):
                 skipped_notifies += skipped
             except Exception as e:
                 _alert(f"[ERROR] notify processed failed: {e}")
-
-    # Deletions based on Notion index vs current run (window index always available)
-    delete_tasks = []
-    if index_ok and team_index_ready and not _should_exit_soon(context) and NOTION_ENABLE_DELETION_SCAN:
-        for ukey, pages in by_user.items():
-            cur = current_ids_by_user.get(ukey, set())
-            for eid, item in pages.items():
-                if eid in cur:
-                    continue
-                snap = item.get("snap") or {}
-                pid = item.get("page_id")
-                try:
-                    s = snap.get("start") or ""
-                    sdt = datetime.strptime(s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if s else None
-                except Exception:
-                    sdt = None
-                if not (sdt and sdt >= since):
-                    continue
-                if pid:
-                    delete_tasks.append(pid)
-
-    if delete_tasks and not _should_exit_soon(context) and (not context or _remaining_s(context) >= MIN_SECONDS_FOR_CLEANUP):
-        max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex3:
-            futs = [ex3.submit(_notion_archive_page, pid) for pid in delete_tasks]
-            for f in as_completed(futs):
-                try:
-                    f.result()
-                except Exception as e:
-                    _alert(f"[ERROR] Notion archive task: {e}")
 
     # Lightweight metrics block: helps tune timeouts and batch sizes.
     metrics: dict[str, dict] = {"timings_s": {}, "counts": {}}
@@ -2140,13 +2449,15 @@ def fast_sync(context=None):
         metrics["counts"]["notifications_skipped_no_webhook"] = skipped_notifies
         metrics["counts"]["team_index_builds"] = _METRICS_TEAM_INDEX_COUNT
         metrics["timings_s"]["team_index_total"] = _METRICS_TEAM_INDEX_SECONDS
+        metrics["counts"]["team_index_cache_hits"] = _METRICS_TEAM_INDEX_CACHE_HITS
+        metrics["counts"]["team_index_cache_misses"] = _METRICS_TEAM_INDEX_CACHE_MISSES
+        metrics["counts"]["team_index_cache_stale"] = _METRICS_TEAM_INDEX_CACHE_STALE
+        metrics["counts"]["team_index_cache_fallbacks"] = _METRICS_TEAM_INDEX_CACHE_FALLBACKS
+        metrics["counts"]["team_index_cache_used"] = 1 if _TEAM_INDEX_CACHE_USED else 0
+        metrics["timings_s"]["team_index_cache_age"] = _METRICS_TEAM_INDEX_CACHE_AGE
         metrics["counts"]["deletions_scheduled"] = len(delete_tasks)
     except Exception:
         pass
-
-    # Optional: emit a final snapshot of the Team Members index so we can
-    # confirm what was indexed in this invocation.
-    _debug_team_index_snapshot("Team Members index (end-of-run)")
 
     try:
         _alert(f"[DEBUG] metrics: {json.dumps(metrics)}")
