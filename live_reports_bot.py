@@ -2385,6 +2385,12 @@ def fast_sync(context=None):
         for ukey, pages in by_user.items():
             if _should_exit_soon(context):
                 break
+            if ukey not in current_ids_by_user:
+                try:
+                    _alert(f"[DEBUG] skipping deletion scan for {ukey!r}; no Toggl data collected for that user this run.")
+                except Exception:
+                    pass
+                continue
             cur = current_ids_by_user.get(ukey, set())
             for eid, item in pages.items():
                 if _should_exit_soon(context):
