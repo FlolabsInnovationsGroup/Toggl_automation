@@ -135,7 +135,7 @@ MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "200"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "30"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
-NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "2000"))
+NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "10000"))
 NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "120"))
 ONBOARDINGS_DB_QUERY_PAGE_SIZE = int(os.getenv("ONBOARDINGS_DB_QUERY_PAGE_SIZE", "400"))
 ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "180")))
@@ -543,10 +543,10 @@ def _truncate(s: str, limit: int = 140) -> str:
     s = s.strip();  return s if len(s) <= limit else (s[:limit-1] + "…")
 
 # Robust ISO8601 parser (handles Z, timezone, fractional seconds)
-def _parse_iso8601(s: str | None, default: datetime | None = None) -> datetime:
+def _parse_iso8601(s: str | None, default: datetime | None = None) -> datetime | None:
     try:
         if not s:
-            return default or datetime.now(timezone.utc)
+            return default
         ss = str(s).strip()
         if ss.endswith("Z"):
             ss = ss[:-1] + "+00:00"
@@ -554,11 +554,10 @@ def _parse_iso8601(s: str | None, default: datetime | None = None) -> datetime:
             return datetime.fromisoformat(ss)
         except Exception:
             pass
-        # Fallback to strptime without fractional seconds
         ss2 = ss.replace("+00:00", "+0000")
         return datetime.strptime(ss2, "%Y-%m-%dT%H:%M:%S%z")
     except Exception:
-        return default or datetime.now(timezone.utc)
+        return default
 
 # Description comparison (case sensitive, ignore surrounding whitespace and CRLF differences)
 def _desc_equal(a: str | None, b: str | None) -> bool:
@@ -2202,6 +2201,8 @@ def fast_sync(context=None):
                         start_dt = datetime.strptime(start_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z") if start_s else now
                     except Exception:
                         start_dt = now
+                    if start_dt < since:
+                        continue
                     if end_s:
                         try:
                             end_dt = datetime.strptime(end_s.replace("Z","+0000").replace("+00:00","+0000"), "%Y-%m-%dT%H:%M:%S%z")
@@ -2255,6 +2256,9 @@ def fast_sync(context=None):
                         tm_pid = _resolve_team_member_pid(user)
                         if not tm_pid:
                             _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
+                            continue
+                        dup = _notion_find_entry_by_eid_ws(eid, wid, notion_user_key, start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat() if start_dt else None)
+                        if dup and dup.get("page_id"):
                             continue
                         notion_entry = {
                             "id": eid,
