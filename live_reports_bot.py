@@ -32,7 +32,6 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/ap
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
 TEAM_INDEX_CACHE_PATH = os.getenv("TEAM_INDEX_CACHE_PATH", "/tmp/team_members_index.json").strip()
 TEAM_INDEX_CACHE_ENABLED = bool(TEAM_INDEX_CACHE_PATH)
-PROFILE_DEBUG_PAGE_ID = os.getenv("ONBOARDINGS_PROFILE_DEBUG_PAGE_ID", "").strip()
 TEAM_MEM_CACHE_PATH = os.getenv("TEAM_MEM_CACHE_PATH", "/tmp/team_members_index_cache.json").strip()
 TEAM_MEM_CACHE_TTL = max(0, int(os.getenv("TEAM_MEM_CACHE_TTL_SECONDS", "7200")))
 TEAM_MATCH_MIN_SCORE = float(os.getenv("TEAM_MATCH_MIN_SCORE", "0.4"))
@@ -841,59 +840,6 @@ def _notion_request(method: str, url: str, json_body: dict|None=None, timeout: i
 
 
 
-def _log_onboarding_profile_debug(page_id: str):
-    if not page_id:
-        return
-    if not _looks_like_uuid(page_id):
-        _alert(f"[DEBUG] skipping profile debug: {page_id!r} is not a UUID")
-        return
-    try:
-        resp = _notion_request("GET", f"https://api.notion.com/v1/pages/{page_id}", timeout=min(HTTP_TIMEOUT, 8))
-    except Exception as exc:
-        _alert(f"[DEBUG] onboarding profile request failed: {exc}")
-        return
-    if not resp or resp.status_code != 200:
-        _alert(f"[DEBUG] onboarding profile request status: {getattr(resp, 'status_code', None)}")
-        return
-    payload = resp.json() or {}
-    props = payload.get("properties", {}) or {}
-    profile = props.get("Profile") or {}
-    try:
-        _alert(f"[DEBUG] onboarding profile payload: {json.dumps({'id': page_id, 'profile': profile}, default=str)}")
-    except Exception:
-        _alert(f"[DEBUG] onboarding profile property keys: {sorted(props.keys())}")
-
-
-if PROFILE_DEBUG_PAGE_ID:
-    _log_onboarding_profile_debug(PROFILE_DEBUG_PAGE_ID)
-
-def _debug_dump_onboardings_database():
-    """Log full Notion responses for every page in the Onboardings database."""
-    if not (NOTION_TOKEN and NOTION_ONBOARDINGS_DB_ID_DASH):
-        return
-    url = f"https://api.notion.com/v1/databases/{NOTION_ONBOARDINGS_DB_ID_DASH}/query"
-    payload = {"page_size": 100}
-    page_count = 0
-    while True:
-        resp = _notion_request("POST", url, json_body=payload, timeout=min(HTTP_TIMEOUT, 8))
-        if not resp or resp.status_code != 200:
-            _alert(f"[DEBUG] onboardings dump failed status {getattr(resp, 'status_code', None)}")
-            return
-        data = resp.json() or {}
-        page_count += 1
-        try:
-            _alert(f"[DEBUG] onboardings dump page {page_count}: {json.dumps(data, default=str)}")
-        except Exception:
-            _alert(f"[DEBUG] onboardings dump page {page_count}: <unable to serialize>")
-        cursor = data.get("next_cursor")
-        if not cursor or not data.get("has_more"):
-            break
-        payload["start_cursor"] = cursor
-
-
-_debug_dump_onboardings_database()
-
-
 # ---- Onboardings-based team member index + fuzzy match ----
 # Team member indexes/caches
 _TEAM_MEM_INDEX: list[tuple[str, str, str, str]] = []  # (norm_name, orig_name, page_id, webhook_url)
@@ -1270,17 +1216,7 @@ def notion_build_team_members_index():
                 continue
             if r.status_code == 200:
                 try:
-                    resp_text = r.text or ""
-                    _alert("[DEBUG] Onboardings response: " + resp_text)
-                except Exception:
-                    pass
-                try:
-                    data = r.json() or {}
-                    try:
-                        _alert(f"[DEBUG] Onboardings response JSON: {json.dumps(data, default=str)}")
-                    except Exception:
-                        pass
-                    return data
+                    return r.json() or {}
                 except Exception:
                     return None
             # For auth/config errors, log once and stop.
@@ -1394,14 +1330,6 @@ def notion_build_team_members_index():
             names_list = ", ".join(sorted(names))
             preview = names_list[:200]
             _alert(f"[DEBUG] Team Members index contains {len(_TEAM_MEM_INDEX)} entries: {preview}")
-            try:
-                entries = [
-                    {"id": pid, "name": _TEAM_MEM_NAME_BY_ID.get(pid, name)}
-                    for _, name, pid, _ in _TEAM_MEM_INDEX
-                ]
-                _alert(f"[DEBUG] Team Members index detail: {json.dumps(entries, default=str)}")
-            except Exception:
-                pass
         except Exception:
             pass
     _save_team_members_index_cache()
@@ -2248,7 +2176,6 @@ def fast_sync(context=None):
                 if not wid:
                     continue
                 entries = fetch_workspace_entries(api_token, wid, since, now)
-                print(f"[DEBUG] Fetched {len(entries)} entries from workspace {wid}")
                 for e in entries:
                     if _should_exit_soon(context):
                         break
@@ -2327,7 +2254,7 @@ def fast_sync(context=None):
                         # Require Team Member relation on insert
                         tm_pid = _resolve_team_member_pid(user)
                         if not tm_pid:
-                            # _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
+                            _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
                             continue
                         notion_entry = {
                             "id": eid,
