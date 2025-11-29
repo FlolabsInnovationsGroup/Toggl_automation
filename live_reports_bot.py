@@ -131,18 +131,18 @@ NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
 NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "5"))
 NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "10"))
-MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "200"))
+MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "60"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "30"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
-NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "10000"))
-NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "120"))
+NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "5000"))
+NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "400"))
 ONBOARDINGS_DB_QUERY_PAGE_SIZE = int(os.getenv("ONBOARDINGS_DB_QUERY_PAGE_SIZE", "400"))
 ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "180")))
 ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS = max(1, int(os.getenv("ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS", "5")))
-ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "180"))
+ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "200"))
 
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "10000"))  # number of new entries to insert per run
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "5000"))  # number of new entries to insert per run
 NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "1000"))  # number of processed entries to notify per run
 
 # Cached Notion schema (property name -> type)
@@ -222,7 +222,6 @@ _NOTION_5XX_COUNT = 0
 _NOTION_EXHAUSTED = 0
 _NOTION_EXC_COUNT = 0
 _NOTION_INDEX_OK = False
-_KNOWN_EIDS: set[str] = set()
 try:
     from threading import Lock
     _NOTION_LOCK = Lock()
@@ -447,7 +446,7 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
         _alert(f"[ERROR] get_workspaces_for_token exception: {e}")
     return []
 
-def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime) -> list[dict]:
+def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime) -> tuple[list[dict], bool]:
     url = "https://api.track.toggl.com/reports/api/v2/details"
     headers = _headers_for_token(api_token)
     params = {
@@ -459,12 +458,13 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
         "per_page": TOGGL_PAGE_SIZE,
     }
     all_entries, last_total = [], 0
-    tok_tail = f"…{api_token[-4:]}"
+    tok_tail = f".{api_token[-4:]}"
     key = (tok_tail, int(workspace_id or 0))
     if key in _UNSUPPORTED_REPORTS:
-        return []
+        return [], False
     MAX_PAGES = 200
     attempt = 0
+    complete = False
     while params["page"] <= MAX_PAGES:
         if not _budget_take():
             _alert("[INFO] Toggl call budget exhausted; stopping pagination early.")
@@ -484,11 +484,14 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
             entries = data.get("data") or []
             total_count = int(data.get("total_count") or 0)
             if not entries:
+                complete = True
                 break
             all_entries.extend(entries)
             if total_count and len(all_entries) >= total_count:
+                complete = True
                 break
             if len(all_entries) == last_total:
+                complete = True
                 break
             last_total = len(all_entries)
             params["page"] += 1
@@ -510,9 +513,10 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
             break
         _alert(f"[ERROR] details fetch failed: {resp.status_code} (token {tok_tail}, ws {workspace_id}) - {txt}")
         break
-    return all_entries
+    else:
+        complete = False
+    return all_entries, complete
 
-# Formatting
 def convert_ms_to_hms(milliseconds: int) -> str:
     minutes = milliseconds // 60000
     seconds = (milliseconds % 60000) // 1000
@@ -847,6 +851,7 @@ _TEAM_MEM_NAME_BY_ID: dict[str, str] = {}              # page_id -> original nam
 _TEAM_MEM_BEST_CACHE: dict[str, str | None] = {}
 _TEAM_SCHEMA_LOGGED = False
 _TEAM_MEM_INDEX_FAILED = False  # avoid repeated slow attempts when index build fails
+_TEAM_MEM_INDEX_COMPLETE = False  # tracks whether the full index was retrieved
 _TEAM_MEM_INDEX_FALLBACK: list[tuple[str, str, str, str]] = []
 _TEAM_MEM_FALLBACK_NAME_BY_ID: dict[str, str] = {}
 _TEAM_MEM_FALLBACK_WEBHOOK_BY_ID: dict[str, str] = {}
@@ -1111,6 +1116,7 @@ def _build_team_members_index_via_search(start_ts: float, stats: dict[str, int |
     search_url = "https://api.notion.com/v1/search"
     page_size = max(1, min(20, ONBOARDINGS_DB_QUERY_PAGE_SIZE))
     cursor = None
+    complete = False
     while True:
         if ONBOARDINGS_DB_MAX_INDEX_SECONDS > 0 and (time.monotonic() - start_ts) > ONBOARDINGS_DB_MAX_INDEX_SECONDS:
             _alert("[WARN] Onboardings search index exceeded time budget; stopping fallback.")
@@ -1147,11 +1153,13 @@ def _build_team_members_index_via_search(start_ts: float, stats: dict[str, int |
                 continue
             _process_team_member_page(pg, stats)
         if not data.get("has_more"):
+            complete = True
             break
         cursor = data.get("next_cursor")
         if not cursor:
+            complete = True
             break
-    return bool(_TEAM_MEM_INDEX)
+    return bool(_TEAM_MEM_INDEX) and complete
 
 def notion_build_team_members_index():
     """Build an in-memory index of Team Members pages from the Onboardings DB.
@@ -1162,7 +1170,7 @@ def notion_build_team_members_index():
     - No use of the global Notion circuit breaker; failures here never disable Notion globally.
     - Robust name extraction: prefer TEAM_TITLE_PROP/"Name", fall back to first title property.
     """
-    global _TEAM_SCHEMA_LOGGED, _TEAM_MEM_INDEX_FAILED, _METRICS_TEAM_INDEX_COUNT, _METRICS_TEAM_INDEX_SECONDS, ONBOARDINGS_DB_MAX_INDEX_SECONDS, ONBOARDINGS_DB_QUERY_PAGE_SIZE
+    global _TEAM_SCHEMA_LOGGED, _TEAM_MEM_INDEX_FAILED, _TEAM_MEM_INDEX_COMPLETE, _METRICS_TEAM_INDEX_COUNT, _METRICS_TEAM_INDEX_SECONDS, ONBOARDINGS_DB_MAX_INDEX_SECONDS, ONBOARDINGS_DB_QUERY_PAGE_SIZE
     if _TEAM_MEM_INDEX or _TEAM_MEM_INDEX_FAILED:
         return
     if _load_team_members_index_cache():
@@ -1197,6 +1205,7 @@ def notion_build_team_members_index():
     # response cannot consume the entire invocation window. Defaults are tuned
     # for a CRM-style Team Members database where all content is needed.
     start_ts = time.monotonic()
+    complete = False
 
     def _tm_request(body: dict) -> dict | None:
         """Dedicated lightweight request for the Onboardings DB."""
@@ -1279,11 +1288,14 @@ def notion_build_team_members_index():
             for pg in page_results:
                 _process_team_member_page(pg, stats)
             if not data.get("has_more"):
+                complete = True
                 break
             cursor = data.get("next_cursor")
-        if not _TEAM_MEM_INDEX and search_fallback_needed:
+        if not complete and search_fallback_needed:
             _alert("[WARN] Falling back to Notion search for Onboardings index build.")
-            _build_team_members_index_via_search(start_ts, stats)
+            fallback_complete = _build_team_members_index_via_search(start_ts, stats)
+            if fallback_complete:
+                complete = True
         if _TEAM_MEM_INDEX:
             try:
                 _store_team_members_index_cache_fallback(_TEAM_MEM_INDEX, _TEAM_MEM_NAME_BY_ID, _TEAM_MEM_WEBHOOK_BY_ID)
@@ -1331,6 +1343,7 @@ def notion_build_team_members_index():
             _alert(f"[DEBUG] Team Members index contains {len(_TEAM_MEM_INDEX)} entries: {preview}")
         except Exception:
             pass
+    _TEAM_MEM_INDEX_COMPLETE = complete
     _save_team_members_index_cache()
 
 def _best_team_member_page_id(user_display: str) -> str | None:
@@ -1681,19 +1694,18 @@ def _notion_mark_deleted(page_id: str, detected_at: datetime | None = None):
 # (legacy run() removed)
 
 # ---- Optimized Notion window indexing and fast sync ----
-def notion_build_window_index(since: datetime, until: datetime, context=None) -> tuple[dict, dict]:
-    """Query Notion once for the window and build indexes.
-    Returns (by_eid, by_user).
+def notion_build_window_index(since: datetime, until: datetime, context=None) -> tuple[dict, bool]:
+    """Query Notion once for the window and build an entry id index.
+    Returns (by_eid, complete).
     by_eid: eid -> {page_id, snap, user_key}
-    by_user: user_key -> {eid -> {page_id, snap}}
+    complete: whether the pagination finished successfully.
     """
     global _NOTION_INDEX_OK
     _NOTION_INDEX_OK = False
 
     by_eid: dict[str, dict] = {}
-    by_user: dict[str, dict] = {}
     if not (NOTION_TOKEN and NOTION_DATABASE_ID):
-        return by_eid, by_user
+        return by_eid, False
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     page_size = max(1, min(100, int(NOTION_INDEX_PAGE_SIZE or 100)))
     # Always restrict by P_DATE to the same time window used for Toggl.
@@ -1721,6 +1733,7 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
         },
     }
     cursor = None
+    complete = False
     while True:
         # Abort early if time budget is nearly exhausted
         if context is not None and _should_exit_soon(context):
@@ -1733,7 +1746,6 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
         r = _notion_request("POST", url, json_body=body, timeout=NOTION_INDEX_TIMEOUT)
         if not r or r.status_code != 200:
             break
-        _NOTION_INDEX_OK = True
         js = r.json() or {}
         for pg in js.get("results") or []:
             if context is not None and _should_exit_soon(context):
@@ -1789,14 +1801,15 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
                 "status": _canon_select(P_STATUS, _get_status(P_STATUS)),
             }
             by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
-            if user_key:
-                by_user.setdefault(user_key, {})[str(eid)] = {"page_id": pid, "snap": snap}
+            by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
 
         # Stop if there is no more data
         if not js.get("has_more"):
+            complete = True
             break
         cursor = js.get("next_cursor")
-    return by_eid, by_user
+    _NOTION_INDEX_OK = complete
+    return by_eid, complete
 
 def _get_title_text(prop: dict) -> str:
     if not isinstance(prop, dict):
@@ -2113,24 +2126,16 @@ def fast_sync(context=None):
             notion_build_team_members_index()
     except Exception:
         pass
-    team_index_ready = bool(_TEAM_MEM_INDEX)
+    team_index_ready = bool(_TEAM_MEM_INDEX) and _TEAM_MEM_INDEX_COMPLETE
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=TIME_WINDOW_DAYS)
-    by_eid, by_user = notion_build_window_index(since, now, context=context)
-    index_ok = bool(_NOTION_INDEX_OK)
+    by_eid, index_complete = notion_build_window_index(since, now, context=context)
+    index_ok = index_complete
     # If the Notion index query failed, skip inserts/deletions to avoid duplicates,
     # but still allow notifications to run later in this invocation.
     if not index_ok:
         _alert("[WARN] Notion index query failed or returned no data; skipping inserts/deletions this run to avoid duplicates.")
-    # Seed known Entry IDs from the current Notion window index so we do not
-    # treat existing pages as new in this or subsequent warm runs.
-    try:
-        global _KNOWN_EIDS
-        _KNOWN_EIDS.update(by_eid.keys())
-    except Exception:
-        pass
-
     # Counters for notifications; actual notify step runs later,
     # after we know whether there are any new entries this run.
     notified = 0
@@ -2140,8 +2145,10 @@ def fast_sync(context=None):
     # Stage tasks separately to prioritize NEW inserts over updates
     staged_new: list[tuple] = []
     scheduled_upserts: set[tuple] = set()
-    current_ids_by_user: dict[str, set[str]] = {}
     keep_upserted_ids: set[str] = set()
+    successful_workspaces: set[int] = set()
+    failed_workspaces: set[int] = set()
+    toggl_ids_by_ws: dict[int, set[str]] = {}
 
     def _queue_new(existing, notion_user_key, notion_entry, wid, add_block):
         if not NOTION_ENABLED or not index_ok or not team_index_ready:
@@ -2152,9 +2159,10 @@ def fast_sync(context=None):
         scheduled_upserts.add(key)
         staged_new.append((existing, notion_user_key, notion_entry, wid, add_block))
 
-    if not team_index_ready:
-        _alert("[WARN] Team Members index is empty or unavailable; skipping Toggl inserts/deletions this run.")
-        workspaces = []
+    indexes_ready = index_ok and team_index_ready
+    workspaces: list[dict] = []
+    if not indexes_ready:
+        _alert("[WARN] Notion indexes incomplete; skipping Toggl inserts/deletions this run.")
     else:
         workspaces = load_workspace_tokens()
         if not workspaces:
@@ -2164,9 +2172,11 @@ def fast_sync(context=None):
             if _should_exit_soon(context):
                 break
             api_token = token.get("api_token")
+            if not api_token:
+                continue
             wss = get_workspaces_for_token(api_token)
             if not wss:
-                _alert(f"⚠️ No workspaces visible for token endinng …{api_token[-4:]}")
+                _alert(f"[WARN] No workspaces visible for token ending ...{api_token[-4:]}")
                 continue
             for ws in wss:
                 if _should_exit_soon(context):
@@ -2174,7 +2184,16 @@ def fast_sync(context=None):
                 wid = ws.get("id")
                 if not wid:
                     continue
-                entries = fetch_workspace_entries(api_token, wid, since, now)
+                try:
+                    wid_int = int(wid or 0)
+                except Exception:
+                    continue
+                entries, ws_complete = fetch_workspace_entries(api_token, wid_int, since, now)
+                if not ws_complete:
+                    failed_workspaces.add(wid_int)
+                    continue
+                successful_workspaces.add(wid_int)
+                toggl_ids_by_ws.setdefault(wid_int, set())
                 for e in entries:
                     if _should_exit_soon(context):
                         break
@@ -2190,10 +2209,7 @@ def fast_sync(context=None):
                     end_s = e.get("end") or ""
                     upd_s = e.get("updated") or e.get("at") or ""
                     uid = e.get("uid")
-                    # Use the Toggl display name as the Notion User Key value
                     notion_user_key = user
-                    current_ids_by_user.setdefault(notion_user_key, set()).add(eid)
-                    # Map Notion user_key to display name for notifications
                     if notion_user_key and user:
                         uid_to_name.setdefault(notion_user_key, user)
 
@@ -2217,68 +2233,51 @@ def fast_sync(context=None):
 
                     prev = by_eid.get(eid)
                     prev_snap = (prev or {}).get("snap") or {}
-                    # Guard against cross-workspace collisions: ignore prev if workspace mismatches
                     try:
                         prev_ws = int(prev_snap.get("workspace") or 0)
                     except Exception:
                         prev_ws = 0
-                    if prev and prev_ws != int(wid or 0):
+                    if prev and prev_ws != wid_int:
                         prev = None
                         prev_snap = {}
-                    # Guard against user mismatch if index provides user_key.
-                    # Legacy pages may store user_key as "user:{uid}", while new
-                    # pages store the Toggl display name. Accept either form so
-                    # we do not treat existing pages as "new" and re-insert them.
                     if prev and isinstance(prev, dict) and prev.get("user_key"):
                         prev_uk = (prev.get("user_key") or "").strip()
                         expected = (user or "").strip()
-                        # Backwards compatibility for older "user:{uid}" keys.
                         if uid is not None and prev_uk.startswith("user:"):
                             expected = f"user:{uid}"
                         if prev_uk != expected:
                             prev = None
                             prev_snap = {}
-                    # First-seen is defined by absence in the known ID set.
-                    try:
-                        if eid not in _KNOWN_EIDS:
-                            first_seen = True
-                            _KNOWN_EIDS.add(eid)
-                        else:
-                            first_seen = False
-                    except Exception:
-                        first_seen = prev is None
 
-                    # Insert only first-seen entries here (batch-limited).
-                    # Existing entries are not edited in this mode; updates
-                    # are intentionally skipped to minimize Notion writes.
-                    if first_seen:
-                        # Require Team Member relation on insert
-                        tm_pid = _resolve_team_member_pid(user)
-                        if not tm_pid:
-                            _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid}).")
-                            continue
-                        dup = _notion_find_entry_by_eid_ws(eid, wid, notion_user_key, start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat() if start_dt else None)
-                        if dup and dup.get("page_id"):
-                            continue
-                        notion_entry = {
-                            "id": eid,
-                            "user": user,
-                            "user_id": uid,
-                            "team_member_pid": tm_pid,
-                            "project": project,
-                            "tags": tags,
-                            "dur": dur_ms,
-                            "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                            "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                            "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                            "description": desc,
-                        }
-                        existing = None
-                        add_block = True
-                        # For new entries, choose Status based on SEND_NOTIFICATIONS:
-                        # when False, insert as Ignored; when True, insert as Processed.
-                        notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
-                        _queue_new(existing, notion_user_key, notion_entry, wid, add_block)
+                    if prev:
+                        continue
+
+                    toggl_ids_by_ws[wid_int].add(eid)
+
+                    tm_pid = _resolve_team_member_pid(user)
+                    if not tm_pid:
+                        _alert(f"[WARN] Skipping insert: no Team Member match for '{user}' (eid {eid}, ws {wid_int}).")
+                        continue
+                    dup = _notion_find_entry_by_eid_ws(eid, wid_int, notion_user_key, start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat() if start_dt else None)
+                    if dup and dup.get("page_id"):
+                        continue
+                    notion_entry = {
+                        "id": eid,
+                        "user": user,
+                        "user_id": uid,
+                        "team_member_pid": tm_pid,
+                        "project": project,
+                        "tags": tags,
+                        "dur": dur_ms,
+                        "start": start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "end": end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "updated": upd_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                        "description": desc,
+                    }
+                    existing = None
+                    add_block = True
+                    notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
+                    _queue_new(existing, notion_user_key, notion_entry, wid_int, add_block)
 
     # Build prioritized task list
     # Requirement: As long as there are new (not-yet-in-DB) entries,
@@ -2307,38 +2306,53 @@ def fast_sync(context=None):
                 except Exception as e:
                     _alert(f"[ERROR] Notion upsert task: {e}")
 
+    if failed_workspaces:
+        for eid, info in list(by_eid.items()):
+            snap = (info.get("snap") or {})
+            snap_ws = snap.get("workspace") or 0
+            try:
+                snap_ws = int(snap_ws)
+            except Exception:
+                snap_ws = 0
+            if snap_ws in failed_workspaces:
+                by_eid.pop(eid, None)
     delete_tasks: list[tuple[str, datetime]] = []
-    if index_ok and team_index_ready and not _should_exit_soon(context) and NOTION_ENABLE_DELETION_SCAN:
+    if indexes_ready and not _should_exit_soon(context) and NOTION_ENABLE_DELETION_SCAN:
         try:
             deleted_skip_status = _canon_select(P_STATUS, STATUS_NOTIFIED)
         except Exception:
             deleted_skip_status = STATUS_NOTIFIED
-        for ukey, pages in by_user.items():
+        for eid, info in by_eid.items():
             if _should_exit_soon(context):
                 break
-            if ukey not in current_ids_by_user:
-                try:
-                    _alert(f"[DEBUG] skipping deletion scan for {ukey!r}; no Toggl data collected for that user this run.")
-                except Exception:
-                    pass
+            snap = (info.get("snap") or {})
+            snap_ws = snap.get("workspace") or 0
+            try:
+                snap_ws = int(snap_ws)
+            except Exception:
+                snap_ws = 0
+            snap_status = _canon_select(P_STATUS, snap.get("status") or "")
+            if snap_status and snap_status == deleted_skip_status:
                 continue
-            cur = current_ids_by_user.get(ukey, set())
-            for eid, item in pages.items():
-                if _should_exit_soon(context):
-                    break
-                if eid in cur:
-                    continue
-                snap = item.get("snap") or {}
-                pid = item.get("page_id")
-                snap_status = _canon_select(P_STATUS, snap.get("status") or "")
-                if snap_status and snap_status == deleted_skip_status:
-                    continue
-                start_s = snap.get("start") or ""
-                start_dt = _parse_iso8601(start_s, default=None)
-                if not (start_dt and start_dt >= since):
-                    continue
+            start_s = snap.get("start") or ""
+            start_dt = _parse_iso8601(start_s, default=None)
+            if not (start_dt and start_dt >= since):
+                continue
+            pid = info.get("page_id")
+            if snap_ws not in successful_workspaces:
                 if pid:
                     delete_tasks.append((pid, datetime.now(timezone.utc)))
+                continue
+            snap_status = _canon_select(P_STATUS, snap.get("status") or "")
+            if snap_status and snap_status == deleted_skip_status:
+                continue
+            start_s = snap.get("start") or ""
+            start_dt = _parse_iso8601(start_s, default=None)
+            if not (start_dt and start_dt >= since):
+                continue
+            pid = info.get("page_id")
+            if pid:
+                delete_tasks.append((pid, datetime.now(timezone.utc)))
 
     if delete_tasks and not _should_exit_soon(context) and (not context or _remaining_s(context) >= MIN_SECONDS_FOR_CLEANUP):
         max_workers = max(1, min(NOTION_CONCURRENCY, len(delete_tasks)))
@@ -2392,6 +2406,7 @@ def fast_sync(context=None):
         metrics["counts"]["team_index_cache_fallbacks"] = _METRICS_TEAM_INDEX_CACHE_FALLBACKS
         metrics["counts"]["team_index_cache_used"] = 1 if _TEAM_INDEX_CACHE_USED else 0
         metrics["timings_s"]["team_index_cache_age"] = _METRICS_TEAM_INDEX_CACHE_AGE
+        metrics["counts"]["workspaces_successful"] = len(successful_workspaces)
         metrics["counts"]["deletions_scheduled"] = len(delete_tasks)
     except Exception:
         pass
