@@ -1974,16 +1974,17 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
 
     def _build_processed_lines(data: dict) -> list[str]:
         display_name = data["name"] or data["user_key"] or "Unknown"
+        tags = ", ".join(data["tags"]) if data["tags"] else "No tags"
         return [
-            "## ?? Time Entry",
-            f"?? **User**: {display_name}",
-            f"?? **Project:** {data['project']}",
-            f"??? **Tags:** {', '.join(data['tags']) if data['tags'] else 'No tags'}",
-            f"?? **Task:** {data['desc']}",
-            f"?? **Time Tracked:** {convert_ms_to_hms(data['dur_ms'])}",
-            f"??? **Start:** {data['start_dt'].strftime('%Y-%m-%d %H:%M:%S')}",
-            f"?? **Updated:** {data['updated_dt'].strftime('%Y-%m-%d %H:%M:%S')}",
-            "-",
+            "## 🆕 New Time Entry Added",
+            f"👤 **User**: {display_name}",
+            f"📁 **Project:** {data['project'] or 'No project'}",
+            f"🏷️ **Tags:** {tags}",
+            f"📝 **Task:** {data['desc']}",
+            f"⏱️ **Time Tracked:** {convert_ms_to_hms(data['dur_ms'])}",
+            f"🗓️ **Start:** {data['start_dt'].strftime('%Y-%m-%d %H:%M:%S')}",
+            f"🕑 **Updated:** {data['updated_dt'].strftime('%Y-%m-%d %H:%M:%S')}",
+            "—",
         ]
 
     def _build_deleted_lines(data: dict) -> list[str]:
