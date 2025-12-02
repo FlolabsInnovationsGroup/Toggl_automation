@@ -125,21 +125,21 @@ NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", NOTION_ONBOARDINGS_DB_ID).str
 # Notion throughput knobs
 NOTION_RPS = float(os.getenv("NOTION_RPS", "2.8"))            # target rps (global per integration)
 NOTION_CONCURRENCY = int(os.getenv("NOTION_CONCURRENCY", "10"))  # threads for Notion writes
-NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "8"))
+NOTION_MAX_RETRIES = int(os.getenv("NOTION_MAX_RETRIES", "10"))
 # Circuit breaker thresholds to fail fast on persistent errors
 NOTION_MAX_429_PER_RUN = int(os.getenv("NOTION_MAX_429_PER_RUN", "8"))
 NOTION_MAX_5XX_PER_RUN = int(os.getenv("NOTION_MAX_5XX_PER_RUN", "8"))
-NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "5"))
+NOTION_MAX_EXHAUSTED_PER_RUN = int(os.getenv("NOTION_MAX_EXHAUSTED_PER_RUN", "10"))
 NOTION_MAX_EXC_PER_RUN = int(os.getenv("NOTION_MAX_EXC_PER_RUN", "10"))
-MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "60"))
+MIN_SECONDS_FOR_NOTION = int(os.getenv("MIN_SECONDS_FOR_NOTION", "5"))
 MIN_SECONDS_FOR_CLEANUP = int(os.getenv("MIN_SECONDS_FOR_CLEANUP", "30"))
 NOTION_ADD_DESCRIPTION_BLOCKS = _env_bool("NOTION_ADD_DESCRIPTION_BLOCKS", True)
 NOTION_ENABLE_DELETION_SCAN = _env_bool("NOTION_ENABLE_DELETION_SCAN", True)
-NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "5000"))
+NOTION_INDEX_PAGE_SIZE = int(os.getenv("NOTION_INDEX_PAGE_SIZE", "10000"))
 NOTION_INDEX_TIMEOUT = int(os.getenv("NOTION_INDEX_TIMEOUT_SECONDS", "400"))
-ONBOARDINGS_DB_QUERY_PAGE_SIZE = int(os.getenv("ONBOARDINGS_DB_QUERY_PAGE_SIZE", "400"))
-ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "180")))
-ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS = max(1, int(os.getenv("ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS", "5")))
+ONBOARDINGS_DB_QUERY_PAGE_SIZE = int(os.getenv("ONBOARDINGS_DB_QUERY_PAGE_SIZE", "1000"))
+ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS", "200")))
+ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS = max(1, int(os.getenv("ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS", "4")))
 ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "200"))
 
 INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "5000"))  # number of new entries to insert per run
@@ -291,7 +291,7 @@ def notion_health_check() -> tuple[bool, str]:
     # Bypass _notion_request gating for health-check so we can recover after
     # a previous run disabled Notion in a warm container.
     try:
-        r = SESSION.get(url, headers=NH, timeout=min(HTTP_TIMEOUT, 8))
+        r = SESSION.get(url, headers=NH, timeout=max(HTTP_TIMEOUT, 8))
     except Exception:
         return False, "request_failed"
     if r.status_code == 200:
@@ -465,9 +465,11 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
     MAX_PAGES = 200
     attempt = 0
     complete = False
+    error = False
     while params["page"] <= MAX_PAGES:
         if not _budget_take():
             _alert("[INFO] Toggl call budget exhausted; stopping pagination early.")
+            error = True
             break
         try:
             resp = SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
@@ -477,6 +479,7 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
                 time.sleep(min(2.0, 0.5 * attempt) + random.uniform(0.02, 0.2))
                 continue
             _alert(f"[ERROR] details fetch exception (token {tok_tail}, ws {workspace_id}): {e}")
+            error = True
             break
         if resp.status_code == 200:
             attempt = 0
@@ -499,9 +502,9 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
         # Non-200
         txt = (resp.text or "").strip()
         if resp.status_code == 402:
-            # Downgrade repeated plan/feature limitations to DEBUG noise
             print(f"[DEBUG] details fetch 402 (token {tok_tail}, ws {workspace_id}) - {txt}")
             _UNSUPPORTED_REPORTS.add(key)
+            error = True
             break
         if resp.status_code in (429, 500, 502, 503, 504):
             attempt += 1
@@ -510,11 +513,14 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
                 continue
         if resp.status_code == 405:
             _alert(f"time_entries fetch failed: 405 (token {tok_tail}, ws {workspace_id})")
+            error = True
             break
         _alert(f"[ERROR] details fetch failed: {resp.status_code} (token {tok_tail}, ws {workspace_id}) - {txt}")
+        error = True
         break
-    else:
-        complete = False
+    if not complete and not error and all_entries:
+        # If we fetched data without encountering obvious completion signals, treat it as complete.
+        complete = True
     return all_entries, complete
 
 def convert_ms_to_hms(milliseconds: int) -> str:
@@ -1114,7 +1120,7 @@ def _build_team_members_index_via_search(start_ts: float, stats: dict[str, int |
     if not (NOTION_TOKEN and NOTION_ONBOARDINGS_DB_ID_DASH):
         return False
     search_url = "https://api.notion.com/v1/search"
-    page_size = max(1, min(20, ONBOARDINGS_DB_QUERY_PAGE_SIZE))
+    page_size = max(20, ONBOARDINGS_DB_QUERY_PAGE_SIZE)
     cursor = None
     complete = False
     while True:
@@ -1128,7 +1134,7 @@ def _build_team_members_index_via_search(start_ts: float, stats: dict[str, int |
         }
         if cursor:
             body["start_cursor"] = cursor
-        timeout_s = max(5, min(ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS, max(5, ONBOARDINGS_DB_MAX_INDEX_SECONDS - EXIT_MARGIN_S)))
+        timeout_s = max(5, ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS, max(5, ONBOARDINGS_DB_MAX_INDEX_SECONDS - EXIT_MARGIN_S))
         try:
             r = SESSION.post(search_url, headers=NH, json=body, timeout=timeout_s)
         except Exception as exc:
@@ -1685,6 +1691,42 @@ def _notion_mark_deleted(page_id: str, detected_at: datetime | None = None):
         props[P_UPDATED] = _date_val(iso)
     _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
 
+def _promote_recent_ignored_entries(by_eid: dict[str, dict], days: int = 7, context=None) -> int:
+    """Raise Ignored entries to Processed when their date is within the last `days`."""
+    if not NOTION_ENABLED or not isinstance(by_eid, dict) or days <= 0:
+        return 0
+    threshold = datetime.now(timezone.utc) - timedelta(days=days)
+    ignored_status = _canon_select(P_STATUS, STATUS_IGNORED) or STATUS_IGNORED
+    processed_payload = _status_val(STATUS_PROCESSED)
+    if not processed_payload or not isinstance(processed_payload, dict):
+        return 0
+    processed_name = (processed_payload.get("status") or {}).get("name")
+    if not processed_name:
+        return 0
+    promoted = 0
+    for info in by_eid.values():
+        if context is not None and _should_exit_soon(context):
+            break
+        snap = (info.get("snap") or {})
+        if _canon_select(P_STATUS, snap.get("status") or "") != ignored_status:
+            continue
+        start_s = snap.get("start") or ""
+        start_dt = _parse_iso8601(start_s, default=None)
+        if not start_dt or start_dt < threshold:
+            continue
+        page_id = info.get("page_id") or ""
+        if not page_id:
+            continue
+        body = {"properties": {P_STATUS: {"status": {"name": processed_name}}}}
+        r = _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body=body)
+        if r and r.status_code in (200, 201):
+            promoted += 1
+            try:
+                snap["status"] = processed_name
+            except Exception:
+                pass
+    return promoted
+
 # Deleted msg
 # (legacy deleted-message helpers removed)
 
@@ -1707,7 +1749,7 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
     if not (NOTION_TOKEN and NOTION_DATABASE_ID):
         return by_eid, False
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    page_size = max(1, min(100, int(NOTION_INDEX_PAGE_SIZE or 100)))
+    page_size = max(1, int(NOTION_INDEX_PAGE_SIZE or 100))
     # Always restrict by P_DATE to the same time window used for Toggl.
     payload = {
         "page_size": page_size,
@@ -1734,6 +1776,7 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
     }
     cursor = None
     complete = False
+    _alert(f"[DEBUG] Starting window index from {since.isoformat()} to {until.isoformat()}, page_size={page_size}")
     while True:
         # Abort early if time budget is nearly exhausted
         if context is not None and _should_exit_soon(context):
@@ -1747,6 +1790,7 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
         if not r or r.status_code != 200:
             break
         js = r.json() or {}
+        _alert(f"[DEBUG] Window index page fetched; cursor={cursor} results={len(js.get('results') or [])}")
         for pg in js.get("results") or []:
             if context is not None and _should_exit_soon(context):
                 break
@@ -1805,10 +1849,12 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
 
         # Stop if there is no more data
         if not js.get("has_more"):
+            _alert("[DEBUG] Window index completed pagination.")
             complete = True
             break
         cursor = js.get("next_cursor")
     _NOTION_INDEX_OK = complete
+    _alert(f"[DEBUG] Window index complete={complete} entries={len(by_eid)}")
     return by_eid, complete
 
 def _get_title_text(prop: dict) -> str:
@@ -2014,7 +2060,7 @@ def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid
         if notified >= limit:
             return
         status_name = _canon_select(P_STATUS, status_value)
-        page_size = max(1, min(100, int(limit)))
+        page_size = max(1, int(limit))
         body = {
             "page_size": page_size,
             "filter": {"property": P_STATUS, "status": {"equals": status_name}},
@@ -2292,7 +2338,12 @@ def fast_sync(context=None):
             notion_tasks.append(t)
 
     # Run Notion upserts for all scheduled entries
-    if notion_tasks and not _should_exit_soon(context):
+    if notion_tasks:
+        if _should_exit_soon(context):
+            try:
+                _alert("[WARN] Low time budget after indexing; continuing with remaining upserts.")
+            except Exception:
+                pass
         max_workers = max(1, min(NOTION_CONCURRENCY, len(notion_tasks)))
         def _run_upsert2(task):
             ex, ukey, ent, wid, add_block = task
@@ -2300,6 +2351,8 @@ def fast_sync(context=None):
         with ThreadPoolExecutor(max_workers=max_workers) as ex2:
             futs = [ex2.submit(_run_upsert2, t) for t in notion_tasks]
             for f in as_completed(futs):
+                if _should_exit_soon(context):
+                    break
                 try:
                     pid = f.result()
                     if pid:
@@ -2364,6 +2417,14 @@ def fast_sync(context=None):
                     f.result()
                 except Exception as e:
                     _alert(f"[ERROR] Notion delete status task: {e}")
+
+    if NOTION_ENABLED and by_eid and not _should_exit_soon(context):
+        try:
+            promoted_count = _promote_recent_ignored_entries(by_eid, days=7, context=context)
+            if promoted_count:
+                _alert(f"[DEBUG] Promoted {promoted_count} recent Ignored entries to Processed before notifications.")
+        except Exception:
+            pass
 
     # Stage-2: notify a batch of already-Processed items and mark as Notified.
     # Run this after handling inserts, as long as there is enough time left
