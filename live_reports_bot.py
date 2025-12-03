@@ -142,7 +142,7 @@ ONBOARDINGS_DB_QUERY_TIMEOUT_SECONDS = max(5, int(os.getenv("ONBOARDINGS_DB_QUER
 ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS = max(1, int(os.getenv("ONBOARDINGS_DB_PAGE_SHRINK_ATTEMPTS", "4")))
 ONBOARDINGS_DB_MAX_INDEX_SECONDS = int(os.getenv("ONBOARDINGS_DB_MAX_INDEX_SECONDS", "200"))
 
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "5000"))  # number of new entries to insert per run
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "10000"))  # number of new entries to insert per run
 NOTIFY_BATCH_SIZE = int(os.getenv("NOTIFY_BATCH_SIZE", "1000"))  # number of processed entries to notify per run
 
 # Cached Notion schema (property name -> type)
