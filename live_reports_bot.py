@@ -30,6 +30,7 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/ap
 # Team index caching
 # Team Members index tuning defaults (Onboardings DB; these envs can still override)
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
+RECENT_ENTRY_DAYS = int(os.getenv("RECENT_ENTRY_DAYS", "7"))
 TEAM_INDEX_CACHE_PATH = os.getenv("TEAM_INDEX_CACHE_PATH", "/tmp/team_members_index.json").strip()
 TEAM_INDEX_CACHE_ENABLED = bool(TEAM_INDEX_CACHE_PATH)
 TEAM_MEM_CACHE_PATH = os.getenv("TEAM_MEM_CACHE_PATH", "/tmp/team_members_index_cache.json").strip()
@@ -115,6 +116,7 @@ STATUS_NOTIFIED  = os.getenv("NOTION_STATUS_NOTIFIED", "Notified")
 STATUS_PROCESSED = os.getenv("NOTION_STATUS_PROCESSED", "Processed")
 STATUS_IGNORED   = os.getenv("NOTION_STATUS_IGNORED", "Ignored")
 STATUS_DELETED   = os.getenv("NOTION_STATUS_DELETED", "Deleted")
+STATUS_EDITED    = os.getenv("NOTION_STATUS_EDITED", "Edited")
 NOTION_ONBOARDINGS_DB_ID = os.getenv("NOTION_ONBOARDINGS_DB_ID", "a1a106fab63548089279dc54d63eab89").strip()
 NOTION_DATABASE_ID_DASH = _dashify_notion_id(NOTION_DATABASE_ID)
 NOTION_ONBOARDINGS_DB_ID_DASH = _dashify_notion_id(NOTION_ONBOARDINGS_DB_ID)
@@ -1691,7 +1693,7 @@ def _notion_mark_deleted(page_id: str, detected_at: datetime | None = None):
         props[P_UPDATED] = _date_val(iso)
     _notion_request('PATCH', f"https://api.notion.com/v1/pages/{page_id}", json_body={"properties": props})
 
-def _promote_recent_ignored_entries(by_eid: dict[str, dict], days: int = 7, context=None) -> int:
+def _promote_recent_ignored_entries(by_eid: dict[str, dict], days: int = RECENT_ENTRY_DAYS, context=None) -> int:
     """Raise Ignored entries to Processed when their date is within the last `days`."""
     if not NOTION_ENABLED or not isinstance(by_eid, dict) or days <= 0:
         return 0
@@ -1727,6 +1729,47 @@ def _promote_recent_ignored_entries(by_eid: dict[str, dict], days: int = 7, cont
                 pass
     return promoted
 
+def _format_delta_hms(seconds: float) -> str:
+    sign = "+" if seconds >= 0 else "-"
+    total = abs(int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = [f"{sign}{hours}h", f"{minutes}m"]
+    if secs:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+def _diff_time_entry_snap(prev_snap: dict, toggl_entry: dict) -> list[dict]:
+    """Return list of changed fields between Notion snapshot and Toggl entry."""
+    diffs: list[dict] = []
+    if not isinstance(prev_snap, dict):
+        prev_snap = {}
+    project_old = (prev_snap.get("project") or "No project").strip()
+    project_new = (toggl_entry.get("project") or "No project").strip()
+    if project_old != project_new:
+        diffs.append({"field": "project", "old": project_old, "new": project_new})
+    tags_old = prev_snap.get("tags") or []
+    tags_new = toggl_entry.get("tags") or []
+    if sorted(tags_old) != sorted(tags_new):
+        diffs.append({"field": "tags", "old": tags_old, "new": tags_new})
+    desc_old = prev_snap.get("desc") or "No description"
+    desc_new = toggl_entry.get("desc") or "No description"
+    if desc_old != desc_new:
+        diffs.append({"field": "description", "old": desc_old, "new": desc_new})
+    dur_old = int(prev_snap.get("dur") or 0)
+    dur_new = int(toggl_entry.get("dur_ms") or 0)
+    if abs(dur_old - dur_new) >= 1000:
+        diffs.append({"field": "duration", "old": dur_old, "new": dur_new})
+    start_old = _parse_iso8601(prev_snap.get("start"), default=None)
+    start_new = toggl_entry.get("start_dt")
+    if isinstance(start_new, datetime) and (not start_old or abs((start_new - start_old).total_seconds()) >= 1):
+        diffs.append({"field": "start", "old": start_old, "new": start_new})
+    end_old = _parse_iso8601(prev_snap.get("end"), default=None)
+    end_new = toggl_entry.get("end_dt")
+    if isinstance(end_new, datetime) and (not end_old or abs((end_new - end_old).total_seconds()) >= 1):
+        diffs.append({"field": "end", "old": end_old, "new": end_new})
+    return diffs
+
 # Deleted msg
 # (legacy deleted-message helpers removed)
 
@@ -1739,7 +1782,7 @@ def _promote_recent_ignored_entries(by_eid: dict[str, dict], days: int = 7, cont
 def notion_build_window_index(since: datetime, until: datetime, context=None) -> tuple[dict, bool]:
     """Query Notion once for the window and build an entry id index.
     Returns (by_eid, complete).
-    by_eid: eid -> {page_id, snap, user_key}
+    by_eid: eid -> {page_id, snap, user_key, team_member_pid, webhook}
     complete: whether the pagination finished successfully.
     """
     global _NOTION_INDEX_OK
@@ -1822,6 +1865,26 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
             def _get_range(n):
                 d = (props.get(n, {}).get("date") or {})
                 return d.get("start") or "", d.get("end") or ""
+            def _get_num(n):
+                q = props.get(n, {})
+                return q.get("number") if q.get("type") == "number" else 0
+            def _get_text(n):
+                q = props.get(n, {})
+                if q.get("type") == "rich_text":
+                    return "".join([x.get("plain_text", "") for x in (q.get("rich_text") or [])]).strip()
+                if q.get("type") == "title":
+                    return "".join([x.get("plain_text", "") for x in (q.get("title") or [])]).strip()
+                return ""
+            def _get_sel(n):
+                q = props.get(n, {})
+                if q.get("type") == "select":
+                    return (q.get("select") or {}).get("name") or ""
+                return ""
+            def _get_tags(n):
+                q = props.get(n, {})
+                if q.get("type") != "multi_select":
+                    return []
+                return [t.get("name", "") for t in (q.get("multi_select") or []) if t.get("name")]
             start_s, end_s = _get_range(P_DATE)
             try:
                 start_dt = _parse_iso8601(start_s, default=None)
@@ -1829,23 +1892,44 @@ def notion_build_window_index(since: datetime, until: datetime, context=None) ->
                 start_dt = None
             if not (start_dt and start_dt >= since):
                 continue
-            # Minimal snapshot: only fields needed for cross-workspace guard
-            # and deletion scan (start + workspace id).
-            def _get_num(n):
-                q = props.get(n, {})
-                return q.get("number") if q.get("type") == "number" else 0
             def _get_status(prop_name):
                 q = props.get(prop_name, {})
                 if not isinstance(q, dict):
                     return ""
                 return (q.get("status") or {}).get("name") or ""
+            tm_pid = ""
+            try:
+                tm_prop = props.get(P_TEAM_MEMBER, {})
+                if isinstance(tm_prop, dict) and tm_prop.get("type") == "relation":
+                    rel = (tm_prop.get("relation") or [])
+                    if rel:
+                        tm_pid = (rel[0].get("id") or "").strip()
+            except Exception:
+                tm_pid = ""
+            webhook = _get_webhook_url_from_props(props)
+            project_val = _canon_select(P_PROJECT, _get_sel(P_PROJECT) or "No project")
+            tags_val = _canon_tags(P_TAGS, _get_tags(P_TAGS))
+            desc_val = _get_text(P_DESCRIPTION) or "No description"
+            duration_ms = int(_get_num(P_DURATION) or 0) * 1000
+            updated_s = _get_date(P_UPDATED) or pg.get("last_edited_time") or pg.get("created_time") or ""
             snap = {
                 "start": start_s,
+                "end": end_s,
                 "workspace": int(_get_num(P_WORKSPACE) or 0),
                 "status": _canon_select(P_STATUS, _get_status(P_STATUS)),
+                "project": project_val,
+                "tags": tags_val,
+                "desc": desc_val,
+                "dur": duration_ms,
+                "updated": updated_s,
             }
-            by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
-            by_eid[str(eid)] = {"page_id": pid, "snap": snap, "user_key": user_key}
+            by_eid[str(eid)] = {
+                "page_id": pid,
+                "snap": snap,
+                "user_key": user_key,
+                "team_member_pid": tm_pid,
+                "webhook": webhook,
+            }
 
         # Stop if there is no more data
         if not js.get("has_more"):
@@ -1952,6 +2036,137 @@ def _get_webhook_url_from_props(props: dict) -> str:
         return ""
     except Exception:
         return ""
+
+def _chunk_message_pairs(pairs: list[tuple[str, str]], limit_chars: int = 1900, sep: str = "\n\n"):
+    chunk: list[str] = []
+    chunk_ids: list[str] = []
+    size = 0
+    for pid, msg in pairs:
+        add_len = len(msg) + (len(sep) if chunk else 0)
+        if chunk and size + add_len > limit_chars:
+            yield sep.join(chunk), list(chunk_ids)
+            chunk = [msg]
+            chunk_ids = [pid]
+            size = len(msg)
+        else:
+            chunk.append(msg)
+            chunk_ids.append(pid)
+            size = len(sep.join(chunk))
+    if chunk:
+        yield sep.join(chunk), list(chunk_ids)
+
+def _format_dt_label(dt: datetime | None) -> str:
+    if not isinstance(dt, datetime):
+        return "Unknown"
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(dt)
+
+def _build_edit_notification_lines(entry: dict) -> list[str]:
+    diffs = entry.get("diffs") or []
+    prev_snap = entry.get("prev_snap") or {}
+    def _changed(field: str):
+        for diff in diffs:
+            if diff.get("field") == field:
+                return diff
+        return None
+    display_name = entry.get("name") or entry.get("user_key") or "Unknown"
+    tags_new = entry.get("tags") or []
+    tags_new_label = ", ".join(tags_new) if tags_new else "No tags"
+    tags_old = prev_snap.get("tags") or []
+    tags_old_label = ", ".join(tags_old) if tags_old else "No tags"
+    project_new = entry.get("project") or "No project"
+    project_old = prev_snap.get("project") or "No project"
+    desc_new = entry.get("desc") or "No description"
+    desc_old = prev_snap.get("desc") or "No description"
+    dur_new = int(entry.get("dur_ms") or 0)
+    dur_old = int(prev_snap.get("dur") or 0)
+    start_new = entry.get("start_dt")
+    start_old = _parse_iso8601(prev_snap.get("start"), default=None)
+    updated_dt = entry.get("updated_dt") or start_new
+    lines = [
+        "## ✍️ Time Entry Edited",
+        f"👤 **User**: {display_name}",
+        f"📁 **Project:** {'~~' + project_old + '~~ ' if _changed('project') and project_old else ''}{project_new}",
+        f"🏷️ **Tags:** {'~~' + tags_old_label + '~~ ' if _changed('tags') else ''}{tags_new_label}",
+        f"📝 **Task:** {'~~' + desc_old + '~~ ' if _changed('description') else ''}{desc_new}",
+        f"⏱️ **Time Tracked:** {'~~' + convert_ms_to_hms(dur_old) + '~~ ' if _changed('duration') else ''}{convert_ms_to_hms(dur_new)}",
+    ]
+    if _changed("start"):
+        lines.append(f"🗓️ **Start:** ~~{_format_dt_label(start_old)}~~ {_format_dt_label(start_new)}")
+    else:
+        lines.append(f"🗓️ **Start:** {_format_dt_label(start_new)}")
+    lines.append(f"🕑 **Updated:** {_format_dt_label(updated_dt)}")
+    summary_parts: list[str] = []
+    for diff in diffs:
+        field = diff.get("field")
+        if field == "start":
+            old_dt = diff.get("old")
+            new_dt = diff.get("new")
+            if isinstance(old_dt, datetime) and isinstance(new_dt, datetime):
+                delta = (new_dt - old_dt).total_seconds()
+                summary_parts.append(f"Δ Start {_format_delta_hms(delta)}")
+            else:
+                summary_parts.append("Δ Start updated")
+        elif field == "duration":
+            delta = int(diff.get("new") or 0) - int(diff.get("old") or 0)
+            summary_parts.append(f"Δ Time Tracked {_format_delta_hms(delta / 1000)}")
+        elif field == "project":
+            summary_parts.append("Δ Project updated")
+        elif field == "tags":
+            summary_parts.append("Δ Tags updated")
+        elif field == "description":
+            summary_parts.append("Δ Task updated")
+        elif field == "end":
+            old_dt = diff.get("old")
+            new_dt = diff.get("new")
+            if isinstance(old_dt, datetime) and isinstance(new_dt, datetime):
+                delta = (new_dt - old_dt).total_seconds()
+                summary_parts.append(f"Δ End {_format_delta_hms(delta)}")
+            else:
+                summary_parts.append("Δ End updated")
+    if summary_parts:
+        lines.append(f"**changes:** {', '.join(summary_parts)}")
+    lines.append("—")
+    return lines
+
+def _send_edit_notifications(notifications: list[dict], context=None) -> tuple[int, int]:
+    if not notifications:
+        return 0, 0
+    notified = 0
+    skipped = 0
+    outbox: dict[str, list[tuple[str, str]]] = {}
+    for entry in notifications:
+        if context is not None and _should_exit_soon(context):
+            break
+        webhook = _sanitize_webhook_url(entry.get("webhook"))
+        if not webhook:
+            skipped += 1
+            continue
+        lines = _build_edit_notification_lines(entry)
+        if not lines:
+            continue
+        msg = "\n".join(lines)
+        pid = entry.get("page_id")
+        if not pid:
+            continue
+        outbox.setdefault(webhook, []).append((pid, msg))
+    status_name = _canon_select(P_STATUS, STATUS_NOTIFIED)
+    notify_body = {"properties": {P_STATUS: {"status": {"name": status_name}}}}
+    for webhook, pairs in outbox.items():
+        if context is not None and _should_exit_soon(context):
+            break
+        for payload, page_ids in _chunk_message_pairs(pairs):
+            if context is not None and _should_exit_soon(context):
+                break
+            if send_discord_with_backoff(webhook, payload, timeout=HTTP_TIMEOUT):
+                notified += len(page_ids)
+                for pid in page_ids:
+                    _notion_request("PATCH", f"https://api.notion.com/v1/pages/{pid}", json_body=notify_body)
+            else:
+                _alert(f"[WARN] Failed to send edit notification for webhook ending {webhook[-4:]}")
+    return notified, skipped
 
 def notion_notify_processed(limit: int, user_map: dict, user_map_norm: dict, uid_to_name: dict, context=None) -> tuple[int, int]:
     """Notify up to `limit` Processed/Deleted time entries."""
@@ -2177,6 +2392,7 @@ def fast_sync(context=None):
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=TIME_WINDOW_DAYS)
+    recent_threshold = now - timedelta(days=RECENT_ENTRY_DAYS)
     by_eid, index_complete = notion_build_window_index(since, now, context=context)
     index_ok = index_complete
     # If the Notion index query failed, skip inserts/deletions to avoid duplicates,
@@ -2196,6 +2412,11 @@ def fast_sync(context=None):
     successful_workspaces: set[int] = set()
     failed_workspaces: set[int] = set()
     toggl_ids_by_ws: dict[int, set[str]] = {}
+    edit_candidates: dict[str, dict] = {}
+    pending_edit_notifications: list[dict] = []
+    edit_updates = 0
+    edit_notifications_sent = 0
+    edit_notifications_queued = 0
 
     def _queue_new(existing, notion_user_key, notion_entry, wid, add_block):
         if not NOTION_ENABLED or not index_ok or not team_index_ready:
@@ -2279,6 +2500,8 @@ def fast_sync(context=None):
                         upd_dt = now
 
                     prev = by_eid.get(eid)
+                    if prev:
+                        toggl_ids_by_ws[wid_int].add(eid)
                     prev_snap = (prev or {}).get("snap") or {}
                     try:
                         prev_ws = int(prev_snap.get("workspace") or 0)
@@ -2297,9 +2520,31 @@ def fast_sync(context=None):
                             prev_snap = {}
 
                     if prev:
+                        page_id = prev.get("page_id")
+                        if page_id:
+                            tm_pid_prev = (prev.get("team_member_pid") or "").strip()
+                            webhook_prev = (prev.get("webhook") or "").strip()
+                            if not webhook_prev and tm_pid_prev:
+                                webhook_prev = _TEAM_MEM_WEBHOOK_BY_ID.get(tm_pid_prev, "") or ""
+                            edit_candidates[eid] = {
+                                "page_id": page_id,
+                                "snap": prev_snap,
+                                "user_key": prev.get("user_key") or notion_user_key,
+                                "team_member_pid": tm_pid_prev,
+                                "webhook": _sanitize_webhook_url(webhook_prev),
+                                "toggl": {
+                                    "project": project,
+                                    "tags": tags,
+                                    "desc": desc,
+                                    "dur_ms": dur_ms,
+                                    "start_dt": start_dt,
+                                    "end_dt": end_dt,
+                                    "updated_dt": upd_dt,
+                                    "user": user,
+                                    "uid": uid,
+                                },
+                            }
                         continue
-
-                    toggl_ids_by_ws[wid_int].add(eid)
 
                     tm_pid = _resolve_team_member_pid(user)
                     if not tm_pid:
@@ -2323,7 +2568,10 @@ def fast_sync(context=None):
                     }
                     existing = None
                     add_block = True
-                    notion_entry["status"] = STATUS_PROCESSED if SEND_NOTIFICATIONS else STATUS_IGNORED
+                    entry_status = STATUS_IGNORED
+                    if SEND_NOTIFICATIONS and start_dt >= recent_threshold:
+                        entry_status = STATUS_PROCESSED
+                    notion_entry["status"] = entry_status
                     _queue_new(existing, notion_user_key, notion_entry, wid_int, add_block)
 
     # Build prioritized task list
@@ -2392,17 +2640,10 @@ def fast_sync(context=None):
             start_dt = _parse_iso8601(start_s, default=None)
             if not (start_dt and start_dt >= since):
                 continue
-            pid = info.get("page_id")
             if snap_ws not in successful_workspaces:
-                if pid:
-                    delete_tasks.append((pid, datetime.now(timezone.utc)))
                 continue
-            snap_status = _canon_select(P_STATUS, snap.get("status") or "")
-            if snap_status and snap_status == deleted_skip_status:
-                continue
-            start_s = snap.get("start") or ""
-            start_dt = _parse_iso8601(start_s, default=None)
-            if not (start_dt and start_dt >= since):
+            ids_for_ws = toggl_ids_by_ws.get(snap_ws)
+            if ids_for_ws is None or eid in ids_for_ws:
                 continue
             pid = info.get("page_id")
             if pid:
@@ -2418,9 +2659,92 @@ def fast_sync(context=None):
                 except Exception as e:
                     _alert(f"[ERROR] Notion delete status task: {e}")
 
+    if NOTION_ENABLED and indexes_ready and edit_candidates and not _should_exit_soon(context):
+        edited_status_name = _canon_select(P_STATUS, STATUS_EDITED)
+        for eid, data in edit_candidates.items():
+            if _should_exit_soon(context):
+                break
+            page_id = data.get("page_id")
+            snap = (data.get("snap") or {})
+            toggl_entry = data.get("toggl") or {}
+            if not page_id or not toggl_entry:
+                continue
+            diffs = _diff_time_entry_snap(snap, toggl_entry)
+            if not diffs:
+                continue
+            props: dict[str, dict] = {}
+            changed_fields = {d.get("field") for d in diffs}
+            start_dt = toggl_entry.get("start_dt")
+            end_dt = toggl_entry.get("end_dt")
+            updated_dt = toggl_entry.get("updated_dt")
+            if "project" in changed_fields:
+                props[P_PROJECT] = _select_val(toggl_entry.get("project"))
+            if "tags" in changed_fields:
+                props[P_TAGS] = _multi_val(toggl_entry.get("tags") or [])
+            if "description" in changed_fields:
+                props[P_DESCRIPTION] = _rt_val(toggl_entry.get("desc") or "")
+            if ("start" in changed_fields or "end" in changed_fields) and isinstance(start_dt, datetime):
+                start_iso = start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                end_iso = None
+                if isinstance(end_dt, datetime):
+                    end_iso = end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                props[P_DATE] = _date_range_val(start_iso, end_iso)
+            if "duration" in changed_fields:
+                props[P_DURATION] = _num_val(int(int(toggl_entry.get("dur_ms") or 0) / 1000))
+            if isinstance(updated_dt, datetime):
+                props[P_UPDATED] = _date_val(updated_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat())
+            if edited_status_name:
+                props[P_STATUS] = {"status": {"name": edited_status_name}}
+            if not props:
+                continue
+            body = {"properties": props}
+            r = _notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json_body=body)
+            if r and r.status_code in (200, 201):
+                edit_updates += 1
+                tm_pid = (data.get("team_member_pid") or "").strip()
+                display_name = ""
+                if tm_pid:
+                    display_name = _TEAM_MEM_NAME_BY_ID.get(tm_pid, "") or ""
+                if not display_name:
+                    display_name = toggl_entry.get("user") or data.get("user_key") or "Unknown"
+                webhook = (data.get("webhook") or "").strip()
+                if not webhook and tm_pid:
+                    webhook = _sanitize_webhook_url(_TEAM_MEM_WEBHOOK_BY_ID.get(tm_pid, "") or "")
+                pending_edit_notifications.append({
+                    "page_id": page_id,
+                    "webhook": webhook,
+                    "user_key": data.get("user_key") or toggl_entry.get("user"),
+                    "name": display_name,
+                    "project": toggl_entry.get("project"),
+                    "tags": toggl_entry.get("tags"),
+                    "desc": toggl_entry.get("desc"),
+                    "dur_ms": toggl_entry.get("dur_ms"),
+                    "start_dt": start_dt,
+                    "updated_dt": updated_dt,
+                    "diffs": diffs,
+                    "prev_snap": snap,
+                })
+                try:
+                    snap["project"] = toggl_entry.get("project")
+                    snap["tags"] = list(toggl_entry.get("tags") or [])
+                    snap["desc"] = toggl_entry.get("desc")
+                    snap["dur"] = toggl_entry.get("dur_ms")
+                    if isinstance(start_dt, datetime):
+                        snap["start"] = start_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                    if isinstance(end_dt, datetime):
+                        snap["end"] = end_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                    if isinstance(updated_dt, datetime):
+                        snap["updated"] = updated_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                    if edited_status_name:
+                        snap["status"] = edited_status_name
+                except Exception:
+                    pass
+            else:
+                _alert(f"[WARN] Failed to update edited entry {eid} in Notion; status={getattr(r, 'status_code', None)}")
+
     if NOTION_ENABLED and by_eid and not _should_exit_soon(context):
         try:
-            promoted_count = _promote_recent_ignored_entries(by_eid, days=7, context=context)
+            promoted_count = _promote_recent_ignored_entries(by_eid, days=RECENT_ENTRY_DAYS, context=context)
             if promoted_count:
                 _alert(f"[DEBUG] Promoted {promoted_count} recent Ignored entries to Processed before notifications.")
         except Exception:
@@ -2443,6 +2767,23 @@ def fast_sync(context=None):
                 skipped_notifies += skipped
             except Exception as e:
                 _alert(f"[ERROR] notify processed failed: {e}")
+
+    edit_notifications_queued = len(pending_edit_notifications)
+    if pending_edit_notifications:
+        if _should_exit_soon(context):
+            try:
+                _alert("[DEBUG] Skipping edit notifications due to low time budget.")
+            except Exception:
+                pass
+        else:
+            try:
+                sent, skipped = _send_edit_notifications(pending_edit_notifications, context=context)
+                edit_notifications_sent = sent
+                notified += sent
+                skipped_notifies += skipped
+                pending_edit_notifications.clear()
+            except Exception as e:
+                _alert(f"[ERROR] Failed to send edit notifications: {e}")
 
     # Lightweight metrics block: helps tune timeouts and batch sizes.
     metrics: dict[str, dict] = {"timings_s": {}, "counts": {}}
@@ -2470,6 +2811,10 @@ def fast_sync(context=None):
         metrics["timings_s"]["team_index_cache_age"] = _METRICS_TEAM_INDEX_CACHE_AGE
         metrics["counts"]["workspaces_successful"] = len(successful_workspaces)
         metrics["counts"]["deletions_scheduled"] = len(delete_tasks)
+        metrics["counts"]["edit_candidates"] = len(edit_candidates)
+        metrics["counts"]["edited_entries_detected"] = edit_updates
+        metrics["counts"]["edit_notifications_queued"] = edit_notifications_queued
+        metrics["counts"]["edit_notifications_sent"] = edit_notifications_sent
     except Exception:
         pass
 
