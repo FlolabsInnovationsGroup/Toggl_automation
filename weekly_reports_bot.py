@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import math
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,9 +32,6 @@ NOTION_TOKEN = os.getenv(
 NOTION_DATABASE_ID = os.getenv(
     "NOTION_DATABASE_ID", "297a157695518075ab6cea94e60e4220"
 ).strip()  # Time Entries DB
-NOTION_TOGGL_WORSPACES_DB_ID = os.getenv(
-    "NOTION_TOGGL_WORSPACES_DB_ID", "2aea15769551801fafcaf79f0c6830ce"
-).strip()  # Toggl Workspaces DB with api_token
 NOTION_TEAM_DB_ID = os.getenv("NOTION_TEAM_DB_ID", "").strip()
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28").strip()
 
@@ -59,6 +57,21 @@ P_TIME_COMMITMENT = os.getenv(
 # Week timezone (IANA name preferred). Example: "Europe/Sofia", "America/New_York".
 WEEK_TZ = os.getenv("WEEK_TZ", "UTC").strip()
 WEEK_TZ_OFFSET_HOURS = int(os.getenv("WEEK_TZ_OFFSET_HOURS", "0"))
+try:
+    _commitment_alert_below_pct = float(
+        os.getenv("WEEKLY_COMMITMENT_ALERT_BELOW_PCT", "50")
+    )
+except Exception:
+    _commitment_alert_below_pct = 50.0
+COMMITMENT_ALERT_BELOW_PCT = max(0.0, _commitment_alert_below_pct)
+try:
+    _commitment_reconsider_above_pct = float(
+        os.getenv("WEEKLY_COMMITMENT_RECONSIDER_ABOVE_PCT", "25")
+    )
+except Exception:
+    _commitment_reconsider_above_pct = 25.0
+COMMITMENT_RECONSIDER_ABOVE_PCT = max(0.0, _commitment_reconsider_above_pct)
+WEEKLY_QUERY_PAGE_SIZE = max(1, int(os.getenv("WEEKLY_QUERY_PAGE_SIZE", "500")))
 
 
 # ==========================
@@ -247,21 +260,31 @@ def _get_webhook_from_props(props: dict) -> str:
         return ""
 
 
+def _iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
 def query_time_entries_between(start_dt: datetime, end_dt: datetime) -> list[dict]:
-    """Return Notion pages for time entries broadly around [start, end)."""
+    """Return Notion pages for the provided [start, end) UTC window."""
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     pages: list[dict] = []
     cursor = None
-    # Widen by one day on both sides
-    start_wide = (start_dt - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_wide = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_iso = _iso_utc(start_dt)
+    end_iso = _iso_utc(end_dt)
+    _alert(
+        f"[DEBUG] Weekly window query from {start_iso} to {end_iso}, page_size={WEEKLY_QUERY_PAGE_SIZE}"
+    )
     while True:
         body: dict = {
-            "page_size": 100,
+            "page_size": WEEKLY_QUERY_PAGE_SIZE,
             "filter": {
                 "and": [
-                    {"property": P_DATE, "date": {"on_or_after": start_wide}},
-                    {"property": P_DATE, "date": {"before": end_wide}},
+                    {"property": P_DATE, "date": {"on_or_after": start_iso}},
+                    {"property": P_DATE, "date": {"before": end_iso}},
                 ]
             },
         }
@@ -275,7 +298,11 @@ def query_time_entries_between(start_dt: datetime, end_dt: datetime) -> list[dic
             )
             break
         data = r.json() or {}
-        pages.extend(data.get("results") or [])
+        results = data.get("results") or []
+        _alert(
+            f"[DEBUG] Weekly window page fetched; cursor={cursor} results={len(results)}"
+        )
+        pages.extend(results)
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
@@ -519,6 +546,36 @@ def _format_project_breakdown(
     return "\n".join(lines)
 
 
+def _commitment_alert_line(
+    username: str,
+    total_hours: float,
+    commitment_hours: float,
+    achievement_pct: float,
+) -> str | None:
+    if commitment_hours <= 0:
+        return None
+    if achievement_pct <= COMMITMENT_ALERT_BELOW_PCT:
+        return (
+            f"> ⚠️ {username} at {achievement_pct:.1f}% of weekly commitment "
+            f"({total_hours:.1f}h / {commitment_hours:.1f}h)"
+        )
+    over_threshold = 100.0 + COMMITMENT_RECONSIDER_ABOVE_PCT
+    if (
+        COMMITMENT_RECONSIDER_ABOVE_PCT > 0
+        and achievement_pct >= over_threshold
+    ):
+        over_pct = achievement_pct - 100.0
+        recommended = max(total_hours, commitment_hours)
+        # Round recommendation to the nearest 0.5h to keep it tidy.
+        recommended = math.ceil(recommended * 2.0) / 2.0
+        return (
+            f"> 💡 {username} exceeded the weekly commitment by {over_pct:.1f}% "
+            f"({total_hours:.1f}h / {commitment_hours:.1f}h). "
+            f"Consider raising their weekly commitment target to about {recommended:.1f}h."
+        )
+    return None
+
+
 def build_weekly_message(
     username: str,
     week_start: datetime,
@@ -545,10 +602,19 @@ def build_weekly_message(
             if time_commitment_hours > 0
             else 0.0
         )
-        parts.append(f"🎯 **Time Commitment:** {time_commitment_hours:.1f} hours/week")
+        parts.append(f"🎯 **Weekly Commitment:** {time_commitment_hours:.1f}h")
         parts.append(
             f"📊 **Variance vs commitment:** {diff:+.1f} hours ({pct:.1f}% of commitment)"
         )
+        parts.append(
+            f"✅ **Achievement:** {pct:.1f}% ({total_hours:.1f}h / {time_commitment_hours:.1f}h)"
+        )
+        alert_line = _commitment_alert_line(
+            username, total_hours, time_commitment_hours, pct
+        )
+        if alert_line:
+            parts.append("")
+            parts.append(alert_line)
 
     parts.append("")
     parts.append(gamified_badge(total_hours))
@@ -624,67 +690,6 @@ def send_reports_parallel(reports: list[dict]) -> int:
     return sent
 
 
-# ==========================
-# Workspace tokens (Notion DB)
-# ==========================
-def load_workspace_tokens() -> list[dict]:
-    """Load Toggl workspace API tokens from the Notion 'Toggl Workspaces' database.
-
-    Expected schema (properties):
-      - Name: title
-      - api_token: rich_text
-    """
-    db_id = NOTION_TOGGL_WORSPACES_DB_ID
-    if not db_id:
-        _alert(
-            "Toggl Workspaces DB id (NOTION_TOGGL_WORSPACES_DB_ID) not configured"
-        )
-        return []
-    url = f"https://api.notion.com/v1/databases/{db_id}/query"
-    out: list[dict] = []
-
-    def _get_title(props: dict, name: str) -> str:
-        p = props.get(name, {})
-        if p.get("type") == "title":
-            return "".join(
-                [x.get("plain_text", "") for x in (p.get("title") or [])]
-            ).strip()
-        return ""
-
-    def _get_rich_text(props: dict, name: str) -> str:
-        p = props.get(name, {})
-        if p.get("type") == "rich_text":
-            return "".join(
-                [x.get("plain_text", "") for x in (p.get("rich_text") or [])]
-            ).strip()
-        return ""
-
-    payload: dict = {"page_size": 100}
-    cursor = None
-    while True:
-        body = dict(payload)
-        if cursor:
-            body["start_cursor"] = cursor
-        r = _notion_request("POST", url, body)
-        if not r or r.status_code != 200:
-            _alert(
-                f"[WARN] Toggl Workspaces query failed: status={getattr(r, 'status_code', None)}"
-            )
-            break
-        data = r.json() or {}
-        for pg in data.get("results") or []:
-            props = pg.get("properties", {}) or {}
-            name = _get_title(props, "Name")
-            tok = _get_rich_text(props, "api_token")
-            if tok:
-                out.append({"name": name or "", "api_token": tok})
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
-    if not out:
-        _alert("Toggl Workspaces DB empty or unreachable")
-    return out
-
 
 # ==========================
 # Week window helpers
@@ -707,17 +712,20 @@ def _previous_week_bounds_local(
 ) -> tuple[datetime, datetime, datetime, datetime]:
     """Return (start_local, end_local, start_utc, end_utc) for the past week window.
 
-    Uses local day boundaries: from start-of-day 7 days ago up to start-of-today.
+    Uses local week boundaries: from the start of the previous Monday up to the
+    start of the current Monday.
     """
     tz = _get_week_tz()
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     now_local = now_utc.astimezone(tz)
-    # End at start of current day
+    # Align to Monday boundaries (weekday 0). Report week ends at the current Monday.
+    weekday = now_local.weekday()
+    this_week_monday = now_local.date() - timedelta(days=weekday)
     week_end_local = datetime.combine(
-        now_local.date(), datetime.min.time(), tzinfo=tz
+        this_week_monday, datetime.min.time(), tzinfo=tz
     )
-    # Start at start of day 7 days ago
+    # Start at previous Monday
     week_start_local = week_end_local - timedelta(days=7)
     # Convert to UTC
     week_start_utc = week_start_local.astimezone(timezone.utc)
@@ -733,15 +741,6 @@ def lambda_handler(event, context):
         return {
             "status": "error",
             "error": "Missing NOTION_TOKEN or NOTION_DATABASE_ID",
-        }
-
-    # Ensure workspace tokens DB is reachable (aligns with live_reports_bot)
-    workspaces = load_workspace_tokens()
-    if not workspaces:
-        return {
-            "status": "no_workspaces",
-            "users": 0,
-            "sent": 0,
         }
 
     now_utc = datetime.now(timezone.utc)

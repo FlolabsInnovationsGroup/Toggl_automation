@@ -1,4 +1,4 @@
-﻿import os, json, base64, requests, csv, time, random, re
+﻿import os, json, base64, requests, csv, time, random, re, copy
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,8 +31,6 @@ SYSTEM_ALERT_WEBHOOK = os.getenv("SYSTEM_ALERT_WEBHOOK", "https://discord.com/ap
 # Team Members index tuning defaults (Onboardings DB; these envs can still override)
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "360"))
 RECENT_ENTRY_DAYS = int(os.getenv("RECENT_ENTRY_DAYS", "7"))
-TEAM_INDEX_CACHE_PATH = os.getenv("TEAM_INDEX_CACHE_PATH", "/tmp/team_members_index.json").strip()
-TEAM_INDEX_CACHE_ENABLED = bool(TEAM_INDEX_CACHE_PATH)
 TEAM_MEM_CACHE_PATH = os.getenv("TEAM_MEM_CACHE_PATH", "/tmp/team_members_index_cache.json").strip()
 TEAM_MEM_CACHE_TTL = max(0, int(os.getenv("TEAM_MEM_CACHE_TTL_SECONDS", "7200")))
 TEAM_MATCH_MIN_SCORE = float(os.getenv("TEAM_MATCH_MIN_SCORE", "0.4"))
@@ -87,6 +85,7 @@ TOGGL_PAGE_SIZE = int(os.getenv("TOGGL_PAGE_SIZE", "200"))
 
 # In-run Toggl state
 _TOGGL_CALLS_USED = 0
+_TOGGL_BUDGET_EXHAUSTED = False
 _WS_CACHE_BY_TOKEN: dict[str, list[dict]] = {}
 _EXHAUSTED_TOKENS: set[str] = set()
 _UNSUPPORTED_REPORTS: set[tuple[str, int]] = set()  # (token_tail, workspace_id) giving 402
@@ -411,8 +410,11 @@ def _should_exit_soon(context) -> bool:
 
 def _budget_take(n: int = 1) -> bool:
     """Consume from Toggl call budget; return False if exhausted."""
-    global _TOGGL_CALLS_USED
+    global _TOGGL_CALLS_USED, _TOGGL_BUDGET_EXHAUSTED
+    if _TOGGL_BUDGET_EXHAUSTED:
+        return False
     if _TOGGL_CALLS_USED + n > MAX_TOGGL_CALLS_PER_RUN:
+        _TOGGL_BUDGET_EXHAUSTED = True
         return False
     _TOGGL_CALLS_USED += n
     return True
@@ -448,7 +450,7 @@ def get_workspaces_for_token(api_token: str) -> list[dict]:
         _alert(f"[ERROR] get_workspaces_for_token exception: {e}")
     return []
 
-def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime) -> tuple[list[dict], bool]:
+def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetime, until_dt: datetime, context=None) -> tuple[list[dict], bool]:
     url = "https://api.track.toggl.com/reports/api/v2/details"
     headers = _headers_for_token(api_token)
     params = {
@@ -469,6 +471,12 @@ def fetch_workspace_entries(api_token: str, workspace_id: int, since_dt: datetim
     complete = False
     error = False
     while params["page"] <= MAX_PAGES:
+        if context is not None and _should_exit_soon(context):
+            error = True
+            break
+        if _TOGGL_BUDGET_EXHAUSTED:
+            error = True
+            break
         if not _budget_take():
             _alert("[INFO] Toggl call budget exhausted; stopping pagination early.")
             error = True
@@ -1739,6 +1747,14 @@ def _format_delta_hms(seconds: float) -> str:
         parts.append(f"{secs}s")
     return " ".join(parts)
 
+def _strip_seconds(dt: datetime | None) -> datetime | None:
+    if not isinstance(dt, datetime):
+        return None
+    try:
+        return dt.replace(second=0, microsecond=0)
+    except Exception:
+        return dt
+
 def _diff_time_entry_snap(prev_snap: dict, toggl_entry: dict) -> list[dict]:
     """Return list of changed fields between Notion snapshot and Toggl entry."""
     diffs: list[dict] = []
@@ -1754,7 +1770,7 @@ def _diff_time_entry_snap(prev_snap: dict, toggl_entry: dict) -> list[dict]:
         diffs.append({"field": "tags", "old": tags_old, "new": tags_new})
     desc_old = prev_snap.get("desc") or "No description"
     desc_new = toggl_entry.get("desc") or "No description"
-    if desc_old != desc_new:
+    if not _desc_equal(desc_old, desc_new):
         diffs.append({"field": "description", "old": desc_old, "new": desc_new})
     dur_old = int(prev_snap.get("dur") or 0)
     dur_new = int(toggl_entry.get("dur_ms") or 0)
@@ -1762,11 +1778,15 @@ def _diff_time_entry_snap(prev_snap: dict, toggl_entry: dict) -> list[dict]:
         diffs.append({"field": "duration", "old": dur_old, "new": dur_new})
     start_old = _parse_iso8601(prev_snap.get("start"), default=None)
     start_new = toggl_entry.get("start_dt")
-    if isinstance(start_new, datetime) and (not start_old or abs((start_new - start_old).total_seconds()) >= 1):
+    start_old_norm = _strip_seconds(start_old)
+    start_new_norm = _strip_seconds(start_new)
+    if isinstance(start_new, datetime) and (not isinstance(start_old_norm, datetime) or start_new_norm != start_old_norm):
         diffs.append({"field": "start", "old": start_old, "new": start_new})
     end_old = _parse_iso8601(prev_snap.get("end"), default=None)
     end_new = toggl_entry.get("end_dt")
-    if isinstance(end_new, datetime) and (not end_old or abs((end_new - end_old).total_seconds()) >= 1):
+    end_old_norm = _strip_seconds(end_old)
+    end_new_norm = _strip_seconds(end_new)
+    if isinstance(end_new, datetime) and (not isinstance(end_old_norm, datetime) or end_new_norm != end_old_norm):
         diffs.append({"field": "end", "old": end_old, "new": end_new})
     return diffs
 
@@ -2065,80 +2085,120 @@ def _format_dt_label(dt: datetime | None) -> str:
 
 def _build_edit_notification_lines(entry: dict) -> list[str]:
     diffs = entry.get("diffs") or []
+    diff_map = {d.get("field"): d for d in diffs if d.get("field")}
     prev_snap = entry.get("prev_snap") or {}
     def _changed(field: str):
-        for diff in diffs:
-            if diff.get("field") == field:
-                return diff
-        return None
+        return diff_map.get(field)
+    def _old_val(field: str, fallback=None):
+        diff = diff_map.get(field)
+        if diff is not None and diff.get("old") is not None:
+            return diff.get("old")
+        return fallback
     display_name = entry.get("name") or entry.get("user_key") or "Unknown"
     tags_new = entry.get("tags") or []
     tags_new_label = ", ".join(tags_new) if tags_new else "No tags"
     tags_old = prev_snap.get("tags") or []
     tags_old_label = ", ".join(tags_old) if tags_old else "No tags"
     project_new = entry.get("project") or "No project"
-    project_old = prev_snap.get("project") or "No project"
+    project_old_raw = _old_val("project", prev_snap.get("project"))
+    project_old = (project_old_raw or "No project").strip()
     desc_new = entry.get("desc") or "No description"
-    desc_old = prev_snap.get("desc") or "No description"
+    desc_old = _old_val("description", prev_snap.get("desc")) or "No description"
     dur_new = int(entry.get("dur_ms") or 0)
-    dur_old = int(prev_snap.get("dur") or 0)
+    dur_old_val = _old_val("duration", prev_snap.get("dur"))
+    dur_old = int(dur_old_val or 0)
     start_new = entry.get("start_dt")
-    start_old = _parse_iso8601(prev_snap.get("start"), default=None)
+    start_old = _old_val("start", _parse_iso8601(prev_snap.get("start"), default=None))
     updated_dt = entry.get("updated_dt") or start_new
+    end_new = entry.get("end_dt")
+    end_old = _old_val("end", _parse_iso8601(prev_snap.get("end"), default=None))
+    def _format_tags_list(tags: list[str] | None) -> str:
+        tags = tags or []
+        return ", ".join(tags) if tags else "No tags"
+    project_line = f"📁 **Project:** ~~{project_old}~~ {project_new}" if _changed("project") else f"📁 **Project:** {project_new}"
+    tags_old_formatted = _format_tags_list(_old_val("tags", prev_snap.get("tags")) or [])
+    tags_line = f"🏷️ **Tags:** ~~{tags_old_formatted}~~ {tags_new_label}" if _changed("tags") else f"🏷️ **Tags:** {tags_new_label}"
+    desc_old_formatted = _old_val("description", prev_snap.get("desc")) or "No description"
+    desc_line = f"📝 **Task:** ~~{desc_old_formatted}~~ {desc_new}" if _changed("description") else f"📝 **Task:** {desc_new}"
+    dur_old_formatted = convert_ms_to_hms(dur_old)
+    dur_line = f"⏱️ **Time Tracked:** ~~{dur_old_formatted}~~ {convert_ms_to_hms(dur_new)}" if _changed("duration") else f"⏱️ **Time Tracked:** {convert_ms_to_hms(dur_new)}"
     lines = [
         "## ✍️ Time Entry Edited",
         f"👤 **User**: {display_name}",
-        f"📁 **Project:** {'~~' + project_old + '~~ ' if _changed('project') and project_old else ''}{project_new}",
-        f"🏷️ **Tags:** {'~~' + tags_old_label + '~~ ' if _changed('tags') else ''}{tags_new_label}",
-        f"📝 **Task:** {'~~' + desc_old + '~~ ' if _changed('description') else ''}{desc_new}",
-        f"⏱️ **Time Tracked:** {'~~' + convert_ms_to_hms(dur_old) + '~~ ' if _changed('duration') else ''}{convert_ms_to_hms(dur_new)}",
+        project_line,
+        tags_line,
+        desc_line,
+        dur_line,
     ]
     if _changed("start"):
         lines.append(f"🗓️ **Start:** ~~{_format_dt_label(start_old)}~~ {_format_dt_label(start_new)}")
     else:
         lines.append(f"🗓️ **Start:** {_format_dt_label(start_new)}")
+    if _changed("end"):
+        lines.append(f"🕓 **End:** ~~{_format_dt_label(end_old)}~~ {_format_dt_label(end_new)}")
+    else:
+        lines.append(f"🕓 **End:** {_format_dt_label(end_new)}")
     lines.append(f"🕑 **Updated:** {_format_dt_label(updated_dt)}")
     summary_parts: list[str] = []
+    def _format_tags_list(tags: list[str] | None) -> str:
+        tags = tags or []
+        return ", ".join(tags) if tags else "No tags"
+    def _arrow(old: str, new: str) -> str:
+        if not old:
+            old = "Unknown"
+        if not new:
+            new = "Unknown"
+        return f"{old} → {new}"
     for diff in diffs:
         field = diff.get("field")
         if field == "start":
             old_dt = diff.get("old")
             new_dt = diff.get("new")
             if isinstance(old_dt, datetime) and isinstance(new_dt, datetime):
-                delta = (new_dt - old_dt).total_seconds()
-                summary_parts.append(f"Δ Start {_format_delta_hms(delta)}")
+                old_label = _format_dt_label(old_dt)
+                new_label = _format_dt_label(new_dt)
+                summary_parts.append(f"Start changed: {_arrow(old_label, new_label)}")
             else:
-                summary_parts.append("Δ Start updated")
+                summary_parts.append("Start changed")
         elif field == "duration":
             delta = int(diff.get("new") or 0) - int(diff.get("old") or 0)
-            summary_parts.append(f"Δ Time Tracked {_format_delta_hms(delta / 1000)}")
+            old_hms = convert_ms_to_hms(int(diff.get("old") or 0))
+            new_hms = convert_ms_to_hms(int(diff.get("new") or 0))
+            summary_parts.append(f"Time Tracked changed: {_arrow(old_hms, new_hms)} ({_format_delta_hms(delta / 1000)})")
         elif field == "project":
-            summary_parts.append("Δ Project updated")
+            old_proj = (diff.get("old") or "No project").strip() or "No project"
+            new_proj = (diff.get("new") or "No project").strip() or "No project"
+            summary_parts.append(f"Project changed: {_arrow(old_proj, new_proj)}")
         elif field == "tags":
-            summary_parts.append("Δ Tags updated")
+            old_tags = _format_tags_list(diff.get("old"))
+            new_tags = _format_tags_list(diff.get("new"))
+            summary_parts.append(f"Tags changed: {_arrow(old_tags, new_tags)}")
         elif field == "description":
-            summary_parts.append("Δ Task updated")
+            old_desc = diff.get("old") or "No description"
+            new_desc = diff.get("new") or "No description"
+            summary_parts.append(f"Task changed: {_arrow(old_desc, new_desc)}")
         elif field == "end":
             old_dt = diff.get("old")
             new_dt = diff.get("new")
             if isinstance(old_dt, datetime) and isinstance(new_dt, datetime):
-                delta = (new_dt - old_dt).total_seconds()
-                summary_parts.append(f"Δ End {_format_delta_hms(delta)}")
+                old_label = _format_dt_label(old_dt)
+                new_label = _format_dt_label(new_dt)
+                summary_parts.append(f"End changed: {_arrow(old_label, new_label)}")
             else:
-                summary_parts.append("Δ End updated")
+                summary_parts.append("End changed")
     if summary_parts:
         lines.append(f"**changes:** {', '.join(summary_parts)}")
     lines.append("—")
     return lines
 
-def _send_edit_notifications(notifications: list[dict], context=None) -> tuple[int, int]:
+def _send_edit_notifications(notifications: list[dict], context=None, ignore_deadline: bool = False) -> tuple[int, int]:
     if not notifications:
         return 0, 0
     notified = 0
     skipped = 0
     outbox: dict[str, list[tuple[str, str]]] = {}
     for entry in notifications:
-        if context is not None and _should_exit_soon(context):
+        if context is not None and not ignore_deadline and _should_exit_soon(context):
             break
         webhook = _sanitize_webhook_url(entry.get("webhook"))
         if not webhook:
@@ -2155,10 +2215,10 @@ def _send_edit_notifications(notifications: list[dict], context=None) -> tuple[i
     status_name = _canon_select(P_STATUS, STATUS_NOTIFIED)
     notify_body = {"properties": {P_STATUS: {"status": {"name": status_name}}}}
     for webhook, pairs in outbox.items():
-        if context is not None and _should_exit_soon(context):
+        if context is not None and not ignore_deadline and _should_exit_soon(context):
             break
         for payload, page_ids in _chunk_message_pairs(pairs):
-            if context is not None and _should_exit_soon(context):
+            if context is not None and not ignore_deadline and _should_exit_soon(context):
                 break
             if send_discord_with_backoff(webhook, payload, timeout=HTTP_TIMEOUT):
                 notified += len(page_ids)
@@ -2349,8 +2409,9 @@ def fast_sync(context=None):
     global _RUN_START_TS
     _RUN_START_TS = time.monotonic()
     # Reset Toggl per-run budgets (warm Lambdas keep globals alive)
-    global _TOGGL_CALLS_USED
+    global _TOGGL_CALLS_USED, _TOGGL_BUDGET_EXHAUSTED
     _TOGGL_CALLS_USED = 0
+    _TOGGL_BUDGET_EXHAUSTED = False
 
     # Reset circuit so warm containers can re-attempt health-checks
     _reset_notion_circuit()
@@ -2437,7 +2498,7 @@ def fast_sync(context=None):
             _alert("Toggl Workspaces DB empty or unreachable.")
             workspaces = []
         for token in workspaces:
-            if _should_exit_soon(context):
+            if _should_exit_soon(context) or _TOGGL_BUDGET_EXHAUSTED:
                 break
             api_token = token.get("api_token")
             if not api_token:
@@ -2447,7 +2508,7 @@ def fast_sync(context=None):
                 _alert(f"[WARN] No workspaces visible for token ending ...{api_token[-4:]}")
                 continue
             for ws in wss:
-                if _should_exit_soon(context):
+                if _should_exit_soon(context) or _TOGGL_BUDGET_EXHAUSTED:
                     break
                 wid = ws.get("id")
                 if not wid:
@@ -2456,7 +2517,7 @@ def fast_sync(context=None):
                     wid_int = int(wid or 0)
                 except Exception:
                     continue
-                entries, ws_complete = fetch_workspace_entries(api_token, wid_int, since, now)
+                entries, ws_complete = fetch_workspace_entries(api_token, wid_int, since, now, context=context)
                 if not ws_complete:
                     failed_workspaces.add(wid_int)
                     continue
@@ -2573,6 +2634,10 @@ def fast_sync(context=None):
                         entry_status = STATUS_PROCESSED
                     notion_entry["status"] = entry_status
                     _queue_new(existing, notion_user_key, notion_entry, wid_int, add_block)
+                if _TOGGL_BUDGET_EXHAUSTED or _should_exit_soon(context):
+                    break
+            if _TOGGL_BUDGET_EXHAUSTED or _should_exit_soon(context):
+                break
 
     # Build prioritized task list
     # Requirement: As long as there are new (not-yet-in-DB) entries,
@@ -2710,6 +2775,7 @@ def fast_sync(context=None):
                 webhook = (data.get("webhook") or "").strip()
                 if not webhook and tm_pid:
                     webhook = _sanitize_webhook_url(_TEAM_MEM_WEBHOOK_BY_ID.get(tm_pid, "") or "")
+                prev_snapshot = copy.deepcopy(snap)
                 pending_edit_notifications.append({
                     "page_id": page_id,
                     "webhook": webhook,
@@ -2720,9 +2786,10 @@ def fast_sync(context=None):
                     "desc": toggl_entry.get("desc"),
                     "dur_ms": toggl_entry.get("dur_ms"),
                     "start_dt": start_dt,
+                    "end_dt": end_dt,
                     "updated_dt": updated_dt,
                     "diffs": diffs,
-                    "prev_snap": snap,
+                    "prev_snap": prev_snapshot,
                 })
                 try:
                     snap["project"] = toggl_entry.get("project")
@@ -2770,20 +2837,25 @@ def fast_sync(context=None):
 
     edit_notifications_queued = len(pending_edit_notifications)
     if pending_edit_notifications:
+        force_send = False
         if _should_exit_soon(context):
+            force_send = True
             try:
-                _alert("[DEBUG] Skipping edit notifications due to low time budget.")
+                _alert("[DEBUG] Low time budget but forcing edit notifications to send.")
             except Exception:
                 pass
-        else:
-            try:
-                sent, skipped = _send_edit_notifications(pending_edit_notifications, context=context)
-                edit_notifications_sent = sent
-                notified += sent
-                skipped_notifies += skipped
-                pending_edit_notifications.clear()
-            except Exception as e:
-                _alert(f"[ERROR] Failed to send edit notifications: {e}")
+        try:
+            sent, skipped = _send_edit_notifications(
+                pending_edit_notifications,
+                context=context,
+                ignore_deadline=force_send,
+            )
+            edit_notifications_sent = sent
+            notified += sent
+            skipped_notifies += skipped
+            pending_edit_notifications.clear()
+        except Exception as e:
+            _alert(f"[ERROR] Failed to send edit notifications: {e}")
 
     # Lightweight metrics block: helps tune timeouts and batch sizes.
     metrics: dict[str, dict] = {"timings_s": {}, "counts": {}}

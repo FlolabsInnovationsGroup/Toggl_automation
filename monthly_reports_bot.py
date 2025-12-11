@@ -31,6 +31,7 @@ NH = {
 _last_send_ts_per_webhook: dict[str, float] = {}
 _last_send_ts_global = 0.0
 _TEAM_MEM_WEBHOOK_BY_ID: dict[str, str] = {}
+_TEAM_MEM_NAME_BY_ID: dict[str, str] = {}
 
 
 def _dashify_notion_id(value: str | None) -> str:
@@ -143,6 +144,32 @@ def _get_webhook_url_from_props(props: dict) -> str:
         return ""
 
 
+def _get_team_member_name(page_id: str) -> str:
+    pid = (page_id or "").strip()
+    if not pid:
+        return ""
+    if pid in _TEAM_MEM_NAME_BY_ID:
+        return _TEAM_MEM_NAME_BY_ID[pid]
+    try:
+        resp = SESSION.get(f"https://api.notion.com/v1/pages/{pid}", headers=NH, timeout=HTTP_TIMEOUT)
+    except requests.RequestException:
+        _TEAM_MEM_NAME_BY_ID[pid] = ""
+        return ""
+    if resp.status_code != 200:
+        _TEAM_MEM_NAME_BY_ID[pid] = ""
+        return ""
+    data = resp.json() or {}
+    props = data.get("properties") or {}
+    for meta in props.values():
+        if isinstance(meta, dict) and meta.get("type") == "title":
+            name = "".join([x.get("plain_text", "") for x in (meta.get("title") or [])]).strip()
+            if name:
+                _TEAM_MEM_NAME_BY_ID[pid] = name
+                return name
+    _TEAM_MEM_NAME_BY_ID[pid] = ""
+    return ""
+
+
 def _get_member_info(props: dict) -> tuple[str, str]:
     tm = props.get(P_TEAM_MEMBER, {}) or {}
     if tm.get("type") != "relation":
@@ -150,6 +177,8 @@ def _get_member_info(props: dict) -> tuple[str, str]:
     for rel in (tm.get("relation") or []):
         pid = (rel.get("id") or "").strip()
         name = (rel.get("name") or "").strip()
+        if not name and pid:
+            name = _get_team_member_name(pid)
         if pid:
             return pid, name
     return "", ""
@@ -212,7 +241,7 @@ def _format_report(hours_month: float, hours_total: float, start: datetime, end:
     return "\n".join([
         "# 📆 MONTHLY TIME REPORT",
         "——————————————————————————————",
-        f"## 👤 **Employee:** {employee}",
+        f"## 👤 **Team member:** {employee}",
         f"🗓️ **Period:** {period}",
         f"⏰ **Hours this month:** {hours_month:.2f} h",
         f"📈 **Total hours (company history):** {hours_total:.2f} h",
@@ -306,3 +335,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def lambda_handler(event, context):
+    """AWS Lambda entrypoint."""
+    try:
+        main()
+        return {"status": "complete"}
+    except SystemExit as exc:
+        return {"status": "error", "code": getattr(exc, "code", 1)}
