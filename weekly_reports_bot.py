@@ -633,7 +633,7 @@ def build_weekly_message(
 # Gamification (kept from original)
 # ==========================
 def gamified_badge(total_hours: float) -> str:
-    steps = [
+    productivity = [
         (70, "👹 Oni mode! Inhuman productivity week!"),
         (65, "🦄 Mythical productivity!"),
         (60, "🐉 Legendary productivity week!"),
@@ -650,7 +650,7 @@ def gamified_badge(total_hours: float) -> str:
         (5, "🐣 Warm-up week"),
         (0, "💀 Bro (Barely present week)"),
     ]
-    for bound, line in steps:
+    for bound, line in productivity:
         if total_hours >= bound:
             return line
     return "💀 Bro (Barely present week)"
