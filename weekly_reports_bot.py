@@ -59,7 +59,7 @@ WEEK_TZ = os.getenv("WEEK_TZ", "UTC").strip()
 WEEK_TZ_OFFSET_HOURS = int(os.getenv("WEEK_TZ_OFFSET_HOURS", "0"))
 try:
     _commitment_alert_below_pct = float(
-        os.getenv("WEEKLY_COMMITMENT_ALERT_BELOW_PCT", "50")
+        os.getenv("WEEKLY_COMMITMENT_ALERT_BELOW_PCT", "60")
     )
 except Exception:
     _commitment_alert_below_pct = 50.0
@@ -314,12 +314,15 @@ def query_time_entries_between(start_dt: datetime, end_dt: datetime) -> list[dic
 # ==========================
 _PAGE_TITLE_CACHE: dict[str, str] = {}
 _TEAM_MEM_ID_TO_NAME: dict[str, str] = {}
+_TEAM_MEM_ID_TO_COMMITMENT: dict[str, float] = {}
 
 
 def notion_build_team_members_index() -> None:
     """Build a cache of Team Member page_id -> display name from the Team Members DB."""
     global _TEAM_MEM_ID_TO_NAME
-    if not NOTION_TEAM_DB_ID or _TEAM_MEM_ID_TO_NAME:
+    if not NOTION_TEAM_DB_ID or (
+        _TEAM_MEM_ID_TO_NAME and _TEAM_MEM_ID_TO_COMMITMENT
+    ):
         return
     url = f"https://api.notion.com/v1/databases/{NOTION_TEAM_DB_ID}/query"
     cursor = None
@@ -342,6 +345,10 @@ def notion_build_team_members_index() -> None:
                 ).strip()
             if pid and name:
                 _TEAM_MEM_ID_TO_NAME[pid] = name
+            if pid and P_TIME_COMMITMENT and P_TIME_COMMITMENT in props:
+                _TEAM_MEM_ID_TO_COMMITMENT[pid] = float(
+                    _extract_number(props.get(P_TIME_COMMITMENT) or {}) or 0.0
+                )
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
@@ -388,6 +395,32 @@ def _user_display_name_from_props(props: dict) -> str:
             if nm:
                 return nm
     return ""
+
+
+def _get_team_member_commitment(team_member_id: str) -> float:
+    if not team_member_id:
+        return 0.0
+    if team_member_id in _TEAM_MEM_ID_TO_COMMITMENT:
+        return _TEAM_MEM_ID_TO_COMMITMENT[team_member_id]
+    if NOTION_TEAM_DB_ID:
+        notion_build_team_members_index()
+        if team_member_id in _TEAM_MEM_ID_TO_COMMITMENT:
+            return _TEAM_MEM_ID_TO_COMMITMENT[team_member_id]
+    try:
+        r = _notion_request("GET", f"https://api.notion.com/v1/pages/{team_member_id}")
+        if r and r.status_code == 200:
+            props2 = (r.json() or {}).get("properties") or {}
+            if P_TIME_COMMITMENT and P_TIME_COMMITMENT in props2:
+                commitment = _extract_number(props2.get(P_TIME_COMMITMENT) or {})
+            else:
+                commitment = 0.0
+            commitment_val = float(commitment or 0.0)
+            _TEAM_MEM_ID_TO_COMMITMENT[team_member_id] = commitment_val
+            return commitment_val
+    except Exception:
+        pass
+    _TEAM_MEM_ID_TO_COMMITMENT[team_member_id] = 0.0
+    return 0.0
 
 
 def _get_team_member_ids_from_props(props: dict) -> list[str]:
@@ -446,6 +479,8 @@ def aggregate_week(
             if P_TIME_COMMITMENT
             else 0.0
         )
+        if time_commitment <= 0 and user_key:
+            time_commitment = _get_team_member_commitment(user_key)
 
         # Local time window filter using Date range (include any overlap with window)
         date_prop = (props.get(P_DATE) or {}).get("date") or {}
@@ -554,7 +589,7 @@ def _commitment_alert_line(
 ) -> str | None:
     if commitment_hours <= 0:
         return None
-    if achievement_pct <= COMMITMENT_ALERT_BELOW_PCT:
+    if achievement_pct < COMMITMENT_ALERT_BELOW_PCT:
         return (
             f"> ⚠️ {username} at {achievement_pct:.1f}% of weekly commitment "
             f"({total_hours:.1f}h / {commitment_hours:.1f}h)"
@@ -595,6 +630,7 @@ def build_weekly_message(
         f"📝 **Total Entries:** {total_entries}",
     ]
 
+    commitment_lines: list[str] = []
     if time_commitment_hours and time_commitment_hours > 0:
         diff = total_hours - time_commitment_hours
         pct = (
@@ -602,19 +638,21 @@ def build_weekly_message(
             if time_commitment_hours > 0
             else 0.0
         )
-        parts.append(f"🎯 **Weekly Commitment:** {time_commitment_hours:.1f}h")
-        parts.append(
+        commitment_lines.append(
+            f"🎯 **Weekly Commitment:** {time_commitment_hours:.1f}h"
+        )
+        commitment_lines.append(
             f"📊 **Variance vs commitment:** {diff:+.1f} hours ({pct:.1f}% of commitment)"
         )
-        parts.append(
+        commitment_lines.append(
             f"✅ **Achievement:** {pct:.1f}% ({total_hours:.1f}h / {time_commitment_hours:.1f}h)"
         )
         alert_line = _commitment_alert_line(
             username, total_hours, time_commitment_hours, pct
         )
         if alert_line:
-            parts.append("")
-            parts.append(alert_line)
+            commitment_lines.append("")
+            commitment_lines.append(alert_line)
 
     parts.append("")
     parts.append(gamified_badge(total_hours))
@@ -622,6 +660,11 @@ def build_weekly_message(
     if total_hours > 0 and per_project_hours:
         parts.append("\n### ⛏️ Time by Project")
         parts.append(_format_project_breakdown(per_project_hours, total_hours, max_rows=12))
+        if commitment_lines:
+            parts.append("")
+
+    if commitment_lines:
+        parts.extend(commitment_lines)
 
     parts.append(
         f"\n🤖 *Generated on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC*"
